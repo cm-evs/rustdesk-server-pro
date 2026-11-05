@@ -1,1 +1,2 @@
-* text=auto
+*.bat -text
+*.ps1 -text

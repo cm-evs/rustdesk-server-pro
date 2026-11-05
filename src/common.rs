@@ -730,3 +730,50 @@ mod tests {
         std::env::set_current_dir(directory.path().parent().unwrap()).unwrap();
     }
 }
+
+/// Anchor the process working directory to the directory containing
+/// the executable, so every file the server creates at runtime
+/// (databases, keys, logs, generated clients, templates) lands in the
+/// server directory no matter where the process was launched from.
+/// Best effort: when the exe path cannot be determined, the inherited
+/// working directory is kept. Must run before any file is opened,
+/// including the logger.
+pub fn anchor_to_exe_dir() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if !dir.as_os_str().is_empty() {
+                let _ = std::env::set_current_dir(dir);
+            }
+        }
+    }
+}
+
+/// Initialize logging to both stdout and an append-only file under `logs/`
+/// (e.g. `logs/hbbs.log`), so the server keeps a persistent, searchable log
+/// no matter how it was started. Falls back to stdout-only when the log file
+/// cannot be opened. The level still comes from `RUST_LOG` (default `info`).
+pub fn init_file_logger(prog: &str) -> ResultType<flexi_logger::LoggerHandle> {
+    use flexi_logger::{Duplicate, FileSpec, Logger, WriteMode};
+    let spec = FileSpec::default()
+        .directory("logs")
+        .basename(prog.to_owned())
+        .suffix("log")
+        .suppress_timestamp();
+    let logger = Logger::try_with_env_or_str("info")?
+        .log_to_file(spec)
+        .duplicate_to_stdout(Duplicate::All)
+        .format(flexi_logger::opt_format)
+        .write_mode(WriteMode::Async)
+        .append();
+    match logger.start() {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            eprintln!("file logging unavailable ({e}), logging to stdout only");
+            Ok(Logger::try_with_env_or_str("info")?
+                .log_to_stdout()
+                .format(flexi_logger::opt_format)
+                .write_mode(WriteMode::Async)
+                .start()?)
+        }
+    }
+}

@@ -32,6 +32,10 @@ use hbb_common::{
 };
 use ipnetwork::Ipv4Network;
 use sodiumoxide::crypto::sign;
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    ConnectOptions, Row,
+};
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -173,6 +177,7 @@ impl RendezvousServer {
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
+        crate::geo_relay::init_geo_db();
         rs.parse_relay_servers(&get_arg("relay-servers"));
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
@@ -396,6 +401,11 @@ impl RendezvousServer {
                     if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
+                        log::warn!(
+                            "register_pk for {} from {} rejected: too frequent (ip blocker)",
+                            id,
+                            ip
+                        );
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
                     let peer = self.pm.get_or(&id).await;
@@ -438,6 +448,11 @@ impl RendezvousServer {
                     if req_pk.1.elapsed().as_secs() > 6 {
                         req_pk.0 = 0;
                     } else if req_pk.0 > 2 {
+                        log::warn!(
+                            "register_pk for {} from {} rejected: too frequent (peer throttle)",
+                            id,
+                            ip
+                        );
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
                     req_pk.0 += 1;
@@ -719,6 +734,37 @@ impl RendezvousServer {
     }
 
     #[inline]
+    /// Device id a login token was issued for, from the account API
+    /// database. Any failure (no API database, locked, unknown token)
+    /// yields None so the caller can fail open.
+    async fn device_for_token(token: &str) -> Option<String> {
+        if token.is_empty() {
+            return None;
+        }
+        let path = std::env::var("API_DB_PATH").unwrap_or_else(|_| "api_v1.sqlite3".to_owned());
+        if !std::path::Path::new(&path).exists() {
+            return None;
+        }
+        let mut opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true);
+        opts.log_statements(log::LevelFilter::Off);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .ok()?;
+        let row = sqlx::query("select device_id from client_tokens where token = ?")
+            .bind(token)
+            .fetch_optional(&pool)
+            .await
+            .ok()?;
+        let row = row?;
+        let device_id = row.try_get::<String, _>("device_id").ok();
+        pool.close().await;
+        device_id
+    }
+
     async fn handle_punch_hole_request(
         &mut self,
         addr: SocketAddr,
@@ -737,6 +783,26 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         let id = ph.id;
+        // Refuse self-connection: the controller's login token resolves
+        // to the device it was issued for. If that is the target, the
+        // controller is asking to control itself. other_failure is
+        // shown verbatim by the client, so this surfaces as a readable
+        // error instead of the peer's accept/password dialog. A missing
+        // or unknown token (logged-out client, lookup failure) fails
+        // open: the request proceeds as before.
+        if !ph.token.is_empty() {
+            if let Some(device_id) = Self::device_for_token(&ph.token).await {
+                if device_id == id {
+                    log::info!("Refusing self-connection request from {} for peer {}", addr, id);
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_punch_hole_response(PunchHoleResponse {
+                        other_failure: "不能连接本机 / Cannot connect to yourself".to_owned(),
+                        ..Default::default()
+                    });
+                    return Ok((msg_out, None));
+                }
+            }
+        }
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
@@ -956,14 +1022,20 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
         }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
-        self.relay_servers[i].clone()
+        let rotation = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst);
+        // v27: when a geo city db is loaded, offer the relay nearest to
+        // both peers (rotating within the near set); otherwise rotate
+        // through the full list as before.
+        if let Some(i) = crate::geo_relay::pick_for(&self.relay_servers, pa, pb, rotation) {
+            return self.relay_servers[i].clone();
+        }
+        self.relay_servers[rotation % self.relay_servers.len()].clone()
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -1226,7 +1298,26 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            // Greeting for clients >= 1.5.0 with a configured server key and a
+            // login token: their rendezvous handshake (secure_tcp) waits for
+            // the server to speak first and fails with "deadline has elapsed"
+            // if the server stays silent, because this server predates the
+            // key-exchange feature and never initiates one. A parseable
+            // non-KeyExchange first message makes the client proceed
+            // unencrypted, the documented fallback for pre-exchange servers;
+            // the peer session itself stays end-to-end encrypted via the peer
+            // key exchange. WebSocket clients skip secure_tcp, so no greeting
+            // there. An empty message is enough: the codec delivers zero-length
+            // frames and the client discards the message after one read.
+            allow_err!(
+                a.send(Bytes::from(
+                    RendezvousMessage::new()
+                        .write_to_bytes()
+                        .unwrap_or_default()
+                ))
+                .await
+            );
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {

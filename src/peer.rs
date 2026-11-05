@@ -71,18 +71,13 @@ pub(crate) struct PeerMap {
 impl PeerMap {
     pub(crate) async fn new() -> ResultType<Self> {
         let db = get_arg_opt("DB_URL").unwrap_or_else(|| {
-            let mut db = "db_v2.sqlite3".to_owned();
-            #[cfg(all(windows, not(debug_assertions)))]
-            {
-                if let Some(path) = hbb_common::config::Config::icon_path().parent() {
-                    db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                db = format!("./{db}");
-            }
-            db
+            // Keep the peer database in the server directory on every
+            // platform (the process cwd is anchored to the exe dir in
+            // main). Upstream sent Windows release builds to the user
+            // profile's %APPDATA%\RustDesk\config via
+            // Config::icon_path(), scattering runtime files outside the
+            // server directory (fixed in v28).
+            "./db_v2.sqlite3".to_owned()
         });
         log::info!("DB_URL={}", db);
         let pm = Self {
