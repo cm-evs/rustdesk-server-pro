@@ -341,6 +341,13 @@ cd rustdesk-server-pro-linux-*
 - 升级：停服 → 只换 hbbs（hbbr、rdsvc 不变）+ 替换 service.bat → 启动。
 - 验证：全量回归（专项 69/69、控制台 28/28 ×2、锚定 17/17、就近选路 12/12、cargo test 全过），debug 与 release 均通过。Windows 发布版的数据库路径分支已删除、逻辑全平台统一，Linux 侧验证即覆盖统一后的代码路径；真机只需确认启动日志 `DB_URL=./db_v2.sqlite3`。
 
+## v29：同步上游中继 UUID 校验加固
+
+- 内容（2026-11-06）：合并上游 rustdesk-server 在分叉底子 873230e 之后的 3 个新提交，核心是 44de977「Validate relay UUIDs before forwarding」：hbbs 在 RequestRelay / RelayResponse 两条路径上转发中继 UUID 前先校验——为空、超过 128 字节、或含 `[A-Za-z0-9_-]` 以外字符（含换行、空格、NUL）直接断开，不再原样转发给中继；对端确认时回送的空字段仍放行。另两个提交是给该校验补单元测试、删除上游的 CLAUDE.md。
+- 与自研改动的相容性：只动 src/rendezvous_server.rs，不碰就近选路（geo_relay）、自连拒绝、控制台与 API；三方合并零冲突。正常客户端使用的 UUID / ULID 均可通过校验，已发出的客户端不受影响。
+- 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
+- 验证：全量回归（专项 69/69、控制台 28/28 ×2、模板 17/17、锚定 17/17、客户端配置 31/31、就近选路 12/12、cargo test 全过，含上游新增的 relay_uuid_validation 单测），debug 与 release 均通过。本版改动为全平台统一的协议校验，无平台专属分支、无 Windows 专属行为变更，无新增真机确认项。
+
 ## 日志
 
 - hbbs / hbbr 运行时同时输出到终端和文件：程序目录下自动生成
