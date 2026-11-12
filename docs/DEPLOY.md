@@ -348,6 +348,14 @@ cd rustdesk-server-pro-linux-*
 - 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
 - 验证：全量回归（专项 69/69、控制台 28/28 ×2、模板 17/17、锚定 17/17、客户端配置 31/31、就近选路 12/12、cargo test 全过，含上游新增的 relay_uuid_validation 单测），debug 与 release 均通过。本版改动为全平台统一的协议校验，无平台专属分支、无 Windows 专属行为变更，无新增真机确认项。
 
+## v30：同步上游加固——消息大小上限与中继/控制台修复
+
+- 内容（2026-11-12）：合并上游 rustdesk-server 在 v29 之后的 8 个新提交（2026-11-07 至 11-08），全是加固与修 bug，无新功能、无账号改动：0415b0e 给 hbbs 与 hbbr 加消息大小上限（hbbs 默认 64 KiB、hbbr 配对前限 128 KiB，新增 `MAX_MESSAGE_KB` 配置项）；680b603 修 hbbr 双栈下 IPv4 中继黑名单匹配失效；98ffcee / 36a0996 给管理控制台回复加超时与防截断；1bd3938 给中继双向写加超时；474fbc7 限制 WebSocket 握手时长；e5c0a42 转发 WebSocket IP 时保留原端口；134008e 修配对 ID 复用后等待者过期。同时上游把 tungstenite / tokio-tungstenite 从 0.17 升到 0.29（rustdesk-org fork）。
+- 与自研改动的相容性：合并时 2 处冲突，均已手工合并保留双方改动——src/rendezvous_server.rs 一处（上游的消息大小上限与我方给 1.5.0+ 客户端的问候消息合并保留）；Cargo.lock 一处（hbbs 依赖保留我方 tokio-rustls 0.23.4，tokio-tungstenite 采纳上游 0.29.0）。就近选路（geo_relay）、自连拒绝、中继 UUID 校验、控制台与 API 均不受影响。
+- 升级：停服 → **同时换 hbbs 和 hbbr 两个二进制**（与 v29 只换 hbbs 不同，本批改动主要在 relay_server.rs）→ 启动（rdsvc、脚本、地理库均不变）。
+- `MAX_MESSAGE_KB`（环境变量，默认 64，单位 KiB，上限 65536）：hbbs 在 TCP 与 WebSocket 监听上接受的最大消息，超大消息的连接会被断开。默认值能覆盖约 5000 个标准 9–10 位 ID 的在线状态查询；ID 特别长或数量特别多时，客户端可能看不到在线状态，可适当调大。
+- 验证：全量回归（专项 69/69、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、客户端配置 31/31 ×2、就近选路 12/12 ×2、cargo test 全过，含上游新增的中继/控制台单测），debug 与 release 均通过。本版改动为全平台统一的协议与超时加固，无新增 Windows/release 专属分支，无新增真机确认项。
+
 ## 日志
 
 - hbbs / hbbr 运行时同时输出到终端和文件：程序目录下自动生成
