@@ -2380,16 +2380,83 @@ fn effective_ports() -> Value {
     })
 }
 
-fn generated_filename(host: &str, key: &str, api: &str, relay: &str) -> String {
-    let cfg = json!({ "key": key, "host": host, "api": api, "relay": relay });
+/// Maximum length (bytes) of the encoded `rustdesk--<payload>.exe`
+/// filename before falling back to the plain `rustdesk-host=...` form.
+/// Leaves headroom under both the 255-byte per-component limit and
+/// Windows' MAX_PATH for the server directory prefix.
+const ENCODED_FILENAME_LIMIT: usize = 200;
+/// Hard per-component filename limit on Linux (NAME_MAX) and NTFS.
+const FILENAME_LIMIT: usize = 255;
+
+/// Whether the api/relay values must be embedded in a generated
+/// client's filename, or the official client can derive them when
+/// absent (verified against client 1.5.0 `src/custom_server.rs`,
+/// `src/common.rs` `get_api_server_` and `rendezvous_mediator.rs`
+/// `get_relay_server`): all four `CustomServer` fields carry
+/// `#[serde(default)]`, so omitted fields parse as empty strings;
+/// an empty api is derived as rendezvous port - 2, and an empty
+/// relay falls back to the address hbbs hands out (else rendezvous
+/// port + 1). So api is embedded unless it is exactly the
+/// plain-http default AND the API port lines up with the
+/// rendezvous port the client derives from (a custom override,
+/// TLS, or a non-standard api-listen port each force embedding),
+/// and relay is embedded unless its port is rendezvous port + 1.
+fn needs_embed(
+    api: &str,
+    default_api: &str,
+    api_port: u16,
+    relay_port: u16,
+    rendezvous_port: u16,
+) -> (bool, bool) {
+    (
+        api != default_api || api_port != rendezvous_port.saturating_sub(2),
+        relay_port != rendezvous_port.saturating_add(1),
+    )
+}
+
+/// Filename for a generated client: the server config is encoded into
+/// the name (reversed base64url of the JSON), which is how the
+/// official client reads its custom server. `api`/`relay` are
+/// `None` when the client can derive them (see `needs_embed`) — they
+/// are left out of the JSON entirely, not written as empty strings,
+/// so a long public address stays under filesystem limits. When the
+/// encoded name would still exceed `ENCODED_FILENAME_LIMIT`, the
+/// much shorter plain form is used instead (the client parses its
+/// `host=`/`key=`/`relay=` parts and derives a missing api the same
+/// way); the plain form is only a fallback because the key is
+/// visible in it. Returns a plain-language error when even the plain
+/// form exceeds the filesystem limit, instead of leaking the raw OS
+/// error to the console.
+fn generated_filename(
+    host: &str,
+    key: &str,
+    api: Option<&str>,
+    relay: Option<&str>,
+) -> Result<String, String> {
+    let mut cfg = serde_json::Map::new();
+    cfg.insert("key".to_string(), json!(key));
+    cfg.insert("host".to_string(), json!(host));
+    if let Some(api) = api {
+        cfg.insert("api".to_string(), json!(api));
+    }
+    if let Some(relay) = relay {
+        cfg.insert("relay".to_string(), json!(relay));
+    }
     let raw = serde_json::to_string(&cfg).unwrap_or_default();
     let b64 = base64::encode_config(raw.as_bytes(), base64::URL_SAFE_NO_PAD);
     let payload: String = b64.chars().rev().collect();
-    if payload.is_empty() || payload.contains("--") {
-        format!("rustdesk-host={host},key={key},relay={relay}.exe")
-    } else {
-        format!("rustdesk--{payload}.exe")
+    let encoded = format!("rustdesk--{payload}.exe");
+    if !payload.is_empty() && !payload.contains("--") && encoded.len() <= ENCODED_FILENAME_LIMIT {
+        return Ok(encoded);
     }
+    let plain = match relay {
+        Some(relay) => format!("rustdesk-host={host},key={key},relay={relay}.exe"),
+        None => format!("rustdesk-host={host},key={key}.exe"),
+    };
+    if plain.len() > FILENAME_LIMIT {
+        return Err("公网地址太长，生成的客户端文件名超出系统限制，请使用更短的公网地址".to_string());
+    }
+    Ok(plain)
 }
 
 async fn server_pubkey(st: &ApiState) -> Result<String, String> {
@@ -2403,11 +2470,15 @@ async fn server_pubkey(st: &ApiState) -> Result<String, String> {
 }
 
 /// The client configuration for this server — (ID/rendezvous host,
-/// API URL, relay host, key) — exactly as embedded into a generated
-/// client. Shared by client generation and the console's client-config
-/// display, so values an admin copies into a stock client by hand can
-/// never drift from what a generated client would have used.
-async fn client_config(st: &ApiState) -> Result<(String, String, String, String), String> {
+/// API URL, relay host, key, plain-http default API URL) — exactly
+/// as embedded into a generated client. Shared by client generation
+/// and the console's client-config display, so values an admin
+/// copies into a stock client by hand can never drift from what a
+/// generated client would have used. The fifth element is the
+/// default API URL before any override/TLS rewrite; generation uses
+/// it to decide whether the api field can be left out of the encoded
+/// filename (see `needs_embed`).
+async fn client_config(st: &ApiState) -> Result<(String, String, String, String, String), String> {
     let public = get_setting(&st.pool, "public_host").await;
     if public.is_empty() {
         return Err("请先在「服务器设置」里填写公网地址".into());
@@ -2427,9 +2498,9 @@ async fn client_config(st: &ApiState) -> Result<(String, String, String, String)
         // configured clients must be pointed at the https address.
         default_api.replacen("http://", "https://", 1)
     } else {
-        default_api
+        default_api.clone()
     };
-    Ok((host, api, relay, key))
+    Ok((host, api, relay, key, default_api))
 }
 
 async fn do_generate(
@@ -2437,12 +2508,24 @@ async fn do_generate(
     created_by: &str,
     label: &str,
 ) -> Result<(String, String), String> {
-    let (host, api, relay, key) = client_config(st).await?;
+    let (host, api, relay, key, default_api) = client_config(st).await?;
     let tpl = st.templates_dir.join("rustdesk-windows.exe");
     if !tpl.exists() {
         return Err("请先在「服务器设置」里下载官方客户端模板".into());
     }
-    let filename = generated_filename(&host, &key, &api, &relay);
+    let (embed_api, embed_relay) = needs_embed(
+        &api,
+        &default_api,
+        api_port(&crate::common::get_arg("api-listen")),
+        relay_port(&crate::common::get_arg("relay-servers")),
+        rendezvous_port(&crate::common::get_arg("port")),
+    );
+    let filename = generated_filename(
+        &host,
+        &key,
+        embed_api.then_some(api.as_str()),
+        embed_relay.then_some(relay.as_str()),
+    )?;
     tokio::fs::create_dir_all(&st.clients_dir)
         .await
         .map_err(|e| e.to_string())?;
@@ -2544,7 +2627,7 @@ async fn client_config_view(
         return jresp(StatusCode::OK, json!({ "ok": true, "configured": false }));
     }
     match client_config(&st).await {
-        Ok((host, api, relay, key)) => jresp(
+        Ok((host, api, relay, key, _)) => jresp(
             StatusCode::OK,
             json!({ "ok": true, "configured": true, "host": host, "api": api, "relay": relay, "key": key }),
         ),
@@ -3149,9 +3232,10 @@ mod tests {
         let name = generated_filename(
             "rd.example.com",
             "AbCdEf0123456789+/xyz=",
-            "http://rd.example.com:21114",
-            "rd.example.com",
-        );
+            Some("http://rd.example.com:21114"),
+            Some("rd.example.com"),
+        )
+        .unwrap();
         let parsed = client_parse(&name);
         assert_eq!(
             parsed,
@@ -3162,6 +3246,124 @@ mod tests {
                 "rd.example.com".to_string(),
             )),
             "filename was: {name}"
+        );
+    }
+
+    /// Standard layout: api/relay are omitted from the encoded JSON
+    /// (the client derives them), so host/key still round-trip and
+    /// api/relay decode as empty.
+    #[test]
+    fn generated_filename_omits_derivable_fields() {
+        let name = generated_filename(
+            "27.45.254.164:21116",
+            "NKsFeb7rJOQ04GYcLrNe8EiUcnj5cqQx6iPQuB3tKqw=",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(name.starts_with("rustdesk--"), "filename was: {name}");
+        assert!(name.len() < 200, "filename was: {name}");
+        assert_eq!(
+            client_parse(&name),
+            Some((
+                "27.45.254.164:21116".to_string(),
+                "NKsFeb7rJOQ04GYcLrNe8EiUcnj5cqQx6iPQuB3tKqw=".to_string(),
+                String::new(),
+                String::new(),
+            )),
+            "filename was: {name}"
+        );
+    }
+
+    /// A 40-character public host still yields the encoded form well
+    /// under the limit (before v31 it failed with ENAMETOOLONG).
+    #[test]
+    fn generated_filename_long_host_stays_encoded() {
+        let host = "rustdesk-server-0123456789.abexample.com:21116";
+        assert_eq!(host.len(), 46); // 40-char domain + ":21116"
+        let name = generated_filename(
+            host,
+            "NKsFeb7rJOQ04GYcLrNe8EiUcnj5cqQx6iPQuB3tKqw=",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(name.starts_with("rustdesk--"), "filename was: {name}");
+        assert!(name.len() <= ENCODED_FILENAME_LIMIT, "filename was: {name}");
+        let parsed = client_parse(&name).unwrap();
+        assert_eq!(parsed.0, host);
+    }
+
+    /// A very long host falls back to the plain form, which the
+    /// client parses via its `host=` branch.
+    #[test]
+    fn generated_filename_very_long_host_falls_back_to_plain() {
+        let host = "a-very-long-rustdesk-server-hostname-for-a-branch-office-0123456789.example.com:21116";
+        let name = generated_filename(
+            host,
+            "NKsFeb7rJOQ04GYcLrNe8EiUcnj5cqQx6iPQuB3tKqw=",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            name.starts_with("rustdesk-host="),
+            "filename was: {name}"
+        );
+        assert!(name.len() <= FILENAME_LIMIT, "filename was: {name}");
+        assert!(name.contains("key=NKsFeb7rJOQ04GYcLrNe8EiUcnj5cqQx6iPQuB3tKqw="));
+    }
+
+    /// An absurdly long host fails with a plain-language error,
+    /// not a raw OS error.
+    #[test]
+    fn generated_filename_absurd_host_errors_clearly() {
+        let host = "x".repeat(240);
+        let err = generated_filename(
+            &host,
+            "NKsFeb7rJOQ04GYcLrNe8EiUcnj5cqQx6iPQuB3tKqw=",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("公网地址太长"), "error was: {err}");
+    }
+
+    /// Non-standard ports and TLS/override keep the fields embedded.
+    #[test]
+    fn needs_embed_decisions() {
+        // Standard layout: both derivable, neither embedded.
+        assert_eq!(
+            needs_embed("http://h:21114", "http://h:21114", 21114, 21117, 21116),
+            (false, false)
+        );
+        // API on a non-default port: the client's port-2 derivation
+        // would point at 21114, not 31114, so api stays embedded
+        // even though it equals the computed default; relay omitted.
+        assert_eq!(
+            needs_embed("http://h:31114", "http://h:31114", 31114, 21117, 21116),
+            (true, false)
+        );
+        // Relay port not rendezvous+1: relay stays embedded.
+        assert_eq!(
+            needs_embed("http://h:21114", "http://h:21114", 21114, 21119, 21116),
+            (false, true)
+        );
+        // TLS (https) or a custom override: api differs from the
+        // plain-http default, so it stays embedded.
+        assert_eq!(
+            needs_embed("https://h:21114", "http://h:21114", 21114, 21117, 21116),
+            (true, false)
+        );
+        assert_eq!(
+            needs_embed(
+                "http://other.example:8080/api",
+                "http://h:21114",
+                21114,
+                21117,
+                21116
+            ),
+            (true, false)
         );
     }
 
