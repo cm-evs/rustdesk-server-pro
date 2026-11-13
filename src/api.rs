@@ -48,6 +48,14 @@ pub struct ApiState {
     tpl_job: std::sync::Mutex<TplJob>,
     upd_job: std::sync::Mutex<UpdJob>,
     guard: std::sync::Mutex<AuthGuard>,
+    /// Cached latest-release data for /api/client-downloads:
+    /// (fetched_at, version, platforms). The GitHub API allows only 60
+    /// unauthenticated requests per hour per shared IP, and the console
+    /// fetches this on every visit to the generate-client page, so the
+    /// upstream data is cached for one hour. Mirrors are NOT cached:
+    /// they are computed per request from the current github_mirror
+    /// setting, so an admin's mirror change takes effect immediately.
+    dl_cache: std::sync::Mutex<Option<(std::time::Instant, String, Vec<ClientDownload>)>>,
 }
 
 /// Progress state of the background official-client template download.
@@ -67,7 +75,7 @@ pub struct TplJob {
 /// NOTE: this deliberately does NOT live in version.rs — build.rs
 /// regenerates that file on every build (see hbb_common::gen_version)
 /// and would wipe a hand-written constant.
-const PRO_VERSION: &str = "32";
+const PRO_VERSION: &str = "33";
 
 /// Progress state of the background one-click server update download.
 #[derive(Default)]
@@ -2041,12 +2049,15 @@ fn tpl_final_path(st: &ApiState) -> PathBuf {
     st.templates_dir.join("rustdesk-windows.exe")
 }
 
-/// Resolve the latest official client version and the installer size from
-/// the GitHub API (small JSON). Mirrors are tried before a direct
-/// connection, because direct GitHub API access is the part most likely to
-/// be slow or blocked on networks that need acceleration; direct is the
-/// last resort.
-fn resolve_latest(custom: &str) -> Result<(String, u64), String> {
+/// Fetch the latest official client release document from the GitHub API
+/// (small JSON). Mirrors are tried before a direct connection, because
+/// direct GitHub API access is the part most likely to be slow or blocked
+/// on networks that need acceleration; direct is the last resort. Shared
+/// by the template download and the other-platform download links. On
+/// failure returns the last transport error; callers add their own
+/// context (the template page and the downloads endpoint word the
+/// failure differently).
+fn fetch_latest_release_json(custom: &str) -> Result<Value, String> {
     let api_url = "https://api.github.com/repos/rustdesk/rustdesk/releases/latest";
     let mut urls: Vec<String> = Vec::new();
     if !custom.is_empty() {
@@ -2061,29 +2072,150 @@ fn resolve_latest(custom: &str) -> Result<(String, u64), String> {
         match fetch_bytes(&u, 20) {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
-                let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-                let version = v
-                    .get("tag_name")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t.trim_start_matches('v').to_string())
-                    .ok_or_else(|| "无法解析官方最新版本".to_string())?;
-                let asset = format!("rustdesk-{version}-x86_64.exe");
-                let mut size = 0u64;
-                if let Some(assets) = v.get("assets").and_then(|a| a.as_array()) {
-                    for a in assets {
-                        if a.get("name").and_then(|n| n.as_str()) == Some(asset.as_str()) {
-                            size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
-                        }
-                    }
-                }
-                return Ok((version, size));
+                return serde_json::from_str(&text).map_err(|e| e.to_string());
             }
             Err(e) => last_err = e,
         }
     }
-    Err(format!(
-        "无法获取官方版本信息（GitHub API 不可达）：{last_err}。可在上方手动填写版本号后重试"
-    ))
+    Err(last_err)
+}
+
+/// Resolve the latest official client version and the installer size from
+/// the GitHub API (small JSON).
+fn resolve_latest(custom: &str) -> Result<(String, u64), String> {
+    let v = fetch_latest_release_json(custom).map_err(|e| {
+        format!("无法获取官方版本信息（GitHub API 不可达）：{e}。可在上方手动填写版本号后重试")
+    })?;
+    let version = v
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .map(|t| t.trim_start_matches('v').to_string())
+        .ok_or_else(|| "无法解析官方最新版本".to_string())?;
+    let asset = format!("rustdesk-{version}-x86_64.exe");
+    let mut size = 0u64;
+    if let Some(assets) = v.get("assets").and_then(|a| a.as_array()) {
+        for a in assets {
+            if a.get("name").and_then(|n| n.as_str()) == Some(asset.as_str()) {
+                size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            }
+        }
+    }
+    Ok((version, size))
+}
+
+/// One official client download for another platform. The filename and
+/// URL come from the release's asset list, never guessed: a renamed or
+/// missing asset simply drops its platform out of the list.
+#[derive(Clone, Debug, PartialEq)]
+struct ClientDownload {
+    id: &'static str,
+    name: &'static str,
+    file: String,
+    url: String,
+}
+
+/// The App Store page for the official iOS client, taken from the
+/// official 1.5.3 release notes (verified 2026-11-13). iOS has no GitHub
+/// install package, so this link is version-independent and is appended
+/// without mirrors.
+const IOS_APP_STORE_URL: &str =
+    "https://apps.apple.com/us/app/rustdesk-remote-desktop/id1581225015";
+
+/// (id, display name, filename suffix) for the other-platform downloads,
+/// in display order. Suffixes are matched against the release's actual
+/// asset names with a `rustdesk-{version}-` prefix (verified against the
+/// real 1.5.3 asset list). Windows is deliberately absent: generated
+/// clients are the Windows path.
+const CLIENT_DOWNLOAD_SUFFIXES: &[(&str, &str, &str)] = &[
+    ("macos-x64", "macOS（Intel）", "x86_64.dmg"),
+    ("macos-arm64", "macOS（Apple 芯片）", "aarch64.dmg"),
+    ("linux-deb-x64", "Linux x86_64（.deb）", "x86_64.deb"),
+    ("linux-deb-arm64", "Linux ARM64（.deb）", "aarch64.deb"),
+    ("linux-appimage-x64", "Linux x86_64（AppImage）", "x86_64.AppImage"),
+    ("linux-appimage-arm64", "Linux ARM64（AppImage）", "aarch64.AppImage"),
+    ("android-arm64", "Android（arm64）", "aarch64-signed.apk"),
+    ("android-x64", "Android（x86_64）", "x86_64-signed.apk"),
+    ("android-armv7", "Android（armv7）", "armv7-signed.apk"),
+    ("android-universal", "Android（通用）", "universal-signed.apk"),
+];
+
+/// Pick the other-platform downloads out of a releases/latest JSON
+/// document. Returns (version, downloads). Assets that do not match any
+/// known suffix are ignored; a release with no matching assets yields an
+/// empty list. The download URL is the asset's own browser_download_url.
+fn parse_client_downloads(v: &Value) -> Result<(String, Vec<ClientDownload>), String> {
+    let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
+    let version = tag.trim_start_matches('v').to_string();
+    if version.is_empty() {
+        return Err("无法解析官方最新版本".to_string());
+    }
+    let prefix = format!("rustdesk-{version}-");
+    let assets = v.get("assets").and_then(|a| a.as_array());
+    let mut out: Vec<ClientDownload> = Vec::new();
+    // Iterate the table in display order so the list is stable.
+    for (id, name, suffix) in CLIENT_DOWNLOAD_SUFFIXES {
+        let file = format!("{prefix}{suffix}");
+        let mut url = String::new();
+        if let Some(assets) = assets {
+            for a in assets {
+                if a.get("name").and_then(|n| n.as_str()) == Some(file.as_str()) {
+                    url = a
+                        .get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    break;
+                }
+            }
+        }
+        if url.is_empty() {
+            continue; // asset absent from this release: skip the platform
+        }
+        out.push(ClientDownload {
+            id,
+            name,
+            file,
+            url,
+        });
+    }
+    Ok((version, out))
+}
+
+/// How long the latest-release data for /api/client-downloads stays
+/// cached (one hour; the unauthenticated GitHub API limit is 60
+/// requests per hour per shared IP).
+const CLIENT_DOWNLOADS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn client_downloads_cache_fresh(fetched_at: std::time::Instant) -> bool {
+    fetched_at.elapsed() < CLIENT_DOWNLOADS_TTL
+}
+
+/// (version, downloads) for the other-platform links: from the cache
+/// when fresh, else fetched from the GitHub API (mirrors first, direct
+/// last — same chain as the template download). Runs on a blocking
+/// thread: fetch_bytes builds its own runtime.
+fn refresh_client_downloads(
+    st: &ApiState,
+    custom: &str,
+) -> Result<(String, Vec<ClientDownload>), String> {
+    if let Ok(guard) = st.dl_cache.lock() {
+        if let Some((at, version, downloads)) = guard.as_ref() {
+            if client_downloads_cache_fresh(*at) {
+                return Ok((version.clone(), downloads.clone()));
+            }
+        }
+    }
+    let v = fetch_latest_release_json(custom)
+        .map_err(|e| format!("无法获取官方客户端版本信息：{e}"))?;
+    let (version, downloads) = parse_client_downloads(&v)?;
+    if let Ok(mut guard) = st.dl_cache.lock() {
+        *guard = Some((
+            std::time::Instant::now(),
+            version.clone(),
+            downloads.clone(),
+        ));
+    }
+    Ok((version, downloads))
 }
 
 /// Stream `url` to `dest` with the built-in downloader, aborting when
@@ -3311,6 +3443,67 @@ async fn client_config_view(
     }
 }
 
+/// Other-platform official client downloads, for the generate-client
+/// page: the latest official release's macOS / Linux / Android installers
+/// (official GitHub link + accelerated mirrors) and the iOS App Store
+/// link. Available to any logged-in user — these are public download
+/// links, and the manual-config card on the same page is open to every
+/// logged-in user too. When GitHub cannot be reached at all, this
+/// returns 502 instead of inventing a version.
+async fn client_downloads(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    if resolve_user(&st, &headers).await.is_none() {
+        return unauthorized();
+    }
+    // Read the mirror setting with the handler's own async runtime —
+    // custom_mirror() builds a throwaway runtime and must only run on
+    // plain (non-tokio) threads like the download jobs.
+    let custom = get_setting(&st.pool, "github_mirror")
+        .await
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let st2 = st.clone();
+    let custom2 = custom.clone();
+    let res =
+        tokio::task::spawn_blocking(move || refresh_client_downloads(&st2, &custom2)).await;
+    let (version, downloads) = match res {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return err_resp(StatusCode::BAD_GATEWAY, &e),
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let prefixes = mirror_prefixes(&custom);
+    let mut platforms: Vec<Value> = downloads
+        .iter()
+        .map(|d| {
+            let mirrors: Vec<String> = prefixes
+                .iter()
+                .map(|p| format!("{p}{}", d.url))
+                .collect();
+            json!({
+                "id": d.id,
+                "name": d.name,
+                "file": d.file,
+                "url": d.url,
+                "mirrors": mirrors,
+            })
+        })
+        .collect();
+    platforms.push(json!({
+        "id": "ios",
+        "name": "iOS",
+        "file": "",
+        "url": IOS_APP_STORE_URL,
+        "mirrors": [],
+    }));
+    jresp(
+        StatusCode::OK,
+        json!({ "ok": true, "version": version, "platforms": platforms }),
+    )
+}
+
 async fn gen_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMap) -> Response {
     let u = match resolve_user(&st, &headers).await {
         Some(u) => u,
@@ -3534,6 +3727,7 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/auth/logout", post(web_logout))
             .route("/api/me", get(me))
             .route("/api/client-config", get(client_config_view))
+            .route("/api/client-downloads", get(client_downloads))
             .route("/api/admin/overview", get(overview))
             .route("/api/admin/users", get(admin_users))
             .route("/api/admin/users/:name/password", post(admin_user_password))
@@ -3764,6 +3958,7 @@ pub fn run(
             tpl_job: std::sync::Mutex::new(TplJob::default()),
             upd_job: std::sync::Mutex::new(UpdJob::default()),
             guard: std::sync::Mutex::new(AuthGuard::default()),
+            dl_cache: std::sync::Mutex::new(None),
         });
         let tls = if tls_cert.is_empty() && tls_key.is_empty() {
             None
@@ -4092,7 +4287,7 @@ mod tests {
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
         assert_eq!(parse_pro_tag("v32 "), Some(32));
-        assert_eq!(current_pro_num(), 32);
+        assert_eq!(current_pro_num(), 33);
     }
 
     #[test]
@@ -4272,6 +4467,139 @@ mod tests {
             .expect("redirect fallback must reach GitHub");
         let n = parse_pro_tag(&tag).expect("redirect tag must be a vN tag");
         assert!(n >= 31, "expected at least v31, got {tag}");
+    }
+
+    fn release_fixture(tag: &str, names: &[&str]) -> Value {
+        let assets: Vec<Value> = names
+            .iter()
+            .map(|n| {
+                json!({
+                    "name": n,
+                    "browser_download_url": format!(
+                        "https://github.com/rustdesk/rustdesk/releases/download/{tag}/{n}"
+                    ),
+                })
+            })
+            .collect();
+        json!({ "tag_name": tag, "assets": assets })
+    }
+
+    #[test]
+    fn client_downloads_parse_real_1_5_3_assets() {
+        // The exact 1.5.3 asset list from the GitHub API (verified
+        // 2026-11-13): 10 of these are other-platform downloads, the
+        // rest (Windows installers, rpm/flatpak, sciter builds, the
+        // unattended-wayland deb, update metadata) must be ignored.
+        let names = [
+            "rustdesk-1.5.3-0-x86_64.pkg.tar.zst",
+            "rustdesk-1.5.3-0.aarch64-suse.rpm",
+            "rustdesk-1.5.3-0.aarch64.rpm",
+            "rustdesk-1.5.3-0.x86_64-suse.rpm",
+            "rustdesk-1.5.3-0.x86_64.rpm",
+            "rustdesk-1.5.3-aarch64-signed.apk",
+            "rustdesk-1.5.3-aarch64.AppImage",
+            "rustdesk-1.5.3-aarch64.deb",
+            "rustdesk-1.5.3-aarch64.dmg",
+            "rustdesk-1.5.3-aarch64.exe",
+            "rustdesk-1.5.3-aarch64.flatpak",
+            "rustdesk-1.5.3-aarch64.msi",
+            "rustdesk-1.5.3-armv7-sciter.deb",
+            "rustdesk-1.5.3-armv7-signed.apk",
+            "rustdesk-1.5.3-universal-signed.apk",
+            "rustdesk-1.5.3-unsigned.tar.gz",
+            "rustdesk-1.5.3-x86-sciter.exe",
+            "rustdesk-1.5.3-x86_64-sciter.deb",
+            "rustdesk-1.5.3-x86_64-sciter.flatpak",
+            "rustdesk-1.5.3-x86_64-signed.apk",
+            "rustdesk-1.5.3-x86_64.AppImage",
+            "rustdesk-1.5.3-x86_64.deb",
+            "rustdesk-1.5.3-x86_64.dmg",
+            "rustdesk-1.5.3-x86_64.exe",
+            "rustdesk-1.5.3-x86_64.flatpak",
+            "rustdesk-1.5.3-x86_64.msi",
+            "rustdesk-unattended-wayland-1.5.3-x86_64.deb",
+            "rustdesk-update.json",
+            "rustdesk-update.json.sig",
+            "rustdesk.sbom.json",
+        ];
+        let (version, downloads) =
+            parse_client_downloads(&release_fixture("1.5.3", &names)).unwrap();
+        assert_eq!(version, "1.5.3");
+        let ids: Vec<&str> = downloads.iter().map(|d| d.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "macos-x64",
+                "macos-arm64",
+                "linux-deb-x64",
+                "linux-deb-arm64",
+                "linux-appimage-x64",
+                "linux-appimage-arm64",
+                "android-arm64",
+                "android-x64",
+                "android-armv7",
+                "android-universal",
+            ]
+        );
+        assert_eq!(downloads[0].file, "rustdesk-1.5.3-x86_64.dmg");
+        assert_eq!(downloads[0].url, "https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg");
+        assert_eq!(downloads[2].file, "rustdesk-1.5.3-x86_64.deb");
+        assert_eq!(downloads[9].file, "rustdesk-1.5.3-universal-signed.apk");
+        // The unattended-wayland and sciter debs must not have matched.
+        assert!(downloads
+            .iter()
+            .all(|d| !d.file.contains("wayland") && !d.file.contains("sciter")));
+    }
+
+    #[test]
+    fn client_downloads_parse_edge_cases() {
+        // Missing tag: an error, never an invented version.
+        assert!(parse_client_downloads(&json!({ "assets": [] })).is_err());
+        // A 'v'-prefixed tag is accepted and stripped.
+        let (version, downloads) =
+            parse_client_downloads(&release_fixture("v9.9.9", &[])).unwrap();
+        assert_eq!(version, "9.9.9");
+        assert!(downloads.is_empty());
+        // A release with no matching assets yields an empty list.
+        let (version, downloads) = parse_client_downloads(&release_fixture(
+            "1.5.3",
+            &["rustdesk-1.5.3-x86_64.exe", "rustdesk-1.5.3-x86_64.msi"],
+        ))
+        .unwrap();
+        assert_eq!(version, "1.5.3");
+        assert!(downloads.is_empty());
+    }
+
+    #[test]
+    fn client_downloads_mirror_urls() {
+        let direct = "https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg";
+        // No custom mirror: built-ins only, direct excluded (it is the
+        // separate official link).
+        let ps = mirror_prefixes("");
+        assert_eq!(ps.len(), 5);
+        let urls: Vec<String> = ps.iter().map(|p| format!("{p}{direct}")).collect();
+        assert_eq!(
+            urls[0],
+            "https://gh-proxy.com/https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg"
+        );
+        assert!(urls.iter().all(|u| u.starts_with("https://")));
+        // Custom mirror comes first.
+        let ps = mirror_prefixes("https://m.example");
+        assert_eq!(ps.len(), 6);
+        assert_eq!(ps[0], "https://m.example/");
+        let urls: Vec<String> = ps.iter().map(|p| format!("{p}{direct}")).collect();
+        assert_eq!(
+            urls[0],
+            "https://m.example/https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg"
+        );
+    }
+
+    #[test]
+    fn client_downloads_cache_freshness() {
+        assert!(client_downloads_cache_fresh(std::time::Instant::now()));
+        let old = std::time::Instant::now()
+            - std::time::Duration::from_secs(2 * 3600);
+        assert!(!client_downloads_cache_fresh(old));
     }
 
 }

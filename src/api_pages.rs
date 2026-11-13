@@ -217,6 +217,9 @@ const CONSOLE_BODY: &str = r#"
 <div class="card"><h2>官方客户端手动配置</h2>
 <p class="muted">已经装好官方 RustDesk 客户端的用户不用下载上面的安装包：在官方客户端「设置 → 网络」里填入下面四项，保存后即可登录本服务器的账号使用。下面显示的值与生成客户端内置的配置完全一致。</p>
 <div id="cfg-body">加载中…</div></div>
+<div class="card"><h2>其他平台下载</h2>
+<p class="muted">其他平台请下载官方 RustDesk 客户端，安装后按上方「官方客户端手动配置」填写服务器地址与密钥，即可登录本服务器的账号使用。加速链接经 GitHub 镜像下载，官方链接直连 GitHub。</p>
+<div id="dl-body">加载中…</div></div>
 </section>
 
 <section id="s-settings">
@@ -285,7 +288,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));$('s-'+b.dataset.s).classList.add('active');
   if(b.dataset.s==='overview')loadOverview(); if(b.dataset.s==='devices')loadDevices();
   if(b.dataset.s==='users')loadUsers(); if(b.dataset.s==='tokens')loadTokens();
-  if(b.dataset.s==='genclient'){loadGen();loadCfg();} if(b.dataset.s==='settings')loadSettings();
+  if(b.dataset.s==='genclient'){loadGen();loadCfg();loadDl();} if(b.dataset.s==='settings')loadSettings();
 });
 $('dev-refresh').onclick=()=>loadDevices();
 $('logout').onclick=async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(e){} location.href='/console/login';};
@@ -363,6 +366,16 @@ async function loadCfg(){
   if(!j.configured){ $('cfg-body').innerHTML='<p class="muted">'+(ME.is_admin?'尚未在「服务器设置」里填写公网地址，填好后这里会显示客户端配置。':'管理员尚未填写服务器公网地址，暂时无法显示客户端配置。')+'</p>'; return; }
   const row=(label,val)=>'<label>'+label+'</label><div class="dl"><input readonly value="'+esc(val)+'"><button class="ghost" onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">复制</button></div>';
   $('cfg-body').innerHTML=row('ID 服务器',j.host)+row('中继服务器',j.relay)+row('API 服务器',j.api)+row('密钥（Key）',j.key);
+}
+async function loadDl(){
+  let j; try{ j=await api('/api/client-downloads'); }catch(e){ if(e.message!=='unauth')loadFail($('dl-body'),'loadDl'); return; }
+  if(!j.ok){ loadFail($('dl-body'),'loadDl',j.error); return; }
+  if(!j.platforms.length){ $('dl-body').innerHTML='<p class="muted">暂无可下载的版本。</p>'; return; }
+  const row=p=>{
+    const links='<a href="'+esc(p.url)+'" target="_blank" rel="noopener">官方下载</a>'+(p.mirrors&&p.mirrors.length?' ｜ <a href="'+esc(p.mirrors[0])+'" target="_blank" rel="noopener">加速下载</a>':'');
+    return '<tr><td>'+esc(p.name)+'</td><td class="fname">'+esc(p.file||'App Store')+'</td><td class="nowrap">'+links+'</td></tr>';
+  };
+  $('dl-body').innerHTML='<p class="muted">官方最新版本：'+esc(j.version)+'</p><table><tr><th>平台</th><th>文件</th><th>下载</th></tr>'+j.platforms.map(row).join('')+'</table>';
 }
 $('gen-btn').onclick=async()=>{
   const btn=$('gen-btn'); if(btn.disabled)return; btn.disabled=true;

@@ -384,9 +384,17 @@ cd rustdesk-server-pro-linux-*
 - 升级：停服 → 换 hbbs（hbbr 无改动，不用换）→ **Windows 下同时换 rdsvc.exe，Linux 下同步替换 start.sh / install-service.sh（Windows 下换 start.ps1）**——替换逻辑在启动器里，旧版启动器没有 `.new` 检查，暂存后重启不会生效 → 启动。API 调用说明见下节。
 - 验证：cargo test 56/56（debug 与 release，各含 9 个新增单测：版本号解析/比较、平台映射、版本参数校验、镜像候选、重定向取 tag、release 解析、解压往返）；端到端 55/55（debug 与 release：真实 GitHub 检测且更新日志与 release body 逐字一致、v31 真实下载暂存、监督脚本模拟重启替换后文件哈希与暂存一致、服务恢复响应）；全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、客户端配置 31/31 ×2、就近选路 12/12 ×2）。真机边界：rdsvc 与 start.ps1 的替换逻辑只在交叉编译 + go vet + 编码检查层面验证过，需在真实 Windows 服务环境确认；systemd 的 `ExecStartPre` 需在真实 Ubuntu 上确认。
 
+## v33：生成客户端页增加其他平台官方下载链接
+
+- 功能（2026-11-13）：控制台「生成客户端」页新增「其他平台下载」区，列出最新官方客户端的 macOS（Intel / Apple 芯片 dmg）、Linux（x86_64 与 ARM64 的 .deb 与 AppImage）、Android（arm64 / x86_64 / armv7 / 通用 apk）安装包，每个平台一行：官方 GitHub 直链 + 加速下载链接；另有 iOS 的 App Store 直链（iOS 没有 GitHub 安装包，不走镜像）。其他平台用户装好官方客户端后，按上方「官方客户端手动配置」卡片填写服务器地址与密钥即可使用。本版只做下载链接，不做多平台预绑定生成（Windows 生成客户端不变）。
+- 接口：新增 `GET /api/client-downloads`（任何登录用户可用，与 `/api/client-config` 同级），返回 `{"ok":true,"version":"1.5.3","platforms":[{"id","name","file","url","mirrors":[...]}]}`。版本号与文件名来自 api.github.com 上 rustdesk/rustdesk 的 `releases/latest`：文件名是 release 里真实的 asset 名（按 `rustdesk-{版本}-` 前缀 + 已知后缀匹配，改名或缺失的 asset 直接让该平台不出列表，绝不拼一个没验证过的链接）；`url` 取 asset 自身的 `browser_download_url`。查不到版本时返回 502 + 中文明错，不编造版本号。
+- 缓存与加速：上游 release 数据内存缓存 1 小时（GitHub 未登录 API 限流 60 次/小时/共享 IP，生成页每次打开都查会很快撞上限）；加速链接不进缓存，每次请求按当前 `github_mirror` 设置现算——管理员改镜像后立即生效。加速用模板下载与在线更新的同一条镜像链（管理员自定义镜像优先，其次内置镜像，最后直连），没有第二套镜像逻辑。检测复用模板下载的最新版解析（镜像优先、直连兜底）。
+- 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
+- 验证：新增 4 个单元测试（按真实 1.5.3 asset 名解析 10 个平台并排除 Windows 安装包/rpm/flatpak/sciter/wayland 变体、缺 tag 报错、镜像 URL 生成、缓存新鲜度），cargo test 60/60（debug 与 release）；端到端 50/50（debug 与 release：版本号与 `gh api` 的最新版一致、平台文件与真实 asset 名逐项核对、官方 URL 格式、镜像含已配置的自定义前缀、匿名 401、普通用户可访问、控制台页面标记）。全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、客户端配置 31/31 ×2、就近选路 12/12 ×2），debug 与 release 均通过。本版改动为全平台统一逻辑，无新增 Windows/release 专属分支，无新增真机确认项。
+
 ## API 调用说明
 
-服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。
+服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/client-downloads`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。
 
 ### Base URL
 
@@ -511,6 +519,25 @@ curl -s http://203.0.113.10:21114/api/client-config \
 ```
 
 （`key` 为 44 字符、以 `=` 结尾的服务端公钥，上例为占位符。）
+
+**其他平台下载链接** `GET /api/client-downloads`（v33 起）：任意登录用户可查，返回最新官方客户端各平台的下载信息（与控制台「其他平台下载」区一致）。`url` 为官方 GitHub 直链，`mirrors` 为加速链接（管理员 `github_mirror` 设置优先，其次内置镜像链）；iOS 只有 App Store 直链，`mirrors` 为空。GitHub 不可达时返回 502（不编造版本号）；上游数据缓存 1 小时，镜像按当前设置每次现算：
+
+```bash
+curl -s http://203.0.113.10:21114/api/client-downloads \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"ok":true,"version":"1.5.3","platforms":[
+ {"file":"rustdesk-1.5.3-x86_64.dmg","id":"macos-x64","mirrors":[
+  "https://gh-proxy.com/https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg",
+  "…（其余内置镜像）"],"name":"macOS（Intel）",
+  "url":"https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg"},
+ {"file":"","id":"ios","mirrors":[],"name":"iOS",
+  "url":"https://apps.apple.com/us/app/rustdesk-remote-desktop/id1581225015"}]}
+```
+
+（上例截断：实际返回 11 个平台——macOS 2 个、Linux 4 个、Android 4 个、iOS 1 个；Windows 不在其中，Windows 请用生成客户端。）
 
 **Token 管理**：创建 `POST /api/tokens`（body `{"name":"..."}`，name 可省略，默认为 `default`），返回的 `token` 只显示这一次，请立即保存；列表 `GET /api/tokens`（只返回 id/name/时间，不返回 token 值）；删除 `DELETE /api/tokens/:id`：
 
