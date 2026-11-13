@@ -39,9 +39,14 @@ pub struct ApiState {
     pool: SqlitePool,
     clients_dir: PathBuf,
     templates_dir: PathBuf,
+    /// Server directory (the exe directory; anchor_to_exe_dir runs at
+    /// startup, so this is the process working directory). Staged
+    /// update binaries land here, never anywhere else.
+    exe_dir: PathBuf,
     peer_db_path: String,
     key_override: String,
     tpl_job: std::sync::Mutex<TplJob>,
+    upd_job: std::sync::Mutex<UpdJob>,
     guard: std::sync::Mutex<AuthGuard>,
 }
 
@@ -50,6 +55,25 @@ pub struct ApiState {
 pub struct TplJob {
     running: bool,
     phase: String, // idle | downloading | done | error
+    version: String,
+    total: u64,
+    source: String,
+    error: String,
+}
+
+/// Fork release number ("32" displays as v32 in the console and is
+/// compared against our GitHub release tags for one-click updates).
+/// Bump once per release, together with dist-pro/VERSION.
+/// NOTE: this deliberately does NOT live in version.rs — build.rs
+/// regenerates that file on every build (see hbb_common::gen_version)
+/// and would wipe a hand-written constant.
+const PRO_VERSION: &str = "32";
+
+/// Progress state of the background one-click server update download.
+#[derive(Default)]
+pub struct UpdJob {
+    running: bool,
+    phase: String, // idle | downloading | extracting | done | error
     version: String,
     total: u64,
     source: String,
@@ -1954,6 +1978,61 @@ const GH_MIRRORS: [&str; 5] = [
     "https://ghps.cc/",
 ];
 
+/// GitHub acceleration prefixes in try order: the admin's custom
+/// mirror (if configured) first, then the built-in mirrors. The
+/// template download and the one-click update share this list and the
+/// same `github_mirror` setting; there is no second mirror setting.
+/// Every prefix ends with '/', so callers can append a full URL
+/// directly (`format!("{prefix}{url}")`).
+fn mirror_prefixes(custom: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !custom.is_empty() {
+        out.push(format!("{custom}/"));
+    }
+    for m in GH_MIRRORS {
+        out.push(m.to_string());
+    }
+    out
+}
+
+/// Ordered download candidates for one GitHub URL: custom mirror,
+/// built-in mirrors, then direct. Each entry is (label, url).
+fn github_candidates(custom: &str, direct: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if !custom.is_empty() {
+        out.push((
+            format!("自定义镜像 {custom}"),
+            format!("{custom}/{direct}"),
+        ));
+    }
+    for m in GH_MIRRORS {
+        out.push((m.to_string(), format!("{m}{direct}")));
+    }
+    out.push(("直连 GitHub".to_string(), direct.to_string()));
+    out
+}
+
+/// The admin-configured GitHub mirror prefix (trimmed, no trailing
+/// '/'), read from settings. The background download threads have no
+/// async runtime, so this builds a throwaway one like the template job.
+fn custom_mirror(st: &ApiState) -> String {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+    let raw = match rt {
+        Ok(rt) => rt.block_on(get_setting(&st.pool, "github_mirror")),
+        Err(_) => String::new(),
+    };
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// GET a small JSON document with the built-in downloader (one attempt).
+fn fetch_json(url: &str, timeout_secs: u64) -> Result<Value, String> {
+    let bytes = fetch_bytes(url, timeout_secs)?;
+    let text = String::from_utf8_lossy(&bytes);
+    serde_json::from_str(&text).map_err(|e| format!("解析响应失败：{e}"))
+}
+
 fn tpl_part_path(st: &ApiState) -> PathBuf {
     st.templates_dir.join("rustdesk-windows.exe.part")
 }
@@ -2116,16 +2195,7 @@ fn run_template_job(st: Arc<ApiState>, version_req: String) {
             return;
         }
     }
-    let custom_mirror = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        match rt {
-            Ok(rt) => rt.block_on(get_setting(&st.pool, "github_mirror")),
-            Err(_) => String::new(),
-        }
-    };
-    let custom: String = custom_mirror.trim().trim_end_matches('/').to_string();
+    let custom = custom_mirror(&st);
     let (version, total) = if !version_req.trim().is_empty() {
         (
             version_req.trim().trim_start_matches('v').to_string(),
@@ -2146,17 +2216,7 @@ fn run_template_job(st: Arc<ApiState>, version_req: String) {
     });
     let direct =
         format!("https://github.com/rustdesk/rustdesk/releases/download/{version}/rustdesk-{version}-x86_64.exe");
-    let mut candidates: Vec<(String, String)> = Vec::new();
-    if !custom.is_empty() {
-        candidates.push((
-            format!("自定义镜像 {custom}"),
-            format!("{custom}/{direct}"),
-        ));
-    }
-    for m in GH_MIRRORS {
-        candidates.push((m.to_string(), format!("{m}{direct}")));
-    }
-    candidates.push(("直连 GitHub".to_string(), direct));
+    let candidates = github_candidates(&custom, &direct);
     let mut last_err = String::new();
     for (label, url) in candidates {
         set_job(&st, |j| j.source = label.clone());
@@ -2279,6 +2339,622 @@ async fn template_status(
             "template_version": get_setting(&st.pool, "tpl_version").await,
         }),
     )
+}
+
+// ------------------------- one-click server update -------------------------
+// The console can check our GitHub Releases for a newer fork version,
+// download the matching release zip, and stage the new hbbs/hbbr
+// binaries as `<exe>.new` next to the running ones. The staged files
+// are swapped in by the launcher (rdsvc / start.sh / start.ps1 /
+// systemd) on the next start — never by hbbs itself, because on
+// Windows a running exe is locked and cannot replace itself.
+// Downloads reuse the template pipeline's mirror chain and the same
+// `github_mirror` setting. The version parameter is strictly
+// validated (`^v[0-9]+$`) and only ever addresses our own repo's
+// releases; no caller-supplied URL is fetched.
+
+const UPDATE_REPO_API: &str = "https://api.github.com/repos/wirh/rustdesk-server-pro";
+const UPDATE_RELEASES_PAGE: &str =
+    "https://github.com/wirh/rustdesk-server-pro/releases/latest";
+const UPDATE_ASSET_PREFIX: &str =
+    "https://github.com/wirh/rustdesk-server-pro/releases/download/";
+
+/// "v32" (or a bare "32") -> Some(32); anything else -> None.
+fn parse_pro_tag(tag: &str) -> Option<u64> {
+    let t = tag.trim().trim_start_matches('v');
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse::<u64>().ok()
+}
+
+fn current_pro_num() -> u64 {
+    parse_pro_tag(PRO_VERSION).unwrap_or(0)
+}
+
+/// Strict `^v[0-9]+$` check for the download endpoint's version
+/// parameter (and for tags extracted from redirect URLs).
+fn valid_version_param(v: &str) -> bool {
+    let t = v.trim();
+    t.len() > 1 && t.starts_with('v') && t[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Release-package platform for (OS, arch, musl). Kept as a pure
+/// function of its inputs so every platform maps in unit tests; the
+/// live value comes from `this_platform` below.
+fn package_for_platform(os: &str, arch: &str, musl: bool) -> Option<&'static str> {
+    match (os, arch, musl) {
+        ("windows", "x86_64", _) => Some("windows-x86_64"),
+        ("linux", "x86_64", _) => Some("linux-x86_64-glibc"),
+        ("linux", "aarch64", false) => Some("linux-aarch64-glibc"),
+        ("linux", "aarch64", true) => Some("linux-aarch64-musl"),
+        _ => None,
+    }
+}
+
+fn this_platform() -> Option<&'static str> {
+    package_for_platform(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "musl"),
+    )
+}
+
+fn update_asset_name(version: &str, platform: &str) -> String {
+    format!("rustdesk-server-pro-{platform}-{version}.zip")
+}
+
+/// GET a GitHub API JSON document: direct first, then each mirror in
+/// order. A failed attempt falls through to the next source; only the
+/// last error is reported.
+fn fetch_github_api(custom: &str, api_url: &str) -> Result<Value, String> {
+    match fetch_json(api_url, 15) {
+        Ok(v) => return Ok(v),
+        Err(e) => {
+            let mut last_err = e;
+            for m in mirror_prefixes(custom) {
+                match fetch_json(&format!("{m}{api_url}"), 15) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => last_err = e,
+                }
+            }
+            Err(last_err)
+        }
+    }
+}
+
+/// What an update check found. `notes_unavailable` means the version
+/// came from the redirect fallback, which has no release body.
+struct CheckOutcome {
+    tag: String,
+    body: String,
+    published_at: String,
+    notes_unavailable: bool,
+}
+
+fn parse_release_json(v: &Value) -> Result<CheckOutcome, String> {
+    let tag = v
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    if tag.is_empty() {
+        return Err("GitHub 返回的发布信息里没有版本号".to_string());
+    }
+    Ok(CheckOutcome {
+        tag,
+        body: v
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string(),
+        published_at: v
+            .get("published_at")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string(),
+        notes_unavailable: false,
+    })
+}
+
+/// Extract a vN tag from a release URL: ".../releases/tag/v31", or a
+/// trailing "v31" segment (query strings and fragments ignored).
+fn tag_from_url(url: &str) -> Option<String> {
+    let url = url.trim_end_matches('/');
+    if let Some(idx) = url.find("/tag/") {
+        let seg = url[idx + 5..].split(['/', '?', '#']).next().unwrap_or("");
+        if valid_version_param(seg) {
+            return Some(seg.to_string());
+        }
+    }
+    let last = url
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    if valid_version_param(last) {
+        return Some(last.to_string());
+    }
+    None
+}
+
+/// Read the version tag from the /releases/latest redirect without
+/// following it in the HTTP client (a second hop to github.com would
+/// bypass the mirror that just worked). The Location header carries
+/// ".../releases/tag/v31". If a mirror already followed the redirect
+/// and returned 200, the final URL is tried instead.
+fn fetch_redirect_tag(url: &str) -> Result<String, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("初始化下载组件失败：{e}"))?;
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .user_agent("hbbs-api")
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("初始化下载组件失败：{e}"))?;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("请求失败：{e}"))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            match resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+            {
+                Some(loc) => tag_from_url(loc)
+                    .ok_or_else(|| format!("重定向地址里没有版本号：{loc}")),
+                None => Err("重定向响应缺少 Location".to_string()),
+            }
+        } else if status.is_success() {
+            tag_from_url(resp.url().as_str())
+                .ok_or_else(|| "响应地址里没有版本号".to_string())
+        } else {
+            Err(format!("请求失败：HTTP {status}"))
+        }
+    })
+}
+
+/// Check our repo's latest release, with acceleration retries: direct
+/// GitHub API first, then the API through each mirror, then the
+/// /releases/latest page (redirect tag only, no release notes) through
+/// each mirror and direct. Only when every path fails is the check a
+/// failure.
+fn check_latest_release(custom: &str) -> Result<CheckOutcome, String> {
+    let api_url = format!("{UPDATE_REPO_API}/releases/latest");
+    if let Ok(v) = fetch_github_api(custom, &api_url) {
+        return parse_release_json(&v);
+    }
+    let page = UPDATE_RELEASES_PAGE;
+    let mut page_urls: Vec<String> = mirror_prefixes(custom)
+        .into_iter()
+        .map(|m| format!("{m}{page}"))
+        .collect();
+    page_urls.push(page.to_string());
+    for u in page_urls {
+        if let Ok(tag) = fetch_redirect_tag(&u) {
+            return Ok(CheckOutcome {
+                tag,
+                body: String::new(),
+                published_at: String::new(),
+                notes_unavailable: true,
+            });
+        }
+    }
+    Err("检测更新失败：已尝试直连与 GitHub 加速镜像，均无法获取更新信息，请稍后重试".to_string())
+}
+
+fn exe_file_name(base: &str) -> String {
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
+}
+
+fn upd_part_path(st: &ApiState) -> PathBuf {
+    st.exe_dir.join("update").join("update.zip.part")
+}
+
+fn staged_hbbs(exe_dir: &std::path::Path) -> PathBuf {
+    exe_dir.join(format!("{}.new", exe_file_name("hbbs")))
+}
+
+fn staged_hbbr(exe_dir: &std::path::Path) -> PathBuf {
+    exe_dir.join(format!("{}.new", exe_file_name("hbbr")))
+}
+
+fn staged_meta(exe_dir: &std::path::Path) -> PathBuf {
+    exe_dir.join("update").join("staged.json")
+}
+
+/// The staged version, if a complete staged update is present (both
+/// `.new` binaries plus the marker file).
+fn staged_version(exe_dir: &std::path::Path) -> Option<String> {
+    if !staged_hbbs(exe_dir).exists() || !staged_hbbr(exe_dir).exists() {
+        return None;
+    }
+    let text = std::fs::read_to_string(staged_meta(exe_dir)).ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn file_starts_with_pk(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    match std::fs::File::open(path) {
+        Ok(mut f) => f.read_exact(&mut buf).is_ok() && &buf == b"PK\x03\x04",
+        Err(_) => false,
+    }
+}
+
+/// Extract hbbs + hbbr from a release zip into `<exe>.new` staging
+/// files. The zip has one top folder whose name varies, so entries are
+/// matched by file name. Each binary is written to a `.tmp` file and
+/// renamed into place; a partial extraction cleans up after itself.
+fn extract_update(zip_path: &std::path::Path, exe_dir: &std::path::Path) -> Result<(), String> {
+    if !file_starts_with_pk(zip_path) {
+        return Err("更新包不是有效的 ZIP 文件".to_string());
+    }
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("打开更新包失败：{e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("读取更新包失败：{e}"))?;
+    let want = [exe_file_name("hbbs"), exe_file_name("hbbr")];
+    let mut found = [false, false];
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取更新包失败：{e}"))?;
+        let name = entry.name().to_string();
+        let base = name.rsplit('/').next().unwrap_or("");
+        for (k, w) in want.iter().enumerate() {
+            if found[k] || base != w {
+                continue;
+            }
+            let tmp = exe_dir.join(format!("{w}.new.tmp"));
+            {
+                let mut out =
+                    std::fs::File::create(&tmp).map_err(|e| format!("写入暂存文件失败：{e}"))?;
+                std::io::copy(&mut entry, &mut out).map_err(|e| format!("解压 {w} 失败：{e}"))?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &tmp,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+            let dest = exe_dir.join(format!("{w}.new"));
+            std::fs::rename(&tmp, &dest).map_err(|e| format!("暂存 {w} 失败：{e}"))?;
+            found[k] = true;
+        }
+    }
+    if !found.iter().all(|f| *f) {
+        for w in want {
+            let _ = std::fs::remove_file(exe_dir.join(format!("{w}.new")));
+            let _ = std::fs::remove_file(exe_dir.join(format!("{w}.new.tmp")));
+        }
+        return Err("更新包里没有找到 hbbs / hbbr".to_string());
+    }
+    Ok(())
+}
+
+fn set_upd_job(st: &ApiState, f: impl FnOnce(&mut UpdJob)) {
+    if let Ok(mut j) = st.upd_job.lock() {
+        f(&mut j);
+    }
+}
+
+fn cleanup_staged(exe_dir: &std::path::Path) {
+    for w in [exe_file_name("hbbs"), exe_file_name("hbbr")] {
+        let _ = std::fs::remove_file(exe_dir.join(format!("{w}.new")));
+        let _ = std::fs::remove_file(exe_dir.join(format!("{w}.new.tmp")));
+    }
+    let _ = std::fs::remove_file(staged_meta(exe_dir));
+}
+
+/// Background update download with GitHub mirror failover. Runs on a
+/// plain thread; progress is read from the .part file size by the
+/// status endpoint. On any failure the partial download and any
+/// staged binaries are removed, so a failed update never leaves a
+/// half-applied state behind.
+fn run_update_job(st: Arc<ApiState>, version: String) {
+    let exe_dir = st.exe_dir.clone();
+    let finish_err = |st: &ApiState, msg: String| {
+        set_upd_job(st, |j| {
+            j.running = false;
+            j.phase = "error".into();
+            j.error = msg;
+        });
+    };
+    let platform = match this_platform() {
+        Some(p) => p,
+        None => {
+            finish_err(&st, "当前平台不支持在线更新".to_string());
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(exe_dir.join("update")) {
+        finish_err(&st, e.to_string());
+        return;
+    }
+    let custom = custom_mirror(&st);
+    let api_url = format!("{UPDATE_REPO_API}/releases/tags/{version}");
+    let asset_name = update_asset_name(&version, platform);
+    // Resolve the asset URL from the release metadata. If the API
+    // lookup fails (rate-limited, blocked, or the release is gone),
+    // fall back to the deterministic download URL instead of failing
+    // outright: the asset is still fetched through the mirror chain,
+    // and a release that does not exist 404s on every source and ends
+    // in the error phase. The fallback URL is built from the validated
+    // version and the compile-time platform only — never from caller
+    // input — so the no-arbitrary-URL guarantee still holds.
+    let (asset_url, total) = match fetch_github_api(&custom, &api_url) {
+        Ok(release) => {
+            let mut url = String::new();
+            let mut size = 0u64;
+            if let Some(assets) = release.get("assets").and_then(|a| a.as_array()) {
+                for a in assets {
+                    if a.get("name").and_then(|n| n.as_str())
+                        == Some(asset_name.as_str())
+                    {
+                        url = a
+                            .get("browser_download_url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                    }
+                }
+            }
+            if url.is_empty() || !url.starts_with(UPDATE_ASSET_PREFIX) {
+                finish_err(&st, format!("{version} 没有 {platform} 平台的安装包"));
+                return;
+            }
+            (url, size)
+        }
+        Err(_) => (
+            format!("{UPDATE_ASSET_PREFIX}{version}/{asset_name}"),
+            0,
+        ),
+    };
+    set_upd_job(&st, |j| {
+        j.version = version.clone();
+        j.total = total;
+    });
+    let part = upd_part_path(&st);
+    let mut last_err = String::new();
+    let mut ok = false;
+    for (label, url) in github_candidates(&custom, &asset_url) {
+        set_upd_job(&st, |j| j.source = label.clone());
+        let _ = std::fs::remove_file(&part);
+        match download_to_file(&url, &part, 1800) {
+            Ok(()) => {
+                let len = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                let size_ok = len >= 1_000_000 && (total == 0 || len == total);
+                if size_ok && file_starts_with_pk(&part) {
+                    ok = true;
+                    break;
+                }
+                last_err =
+                    format!("{label} 返回的文件不完整或不是有效的更新包（{len} 字节）");
+            }
+            Err(e) => last_err = format!("{label}：{e}"),
+        }
+    }
+    if !ok {
+        let _ = std::fs::remove_file(&part);
+        finish_err(
+            &st,
+            format!("{version} 的更新包下载失败，所有下载源都失败了。最后错误：{last_err}"),
+        );
+        return;
+    }
+    // On the deterministic-URL fallback path the package size is
+    // unknown until the download finishes; report the real size so
+    // the status endpoint is accurate on both paths.
+    if total == 0 {
+        let len = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        set_upd_job(&st, |j| j.total = len);
+    }
+    set_upd_job(&st, |j| j.phase = "extracting".into());
+    match extract_update(&part, &exe_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&part);
+            // `version` passed the strict ^v[0-9]+$ check, so it needs
+            // no JSON escaping here.
+            let _ = std::fs::write(
+                staged_meta(&exe_dir),
+                format!("{{\"version\":\"{version}\"}}"),
+            );
+            set_upd_job(&st, |j| {
+                j.running = false;
+                j.phase = "done".into();
+                j.error = String::new();
+            });
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            cleanup_staged(&exe_dir);
+            finish_err(&st, e);
+        }
+    }
+}
+
+async fn update_status(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    if !u.is_admin {
+        return forbidden();
+    }
+    let (running, phase, version, total, source, error) = match st.upd_job.lock() {
+        Ok(j) => (
+            j.running,
+            j.phase.clone(),
+            j.version.clone(),
+            j.total,
+            j.source.clone(),
+            j.error.clone(),
+        ),
+        Err(_) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "状态锁异常"),
+    };
+    let downloaded = std::fs::metadata(upd_part_path(&st))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let staged = staged_version(&st.exe_dir);
+    jresp(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "current": format!("v{}", PRO_VERSION),
+            "current_num": current_pro_num(),
+            "upstream_base": crate::version::VERSION,
+            "platform": this_platform().unwrap_or("unknown"),
+            "staged": staged.is_some(),
+            "staged_version": staged,
+            "state": if phase.is_empty() { "idle".to_string() } else { phase },
+            "running": running,
+            "version": version,
+            "total": total,
+            "downloaded": downloaded,
+            "source": source,
+            "error": error,
+        }),
+    )
+}
+
+async fn update_check(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    if !u.is_admin {
+        return forbidden();
+    }
+    // Read the mirror setting with the handler's own async runtime —
+    // custom_mirror() builds a throwaway runtime and must only run on
+    // plain (non-tokio) threads like the download jobs.
+    let custom = get_setting(&st.pool, "github_mirror")
+        .await
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    // The check can take a while when every source is slow (direct
+    // API, then each mirror, then the redirect fallback), so it runs
+    // on a blocking thread instead of an API worker.
+    let res = tokio::task::spawn_blocking(move || check_latest_release(&custom)).await;
+    match res {
+        Ok(Ok(out)) => {
+            let has_update = parse_pro_tag(&out.tag)
+                .map(|n| n > current_pro_num())
+                .unwrap_or(false);
+            jresp(
+                StatusCode::OK,
+                json!({
+                    "ok": true,
+                    "latest": out.tag,
+                    "has_update": has_update,
+                    "release_notes": out.body,
+                    "notes_unavailable": out.notes_unavailable,
+                    "published_at": out.published_at,
+                }),
+            )
+        }
+        Ok(Err(e)) => err_resp(StatusCode::BAD_GATEWAY, &e),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn update_download(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    if !u.is_admin {
+        return forbidden();
+    }
+    let v = parse_body(&body);
+    let version = sfield(&v, "version");
+    if !valid_version_param(&version) {
+        return err_resp(StatusCode::BAD_REQUEST, "版本号格式不正确（应为 v32 这样的格式）");
+    }
+    if this_platform().is_none() {
+        return err_resp(StatusCode::BAD_REQUEST, "当前平台不支持在线更新");
+    }
+    let already = {
+        match st.upd_job.lock() {
+            Ok(mut j) => {
+                if j.running {
+                    true
+                } else {
+                    *j = UpdJob {
+                        running: true,
+                        phase: "downloading".into(),
+                        version: String::new(),
+                        total: 0,
+                        source: String::new(),
+                        error: String::new(),
+                    };
+                    false
+                }
+            }
+            Err(_) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "状态锁异常"),
+        }
+    };
+    if !already {
+        let st2 = st.clone();
+        std::thread::spawn(move || run_update_job(st2, version));
+    }
+    jresp(StatusCode::OK, json!({ "ok": true, "started": !already }))
+}
+
+async fn update_restart(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    if !u.is_admin {
+        return forbidden();
+    }
+    if staged_version(&st.exe_dir).is_none() {
+        return err_resp(StatusCode::BAD_REQUEST, "没有已暂存的更新，无法重启生效");
+    }
+    // Answer first, then exit: the launcher (rdsvc / start.sh /
+    // start.ps1 / systemd) swaps the staged binaries in and starts the
+    // new version. A directly-run hbbs stays down until started again
+    // by hand — the console says so.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::process::exit(0);
+    });
+    jresp(StatusCode::OK, json!({ "ok": true }))
 }
 
 /// Build the generated client file name exactly the way the official client
@@ -2868,6 +3544,10 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/admin/settings", get(settings_get).post(settings_post))
             .route("/api/admin/template/download", post(template_download))
             .route("/api/admin/template/status", get(template_status))
+            .route("/api/admin/update/status", get(update_status))
+            .route("/api/admin/update/check", post(update_check))
+            .route("/api/admin/update/download", post(update_download))
+            .route("/api/admin/update/restart", post(update_restart))
             .route("/api/admin/gen-client", post(gen_client))
             .route("/api/admin/gen-clients", get(gen_list))
             .route("/api/admin/gen-clients/:id", delete(gen_delete));
@@ -3078,9 +3758,11 @@ pub fn run(
             pool,
             clients_dir: cwd.join("clients"),
             templates_dir: cwd.join("client-templates"),
+            exe_dir: cwd.clone(),
             peer_db_path: "db_v2.sqlite3".to_string(),
             key_override,
             tpl_job: std::sync::Mutex::new(TplJob::default()),
+            upd_job: std::sync::Mutex::new(UpdJob::default()),
             guard: std::sync::Mutex::new(AuthGuard::default()),
         });
         let tls = if tls_cert.is_empty() && tls_key.is_empty() {
@@ -3399,4 +4081,197 @@ mod tests {
         let (h, _, _) = client_addrs("rd.example.com:9999", "", "", "");
         assert_eq!(h, "rd.example.com:21116");
     }
+
+    #[test]
+    fn update_tag_parsing() {
+        assert_eq!(parse_pro_tag("v32"), Some(32));
+        assert_eq!(parse_pro_tag("32"), Some(32));
+        assert_eq!(parse_pro_tag("v031"), Some(31));
+        assert_eq!(parse_pro_tag("v32.1"), None);
+        assert_eq!(parse_pro_tag("latest"), None);
+        assert_eq!(parse_pro_tag("v"), None);
+        assert_eq!(parse_pro_tag(""), None);
+        assert_eq!(parse_pro_tag("v32 "), Some(32));
+        assert_eq!(current_pro_num(), 32);
+    }
+
+    #[test]
+    fn update_version_param() {
+        assert!(valid_version_param("v32"));
+        assert!(valid_version_param("v1"));
+        assert!(!valid_version_param("32"));
+        assert!(!valid_version_param("v"));
+        assert!(!valid_version_param("v32x"));
+        assert!(!valid_version_param("v32.1"));
+        assert!(!valid_version_param("https://example.com/x.zip"));
+        assert!(!valid_version_param(""));
+    }
+
+    #[test]
+    fn update_platform_mapping() {
+        assert_eq!(
+            package_for_platform("windows", "x86_64", false),
+            Some("windows-x86_64")
+        );
+        assert_eq!(
+            package_for_platform("linux", "x86_64", false),
+            Some("linux-x86_64-glibc")
+        );
+        assert_eq!(
+            package_for_platform("linux", "aarch64", false),
+            Some("linux-aarch64-glibc")
+        );
+        assert_eq!(
+            package_for_platform("linux", "aarch64", true),
+            Some("linux-aarch64-musl")
+        );
+        assert_eq!(package_for_platform("macos", "x86_64", false), None);
+        assert_eq!(package_for_platform("linux", "arm", false), None);
+        assert_eq!(package_for_platform("windows", "aarch64", false), None);
+        // This machine: Linux x86_64 glibc.
+        assert_eq!(this_platform(), Some("linux-x86_64-glibc"));
+    }
+
+    #[test]
+    fn update_asset_name_format() {
+        assert_eq!(
+            update_asset_name("v32", "linux-x86_64-glibc"),
+            "rustdesk-server-pro-linux-x86_64-glibc-v32.zip"
+        );
+        assert_eq!(
+            update_asset_name("v31", "windows-x86_64"),
+            "rustdesk-server-pro-windows-x86_64-v31.zip"
+        );
+    }
+
+    #[test]
+    fn update_mirror_candidates() {
+        let cs = github_candidates("", "https://github.com/x/y");
+        assert_eq!(cs.len(), 6); // 5 built-in mirrors + direct
+        assert_eq!(cs[0].0, "https://gh-proxy.com/");
+        assert_eq!(cs[0].1, "https://gh-proxy.com/https://github.com/x/y");
+        assert_eq!(cs[5].0, "直连 GitHub");
+        assert_eq!(cs[5].1, "https://github.com/x/y");
+        let cs = github_candidates("https://m.example", "https://github.com/x/y");
+        assert_eq!(cs.len(), 7);
+        assert_eq!(cs[0].0, "自定义镜像 https://m.example");
+        assert_eq!(cs[0].1, "https://m.example/https://github.com/x/y");
+        let ps = mirror_prefixes("https://m.example");
+        assert_eq!(ps[0], "https://m.example/");
+        assert!(ps.iter().all(|p| p.ends_with('/')));
+    }
+
+    #[test]
+    fn update_tag_from_url() {
+        assert_eq!(
+            tag_from_url("https://github.com/wirh/rustdesk-server-pro/releases/tag/v31"),
+            Some("v31".to_string())
+        );
+        assert_eq!(
+            tag_from_url("https://github.com/wirh/rustdesk-server-pro/releases/tag/v31/"),
+            Some("v31".to_string())
+        );
+        assert_eq!(
+            tag_from_url("https://github.com/x/y/releases/tag/v32?foo=1"),
+            Some("v32".to_string())
+        );
+        assert_eq!(
+            tag_from_url("https://example.com/dl/v33"),
+            Some("v33".to_string())
+        );
+        assert_eq!(tag_from_url("https://github.com/x/y/releases"), None);
+        assert_eq!(
+            tag_from_url("https://github.com/x/y/releases/tag/latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn update_parse_release_json() {
+        let v: Value = serde_json::from_str(
+            r##"{"tag_name":"v33","body":"# v33\n\n- fix A","published_at":"2026-11-14T00:00:00Z"}"##,
+        )
+        .unwrap();
+        let out = parse_release_json(&v).unwrap();
+        assert_eq!(out.tag, "v33");
+        assert_eq!(out.body, "# v33\n\n- fix A");
+        assert_eq!(out.published_at, "2026-11-14T00:00:00Z");
+        assert!(!out.notes_unavailable);
+        let v: Value = serde_json::from_str(r#"{"body":"x"}"#).unwrap();
+        assert!(parse_release_json(&v).is_err());
+    }
+
+    #[test]
+    fn update_extract_roundtrip() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let exe_dir = dir.path();
+        let hbbs_name = exe_file_name("hbbs");
+        let hbbr_name = exe_file_name("hbbr");
+        // Build a release-shaped zip: one top folder, both binaries,
+        // plus an unrelated file that must be ignored.
+        let zip_path = exe_dir.join("rel.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file(format!("rustdesk-server-pro-test/{hbbs_name}"), opts)
+                .unwrap();
+            zw.write_all(b"fake-hbbs-binary").unwrap();
+            zw.start_file(format!("rustdesk-server-pro-test/{hbbr_name}"), opts)
+                .unwrap();
+            zw.write_all(b"fake-hbbr-binary").unwrap();
+            zw.start_file("rustdesk-server-pro-test/README.md", opts)
+                .unwrap();
+            zw.write_all(b"readme").unwrap();
+            zw.finish().unwrap();
+        }
+        extract_update(&zip_path, exe_dir).unwrap();
+        assert_eq!(
+            std::fs::read(staged_hbbs(exe_dir)).unwrap(),
+            b"fake-hbbs-binary"
+        );
+        assert_eq!(
+            std::fs::read(staged_hbbr(exe_dir)).unwrap(),
+            b"fake-hbbr-binary"
+        );
+        assert!(!exe_dir.join("README.md").exists());
+        // No marker yet: not a complete staged update.
+        assert_eq!(staged_version(exe_dir), None);
+        std::fs::create_dir_all(exe_dir.join("update")).unwrap();
+        std::fs::write(staged_meta(exe_dir), r#"{"version":"v33"}"#).unwrap();
+        assert_eq!(staged_version(exe_dir), Some("v33".to_string()));
+        std::fs::remove_file(staged_hbbr(exe_dir)).unwrap();
+        assert_eq!(staged_version(exe_dir), None);
+
+        // A zip missing one binary fails and leaves no staged files.
+        let dir2 = tempfile::tempdir().unwrap();
+        let exe_dir2 = dir2.path();
+        let zip_path2 = exe_dir2.join("rel.zip");
+        {
+            let f = std::fs::File::create(&zip_path2).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file(format!("top/{hbbs_name}"), opts).unwrap();
+            zw.write_all(b"only-hbbs").unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(extract_update(&zip_path2, exe_dir2).is_err());
+        assert!(!staged_hbbs(exe_dir2).exists());
+        assert!(!staged_hbbr(exe_dir2).exists());
+    }
+
+    #[test]
+    fn update_redirect_tag_live() {
+        // Live network: GitHub must be reachable (same assumption as
+        // the template e2e suites). The redirect fallback must resolve
+        // our latest release tag.
+        let tag = fetch_redirect_tag(UPDATE_RELEASES_PAGE)
+            .expect("redirect fallback must reach GitHub");
+        let n = parse_pro_tag(&tag).expect("redirect tag must be a vN tag");
+        assert!(n >= 31, "expected at least v31, got {tag}");
+    }
+
 }

@@ -372,6 +372,237 @@ cd rustdesk-server-pro-linux-*
 - 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
 - 验证：新增 5 个单元测试（省略字段、40 字符域名仍走编码格式、超长回退明文、超长中文报错、省略判定），cargo test 47/47（debug 与 release）；端到端 19/19（debug 与 release：40 字符域名生成成功，文件名 161 字符且解码后 host/key 正确、api/relay 已省略；85 字符域名走明文兜底；240 字符域名报中文明错）。全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、客户端配置 31/31 ×2、就近选路 12/12 ×2），debug 与 release 均通过。本版改动为全平台统一的文件名生成逻辑，无新增 Windows/release 专属分支，无新增真机确认项。
 
+## v32：在线一键更新 + API 调用说明
+
+- 功能（2026-11-13）：控制台服务器设置页新增「服务端版本更新」区，显示当前版本 v32（附带上游基底 1.1.17）与运行平台（windows-x86_64 / linux-x86_64-glibc / linux-aarch64-glibc / linux-aarch64-musl 四者之一）；「检测更新」按钮查本仓库（wirh/rustdesk-server-pro）的最新 release；有新版时在「更新」按钮上方展示完整更新日志面板（可滚动，点更新前能看清新版改了什么）；下载中显示进度与来源；暂存完成后显示「已暂存 vX，重启后生效」+「立即重启」按钮；重启后页面自动等待、服务端恢复响应后显示新版本。版本号比较去掉前导 `v` 后按整数比（v32 > v31）；非数字 tag 视为无更新并原样展示。
+- 流程：检测 → 下载暂存 → 重启替换。下载只从本仓库的 release 取对应平台的安装包：版本号严格校验 `^v[0-9]+$`，绝不接受调用方提供的任意 URL；下载校验（不小于 1MB + ZIP 魔数 `PK\x03\x04`）；解压出 hbbs 与 hbbr 两个二进制，暂存为 exe 目录下的 `hbbs.new` / `hbbr.new`（Windows 为 `hbbs.exe.new` / `hbbr.exe.new`），同时写 `update/staged.json` 记录版本；失败时清理临时文件，不留半截二进制。下载在后台线程进行，可用 `GET /api/admin/update/status` 轮询进度（详见下文 API 一节）。
+- 检测重试：先直连 api.github.com 查 `releases/latest`，失败时依次用镜像链重试同一 API 请求；镜像 API 也失败时，再用镜像链请求 `releases/latest` 页面，从重定向 Location 里取版本号（这条路只有版本号、拿不到更新日志，返回里标记 `notes_unavailable`，界面显示「更新日志暂不可用」）。全部路径都失败才返回检测失败（502），并说明已尝试直连与加速。
+- 下载兜底：API 查不到发布信息时（例如 GitHub 未登录 API 的 60 次/小时共享限流），改用确定性的 `releases/download/{version}/{包名}` 直链走镜像链下载；该 URL 由校验过的版本号与编译期平台拼成，不接受调用方输入，防 SSRF 的保证不变。不存在的版本在所有下载源上都 404，最终仍进入错误状态。
+- 重启替换：替换必须发生在启动器执行二进制之前（Windows 下运行中的 exe 被锁死，hbbs 启动时换不了自己；Linux 下 hbbs 启动时替换会导致当次运行的仍是旧二进制）。rdsvc（Windows 服务宿主）、start.sh、start.ps1、systemd（install-service.sh 生成的 unit 加了 `ExecStartPre`）都在启动子进程前检查同目录的 `.new` 文件并覆盖正式文件，成功后删除 `update/staged.json`；替换失败只记日志、不阻塞启动（下次重启再试）。直接运行 hbbs（无启动器托管）时 `.new` 不会自动替换：需手动把 `hbbs.new` 改名为 `hbbs`（`hbbr.new` 改名为 `hbbr`）、删除 `update/staged.json` 后再启动，控制台文案有此说明。
+- 镜像设置：更新下载与检测复用服务器设置页已有的 `github_mirror` 设置和模板下载的同一条内置镜像链，没有第二个镜像设置。
+- 新增依赖：解压用 `zip` 8.6.0（仅 `deflate-flate2` 特性），Cargo.lock 的改动只涉及该 crate 及其传递依赖（flate2、miniz_oxide、crc32fast 的版本统一）。
+- 升级：停服 → 换 hbbs（hbbr 无改动，不用换）→ **Windows 下同时换 rdsvc.exe，Linux 下同步替换 start.sh / install-service.sh（Windows 下换 start.ps1）**——替换逻辑在启动器里，旧版启动器没有 `.new` 检查，暂存后重启不会生效 → 启动。API 调用说明见下节。
+- 验证：cargo test 56/56（debug 与 release，各含 9 个新增单测：版本号解析/比较、平台映射、版本参数校验、镜像候选、重定向取 tag、release 解析、解压往返）；端到端 55/55（debug 与 release：真实 GitHub 检测且更新日志与 release body 逐字一致、v31 真实下载暂存、监督脚本模拟重启替换后文件哈希与暂存一致、服务恢复响应）；全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、客户端配置 31/31 ×2、就近选路 12/12 ×2）。真机边界：rdsvc 与 start.ps1 的替换逻辑只在交叉编译 + go vet + 编码检查层面验证过，需在真实 Windows 服务环境确认；systemd 的 `ExecStartPre` 需在真实 Ubuntu 上确认。
+
+## API 调用说明
+
+服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。
+
+### Base URL
+
+默认 `http://<服务器地址>:21114`（`--api-listen` 默认 `0.0.0.0:21114`，可改地址/端口，`off` 关闭）。开启 TLS（`--tls-cert` / `--tls-key`）后用 `https://`。管理面拆分后（`--console-listen`，见 v23 一节）注意区分两个地址：
+
+- API 地址（21114）：客户端协议接口（`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/heartbeat`、`/api/sysinfo`、`/api/ab`、`/api/sysinfo_ver`、`/api/oidc/*`）+ 下载链接 `/dl/*` + `/oidc/login`；
+- Console 地址：控制台页面（`/console/*`）与管理接口（`/api/auth/*`、`/api/me`、`/api/client-config`、`/api/admin/*`、`/api/devices`、`/api/tokens*`）。
+
+拆分后调管理接口必须用 console 地址和端口，用 API 地址会 404。未拆分时两者在同一个地址上。
+
+除 `/dl/*`（文件流）与 `/api/sysinfo_ver`（纯文本 `1`）外，所有接口的请求与响应都是 JSON；POST 请求请带 `Content-Type: application/json`。
+
+### 鉴权：三种凭证，互不通用
+
+1. **API Token（`rdt_`，脚本/程序调用推荐）**：在控制台「API Token」页创建（任意登录用户可创建自己的；创建成功时只显示一次完整 token，服务端只保存它的 SHA-256 哈希，丢了只能删除重建）。用法：`Authorization: Bearer rdt_...`。权限等于创建它的账号：管理员的 token 可调管理接口，普通用户的 token 只能看到自己范围的数据。每次使用会更新 `last_used_at`。
+2. **会话 Cookie（`rdp_sid`）**：浏览器登录控制台后由 `POST /api/auth/login` 下发（`Set-Cookie`，有效期 24 小时），后续请求带 `Cookie: rdp_sid=...`。网页登录要先过验证码（`GET /api/captcha` 取图，再把识别出的字符填进 `captcha` 字段），脚本调用不如直接用 `rdt_` token 省事。
+3. **客户端访问令牌（`POST /api/login` 返回的 `access_token`）**：只给官方客户端协议接口用（`/api/peers`、`/api/users`、`/api/currentUser` 等）。它调不了管理接口（实测返回 401 `未登录`）；反过来 `rdt_` token 也调不了客户端协议接口（那些接口只认登录时发出的客户端令牌）。
+
+示例约定：下面用 `TOKEN` 表示 `rdt_` token，`CTOKEN` 表示客户端访问令牌，服务器地址用 `203.0.113.10`（文档保留地址，请换成实际地址）：
+
+```bash
+TOKEN="rdt_0123456789abcdef..."   # 控制台 API Token 页创建
+CTOKEN="0123456789abcdef..."      # POST /api/login 返回的 access_token
+```
+
+### 错误格式
+
+- **管理/控制台接口**：HTTP 状态码 + `{"ok":false,"error":"..."}`。401 未登录（无凭证、凭证无效或过期）；403 需要管理员权限（或资源不属于当前用户）；400 参数错误（消息为中文说明）；404 记录不存在/链接无效；429 登录太频繁被锁定；500 服务端错误。
+- **客户端协议接口**：错误也返回 HTTP 200，body 为 `{"error":"..."}`（这是官方客户端约定的格式）；只有未鉴权是 HTTP 401 `{"error":"Please login"}`。写脚本时不要只看状态码，要检查 body 里有没有 `error` 字段。
+
+### 限流与锁定（v23 起）
+
+- **密码登录**（网页与客户端共用同一套计数器）：同一账号 10 分钟内错 5 次 → 锁定 15 分钟起步，重复触发翻倍（15 分钟 → 30 分钟 → 1 小时……上限 12 小时，24 小时无再次触发后级别清零）；同一 IP 10 分钟内错 30 次 → 该 IP 按同样规则锁定（影响该 IP 上的所有账号）。登录成功清零账号计数器；锁定期间的尝试不会延长锁定。锁定状态在内存里，重启服务端即清零；锁定与登录失败都记到 `logs/hbbs.log`（`[auth]` 开头的行）。阈值可用 `RD_AUTH_FAIL_MAX` / `RD_AUTH_IP_FAIL_MAX` / `RD_AUTH_WINDOW_SECS` / `RD_AUTH_LOCK_SECS` 环境变量调整。
+- **注册**：每 IP 每小时最多 10 次（`RD_AUTH_REG_MAX` / `RD_AUTH_REG_WINDOW_SECS` 可调）。关掉「允许开放注册」后匿名注册返回 403（零用户时仍可创建第一个管理员；已登录的管理员仍可创建账号）。
+- 验证码失败不计入锁定计数。客户端登录被锁定时返回的是 200 + `{"error":"Too many failed attempts, temporarily locked. Try again in about N min"}`；网页登录被锁定时返回 429。
+
+### 客户端协议接口（客户端访问令牌）
+
+**客户端登录** `POST /api/login`：body 为 `{"username","password"}`，可选带 `"id"`（设备 ID）与 `"uuid"`（客户端设备标识，用于设备绑定）。成功返回：
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+```json
+{"access_token":"ee8762dfbc822be5…（64 位十六进制）","type":"access_token",
+ "user":{"name":"admin","email":"","note":"","status":1,"is_admin":true,"info":{}}}
+```
+
+账号或密码错误返回 HTTP 200 + `{"error":"Username or password is incorrect"}`。退出登录：`POST /api/logout`（带客户端令牌，服务端删除该令牌）。
+
+**设备列表** `GET /api/peers`：返回登录账号自己的设备（管理员也只看自己的；看全部设备用下面的 `/api/devices`）。分页参数 `current`（默认 1）与 `pageSize`（默认 100，上限 1000）：
+
+```bash
+curl -s "http://203.0.113.10:21114/api/peers?current=1&pageSize=100" \
+  -H "Authorization: Bearer $CTOKEN"
+```
+
+```json
+{"total":1,"data":[{"id":"1234730355","user":"admin","user_name":"admin","note":"",
+ "device_group_name":"","status":1,
+ "info":{"device_name":"tk","os":"Windows","username":"Administrator"}}]}
+```
+
+**用户列表** `GET /api/users`：只返回登录账号本人（客户端侧栏用）：
+
+```bash
+curl -s http://203.0.113.10:21114/api/users -H "Authorization: Bearer $CTOKEN"
+```
+
+```json
+{"total":1,"data":[{"name":"admin","display_name":"","avatar":"","email":"",
+ "note":"","status":1,"is_admin":true}]}
+```
+
+**当前用户** `POST /api/currentUser`：返回与上面相同的单个用户对象（无 `total`/`data` 包裹）：
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/currentUser \
+  -H "Authorization: Bearer $CTOKEN"
+```
+
+**其他客户端协议接口**（官方客户端内部调用，一般不需要手工调）：`POST /api/heartbeat`（设备心跳与策略下发）、`POST /api/sysinfo`（上报设备信息）、`GET/POST /api/ab`（地址簿同步）、`GET /api/device-group/accessible`（设备组，当前返回空列表）、`GET /api/login-options` 与 `/api/oidc/*`（OIDC 浏览器登录）、`POST /api/sysinfo_ver`（返回纯文本 `1`，客户端版本协商用）。
+
+### 管理接口（`rdt_` token 或会话 Cookie）
+
+**当前登录信息** `GET /api/me`：
+
+```bash
+curl -s http://203.0.113.10:21114/api/me -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"is_admin":true,"ok":true,"username":"admin"}
+```
+
+**设备列表（控制台全视图）** `GET /api/devices`：管理员看全部设备，普通用户只看自己的。`last_seen` 是 Unix 秒时间戳：
+
+```bash
+curl -s http://203.0.113.10:21114/api/devices -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"devices":[{"device_id":"1234730355","uuid":"…","username":"admin",
+ "hostname":"tk","os":"Windows","version":"1.5.3","last_seen":1794566574}],
+ "now":1794566574,"ok":true}
+```
+
+**客户端配置** `GET /api/client-config`：任意登录用户可查，返回官方客户端手动配置需要的四个值（与控制台「官方客户端手动配置」卡片一致）；未配置公网地址（`public_host` 为空）时返回 `{"ok":true,"configured":false}`：
+
+```bash
+curl -s http://203.0.113.10:21114/api/client-config \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"api":"http://203.0.113.10:21114","configured":true,"host":"203.0.113.10:21116",
+ "key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ok":true,
+ "relay":"203.0.113.10:21117"}
+```
+
+（`key` 为 44 字符、以 `=` 结尾的服务端公钥，上例为占位符。）
+
+**Token 管理**：创建 `POST /api/tokens`（body `{"name":"..."}`，name 可省略，默认为 `default`），返回的 `token` 只显示这一次，请立即保存；列表 `GET /api/tokens`（只返回 id/name/时间，不返回 token 值）；删除 `DELETE /api/tokens/:id`：
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/tokens \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"backup-script"}'
+# {"ok":true,"token":"rdt_…（创建时只显示一次）"}
+
+curl -s http://203.0.113.10:21114/api/tokens -H "Authorization: Bearer $TOKEN"
+# {"ok":true,"tokens":[{"id":1,"name":"backup-script",
+#   "created_at":1794566574,"last_used_at":null}]}
+
+curl -s -X DELETE http://203.0.113.10:21114/api/tokens/1 \
+  -H "Authorization: Bearer $TOKEN"
+# {"ok":true}，不存在的 id 返回 404 {"ok":false,"error":"Token 不存在"}
+```
+
+**生成客户端** `POST /api/admin/gen-client`：任意登录用户可生成（记录归属调用者）。body 可带 `{"label":"..."}`（备注，可省略）。需要先在控制台下载好 Windows 模板并配置公网地址，否则返回 400。返回的 `download_url` 即下载链接（见下）：
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/admin/gen-client \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"label":"office-pc"}'
+```
+
+```json
+{"download_url":"http://203.0.113.10:21114/dl/b64c2b88…/rustdesk--Qfi0DMzM…（约 120 字符的编码文件名）.exe",
+ "filename":"rustdesk--Qfi0DMzM….exe","ok":true}
+```
+
+**生成记录列表** `GET /api/admin/gen-clients`：管理员看全部，普通用户只看自己的：
+
+```bash
+curl -s http://203.0.113.10:21114/api/admin/gen-clients \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"clients":[{"created_at":1794566574,"created_by":"admin",
+ "download_url":"http://203.0.113.10:21114/dl/b64c2b88…/rustdesk--Qfi0DMzM….exe",
+ "filename":"rustdesk--Qfi0DMzM….exe","id":1,"label":"office-pc"}],"ok":true}
+```
+
+**删除生成记录** `DELETE /api/admin/gen-clients/:id`：本人或管理员可删；删除后该记录的下载链接立即失效（文件一并删除）：
+
+```bash
+curl -s -X DELETE http://203.0.113.10:21114/api/admin/gen-clients/1 \
+  -H "Authorization: Bearer $TOKEN"
+# {"ok":true}，不存在的 id 返回 404 {"ok":false,"error":"记录不存在"}
+```
+
+**下载生成的客户端** `GET /dl/:token/:filename`：无需登录，链接里的 token 本身就是凭证（可直接发给他人下载）。成功返回 exe 文件流（`Content-Type: application/octet-stream`，`Content-Disposition: attachment`）；链接无效或记录已删除时返回 404 `{"ok":false,"error":"下载链接无效或已删除"}`：
+
+```bash
+curl -O "http://203.0.113.10:21114/dl/b64c2b88…/rustdesk--Qfi0DMzM….exe"
+```
+
+**在线更新（v32 起，仅管理员）**：
+
+```bash
+# 当前版本与暂存状态
+curl -s http://203.0.113.10:21114/api/admin/update/status \
+  -H "Authorization: Bearer $TOKEN"
+# {"current":"v32","current_num":32,"downloaded":0,"error":"","ok":true,
+#  "platform":"linux-x86_64-glibc","running":false,"source":"",
+#  "staged":false,"staged_version":null,"state":"idle","total":0,
+#  "upstream_base":"1.1.17","version":""}
+# state: idle / downloading / extracting / done / error；
+# 下载中时 downloaded/total 为已下载/总字节数，source 为当前下载源
+
+# 检测更新（直连 API → 镜像 API → 重定向取版本号，全部失败才报 502）
+curl -s -X POST http://203.0.113.10:21114/api/admin/update/check \
+  -H "Authorization: Bearer $TOKEN"
+# {"has_update":false,"latest":"v31","notes_unavailable":false,"ok":true,
+#  "published_at":"2026-11-13T09:31:31Z","release_notes":"# v31\n\n## 修复\n\n…（完整 body）"}
+# 只有版本号、拿不到日志时 notes_unavailable 为 true，release_notes 为空
+
+# 下载并暂存指定版本（version 必须是 v33 这样的格式；立即返回，用 status 轮询进度）
+curl -s -X POST http://203.0.113.10:21114/api/admin/update/download \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"version":"v33"}'
+# {"ok":true,"started":true}（已有下载在进行时 started 为 false）
+
+# 重启生效（仅在已暂存时可用；无暂存返回 400）
+curl -s -X POST http://203.0.113.10:21114/api/admin/update/restart \
+  -H "Authorization: Bearer $TOKEN"
+# {"ok":true}，服务端约 0.5 秒后退出，由启动器换上新版并拉起
+```
+
+**其他管理接口**（控制台页面内部使用）：`GET /api/admin/overview`（概览统计）、`GET /api/admin/users` 与 `POST /api/admin/users/:name/password`、`POST /api/admin/users/:name/:action`（用户管理）、`GET/POST /api/admin/settings`（服务器设置）、`POST /api/admin/template/download` 与 `GET /api/admin/template/status`（模板下载）。这几个接口的字段以控制台页面的实际调用为准，不再逐一列出。
+
 ## 日志
 
 - hbbs / hbbr 运行时同时输出到终端和文件：程序目录下自动生成

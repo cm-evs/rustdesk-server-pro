@@ -26,6 +26,7 @@ code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:13px}
 .capbtn{background:transparent;border:0;padding:0;cursor:pointer}.capbtn:hover{background:transparent}
 .capq{font-size:18px;font-weight:600;white-space:nowrap}
 .linkbtn{background:none;border:0;color:#58a6ff;padding:0;font-size:13px;cursor:pointer;text-decoration:underline}.linkbtn:hover{background:none}
+.changelog{white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;font-size:13px;line-height:1.6}
 "#;
 
 fn page(title: &str, body: &str) -> String {
@@ -250,6 +251,18 @@ const CONSOLE_BODY: &str = r#"
 <p class="muted" id="tpl-detail"></p>
 </div>
 <p class="muted">模板是官方 RustDesk Windows 安装程序，生成客户端时会在其基础上改文件名注入配置，不修改程序本身。下载会自动在多个 GitHub 加速镜像与直连之间切换（某个源太慢会自动换下一个）。</p></div>
+<div class="card"><h2>服务端版本更新</h2>
+<p class="muted" id="upd-current">读取中…</p>
+<div class="err" id="upd-err"></div>
+<button id="upd-check">检测更新</button>
+<div id="upd-result" style="display:none;margin-top:12px"></div>
+<div id="upd-prog" style="display:none;margin-top:12px">
+<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;height:14px;overflow:hidden">
+<div id="upd-bar" style="height:100%;width:0%;background:#1f6feb;transition:width .5s"></div>
+</div>
+<p class="muted" id="upd-detail"></p>
+</div>
+<p class="muted">更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。</p></div>
 </section>
 </div>
 
@@ -375,6 +388,7 @@ async function loadSettings(){
   if(j.ports){let pl='中继/ID：'+j.ports.rendezvous+'（NAT 测试 '+j.ports.nat_test+'，WebSocket '+j.ports.ws_rendezvous+'）｜中继：'+j.ports.relay+'（WebSocket '+j.ports.ws_relay+'）｜API：'+j.ports.api; if(j.ports.console){pl+='｜控制台（独立监听）：'+j.ports.console_listen;}else{pl+='（与 API 同端口）';} if(j.ports.tls){pl+='｜HTTPS：已启用';} $('ports-line').textContent=pl;}
   $('tpl-status').textContent=j.template_ready?('已就绪：'+(j.template_version||'')):'未下载（生成客户端前需要先下载）';
   pollTpl();
+  loadUpdate();
 }
 $('set-save').onclick=async()=>{
   const btn=$('set-save'); if(btn.disabled)return; btn.disabled=true;
@@ -427,6 +441,100 @@ $('tpl-btn').onclick=async()=>{
   $('tpl-prog').style.display='block'; $('tpl-status').textContent='正在下载…';
   pollTpl();
 };
+let UPD={current:'',latest:null};
+async function loadUpdate(){
+  let j; try{ j=await api('/api/admin/update/status'); }catch(e){ if(e.message!=='unauth')$('upd-current').textContent='版本信息加载失败，请刷新重试'; return; }
+  if(!j.ok){ $('upd-current').textContent='版本信息加载失败：'+(j.error||'未知错误'); return; }
+  UPD.current=j.current||'';
+  $('upd-current').textContent='当前版本：'+j.current+'（上游基底 '+j.upstream_base+'）｜平台：'+j.platform+(j.staged?('｜已暂存 '+j.staged_version+'，重启后生效'):'');
+  if(j.staged){ showStaged(j.staged_version); }
+  if(j.running){ pollUpd(); }
+}
+$('upd-check').onclick=async()=>{
+  const btn=$('upd-check'); if(btn.disabled)return; btn.disabled=true;
+  $('upd-err').textContent=''; $('upd-result').style.display='none'; $('upd-result').innerHTML='';
+  try{
+    const j=await api('/api/admin/update/check',{method:'POST'});
+    if(!j.ok){ $('upd-err').textContent=j.error||'检测失败'; return; }
+    $('upd-result').style.display='block';
+    if(!j.has_update){
+      $('upd-result').innerHTML='<p class="ok">已是最新版本（最新：'+esc(j.latest)+'）。</p>';
+      return;
+    }
+    UPD.latest=j.latest;
+    let notesHtml='';
+    if(j.notes_unavailable){ notesHtml='<p class="muted">更新日志暂不可用（本次检测未能获取到更新说明，可稍后重试）。</p>'; }
+    else if(!j.release_notes){ notesHtml='<p class="muted">暂无更新说明。</p>'; }
+    else { notesHtml='<div class="changelog" id="upd-notes"></div>'; }
+    $('upd-result').innerHTML='<p>发现新版本：<b>'+esc(j.latest)+'</b>'+(j.published_at?('（发布于 '+esc(j.published_at.slice(0,10))+'）'):'')+'</p>'+notesHtml+'<p><button id="upd-dl">更新到 '+esc(j.latest)+'</button></p>';
+    const notesEl=$('upd-notes'); if(notesEl) notesEl.textContent=j.release_notes;
+    $('upd-dl').onclick=()=>{
+      if(!confirm('确定更新到 '+UPD.latest+' 吗？将从 GitHub 下载新版安装包（约 35 MB），下载完成后需重启服务端生效。'))return;
+      startUpdDownload(UPD.latest);
+    };
+  }catch(e){ if(e.message!=='unauth')$('upd-err').textContent='检测失败：网络错误或检测超时，请重试'; }
+  btn.disabled=false;
+};
+async function startUpdDownload(version){
+  const j=await api('/api/admin/update/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version})});
+  if(!j.ok){$('upd-err').textContent=j.error||'启动下载失败';return;}
+  $('upd-prog').style.display='block';
+  updLastBytes=0; updLastTime=0; updSpeed=0;
+  pollUpd();
+}
+let updTimer=null, updLastBytes=0, updLastTime=0, updSpeed=0;
+async function pollUpd(){
+  let j; try{ j=await api('/api/admin/update/status'); }catch(e){ return; }
+  if(!j.ok)return;
+  const now=Date.now();
+  if(updLastTime>0 && now>updLastTime && j.downloaded>=updLastBytes){
+    const inst=(j.downloaded-updLastBytes)/((now-updLastTime)/1000);
+    updSpeed=updSpeed>0?updSpeed*0.6+inst*0.4:inst;
+  }
+  updLastBytes=j.downloaded; updLastTime=now;
+  if(j.state==='downloading'||j.state==='extracting'||j.running){
+    $('upd-prog').style.display='block';
+    const pct=j.total>0?Math.min(100,j.downloaded/j.total*100):0;
+    $('upd-bar').style.width=pct+'%';
+    $('upd-detail').textContent=j.state==='extracting'?'正在解压并暂存…':(j.total>0?(fmtMB(j.downloaded)+' / '+fmtMB(j.total)+'（'+pct.toFixed(1)+'%）'):fmtMB(j.downloaded))+' · 速度 '+fmtSpeed(updSpeed)+(j.source?(' · 来源：'+j.source):'');
+    updTimer=setTimeout(pollUpd,1000);
+  }else{
+    if(updTimer){clearTimeout(updTimer);updTimer=null;}
+    if(j.state==='done'){
+      $('upd-bar').style.width='100%';
+      $('upd-detail').textContent='下载完成';
+      showStaged(j.version);
+      loadUpdate();
+    }else if(j.state==='error'){
+      $('upd-err').textContent='更新失败：'+(j.error||'未知错误');
+      $('upd-detail').textContent='';
+    }
+  }
+}
+function showStaged(version){
+  $('upd-result').style.display='block';
+  $('upd-result').innerHTML='<p class="ok">已暂存 '+esc(version)+'，重启后生效。</p><p><button id="upd-restart">立即重启</button></p><p class="muted">重启后服务会短暂中断，页面会在新版本起来后自动刷新。</p>';
+  $('upd-restart').onclick=async()=>{
+    if(!confirm('确定立即重启服务端以应用 '+version+' 吗？正在进行的连接会中断。'))return;
+    const j=await api('/api/admin/update/restart',{method:'POST'});
+    if(!j.ok){$('upd-err').textContent=j.error||'重启失败';return;}
+    sessionStorage.setItem('upd-just-restarted','1');
+    $('upd-result').innerHTML='<p class="muted">正在重启…等待新版本响应后自动刷新。</p>';
+    setTimeout(()=>waitForServer(0,UPD.current),4000);
+  };
+}
+async function waitForServer(n,oldVer){
+  if(n>45){ $('upd-result').innerHTML='<p class="err">等待超时，服务可能未自动恢复。请检查服务端是否在运行（直接运行 hbbs 时需手动启动），然后刷新页面。</p>'; return; }
+  try{
+    const r=await fetch('/api/admin/update/status');
+    if(r.ok){ const j=await r.json(); if(j.ok&&j.current&&j.current!==oldVer){ location.reload(); return; } }
+  }catch(e){}
+  setTimeout(()=>waitForServer(n+1,oldVer),2000);
+}
+if(sessionStorage.getItem('upd-just-restarted')){
+  sessionStorage.removeItem('upd-just-restarted');
+  document.querySelector('nav button[data-s="settings"]').click();
+}
 init();
 </script>
 "#;

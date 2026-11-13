@@ -178,6 +178,37 @@ func (s *supervisor) stopped() bool {
 	}
 }
 
+// applyStagedUpdates swaps in binaries staged by the console's
+// one-click update (hbbs.exe.new / hbbr.exe.new) before a child is
+// (re)started. At this point the child is not running, so its exe
+// file is not locked on Windows. A failed swap is only logged; the
+// old binary keeps running and the next restart retries. The staged
+// marker (update/staged.json) is dropped once neither .new file
+// remains. Both child loops call this, so the swap is serialized on
+// the supervisor mutex.
+func (s *supervisor) applyStagedUpdates() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, name := range []string{"hbbs.exe", "hbbr.exe"} {
+		staged := filepath.Join(s.dir, name+".new")
+		if _, err := os.Stat(staged); err != nil {
+			continue
+		}
+		if err := os.Rename(staged, filepath.Join(s.dir, name)); err != nil {
+			svcLog("应用暂存更新失败 %s: %v（下次重启再试）", name, err)
+			continue
+		}
+		svcLog("已应用暂存更新：%s", name)
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, "hbbs.exe.new")); err == nil {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, "hbbr.exe.new")); err == nil {
+		return
+	}
+	_ = os.Remove(filepath.Join(s.dir, "update", "staged.json"))
+}
+
 // runChild starts one child and keeps it alive: an unexpected exit is
 // logged and the child is restarted after a short delay, until the
 // service itself is stopped.
@@ -187,6 +218,7 @@ func (s *supervisor) runChild(name string, args []string) {
 		if s.stopped() {
 			return
 		}
+		s.applyStagedUpdates()
 		cmd := exec.Command(exe, args...)
 		cmd.Dir = s.dir
 		cmd.Env = append(os.Environ(), "TEST_HBBS=no")
