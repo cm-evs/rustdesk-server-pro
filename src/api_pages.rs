@@ -365,7 +365,7 @@ async function loadCfg(){
   if(!j.ok){ loadFail($('cfg-body'),'loadCfg',j.error); return; }
   if(!j.configured){ $('cfg-body').innerHTML='<p class="muted">'+(ME.is_admin?'尚未在「服务器设置」里填写公网地址，填好后这里会显示客户端配置。':'管理员尚未填写服务器公网地址，暂时无法显示客户端配置。')+'</p>'; return; }
   const row=(label,val)=>'<label>'+label+'</label><div class="dl"><input readonly value="'+esc(val)+'"><button class="ghost" onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">复制</button></div>';
-  $('cfg-body').innerHTML=row('ID 服务器',j.host)+row('中继服务器',j.relay)+row('API 服务器',j.api)+row('密钥（Key）',j.key);
+  $('cfg-body').innerHTML=row('ID 服务器',j.host)+row('中继服务器',j.relay)+row('API 服务器',j.api)+row('密钥（Key）',j.key)+'<div class="dl" style="margin-top:8px"><input type="hidden" value="'+esc(j.share)+'"><button onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">一键复制配置</button></div><p class="muted">复制后，在官方客户端「设置 → 网络」点粘贴图标即可导入整份配置，无需逐项填写。</p>';
 }
 async function loadDl(){
   let j; try{ j=await api('/api/client-downloads'); }catch(e){ if(e.message!=='unauth')loadFail($('dl-body'),'loadDl'); return; }

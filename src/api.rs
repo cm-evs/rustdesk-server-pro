@@ -3222,6 +3222,34 @@ fn needs_embed(
     )
 }
 
+/// The whole server config as one share string, for the console's
+/// "one-click copy" button: the user pastes it into the official
+/// client's Settings -> Network import box (the paste icon), and the
+/// client fills all four fields at once. This is exactly the format
+/// the official client itself exports — `ServerConfig.encode()` in
+/// flutter/lib/common.dart (verified identical in 1.5.0 and 1.5.3):
+/// reversed base64url (no padding) of the JSON, with the keys in the
+/// client's own order (host, relay, api, key). It is also the same
+/// payload that sits in a generated client's filename and in the
+/// paid Pro console's "Config" field — only the carrier differs.
+/// Unlike `generated_filename`, all four fields are always present
+/// (never omitted as derivable), so the string matches the
+/// manual-config card value for value.
+fn encode_server_config(host: &str, relay: &str, api: &str, key: &str) -> String {
+    // Build the JSON by hand (per-field json!() for correct escaping)
+    // so the key order matches the client's export byte for byte;
+    // serde_json::Map would sort the keys alphabetically instead.
+    let raw = format!(
+        "{{\"host\":{},\"relay\":{},\"api\":{},\"key\":{}}}",
+        json!(host),
+        json!(relay),
+        json!(api),
+        json!(key)
+    );
+    let b64 = base64::encode_config(raw.as_bytes(), base64::URL_SAFE_NO_PAD);
+    b64.chars().rev().collect()
+}
+
 /// Filename for a generated client: the server config is encoded into
 /// the name (reversed base64url of the JSON), which is how the
 /// official client reads its custom server. `api`/`relay` are
@@ -3435,10 +3463,13 @@ async fn client_config_view(
         return jresp(StatusCode::OK, json!({ "ok": true, "configured": false }));
     }
     match client_config(&st).await {
-        Ok((host, api, relay, key, _)) => jresp(
-            StatusCode::OK,
-            json!({ "ok": true, "configured": true, "host": host, "api": api, "relay": relay, "key": key }),
-        ),
+        Ok((host, api, relay, key, _)) => {
+            let share = encode_server_config(&host, &relay, &api, &key);
+            jresp(
+                StatusCode::OK,
+                json!({ "ok": true, "configured": true, "host": host, "api": api, "relay": relay, "key": key, "share": share }),
+            )
+        }
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
@@ -4204,6 +4235,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("公网地址太长"), "error was: {err}");
+    }
+
+    /// The share string is the same payload as a generated client's
+    /// filename: wrapping it in the `rustdesk--<payload>.exe` form
+    /// and running the client-side filename parser over it must
+    /// recover all four fields exactly.
+    #[test]
+    fn server_config_share_matches_filename_payload() {
+        let share = encode_server_config(
+            "rd.example.com:21116",
+            "rd.example.com:21117",
+            "http://rd.example.com:21114",
+            "AbCdEf0123456789+/xyz=",
+        );
+        assert!(!share.is_empty());
+        let (host, key, api, relay) =
+            client_parse(&format!("rustdesk--{share}.exe")).expect("share must parse");
+        assert_eq!(host, "rd.example.com:21116");
+        assert_eq!(key, "AbCdEf0123456789+/xyz=");
+        assert_eq!(api, "http://rd.example.com:21114");
+        assert_eq!(relay, "rd.example.com:21117");
+    }
+
+    /// Byte-for-byte identical to the official client's own export:
+    /// `ServerConfig.encode()` (flutter/lib/common.dart) emits
+    /// base64url of `{"host","relay","api","key"}` in that order,
+    /// then reverses it. Decoding the share string must reproduce
+    /// that exact JSON.
+    #[test]
+    fn server_config_share_matches_client_export() {
+        let share = encode_server_config(
+            "rd.example.com:21116",
+            "rd.example.com:21117",
+            "http://rd.example.com:21114",
+            "AbCdEf0123456789+/xyz=",
+        );
+        let rev: String = share.chars().rev().collect();
+        let data = base64::decode_config(&rev, base64::URL_SAFE_NO_PAD).unwrap();
+        let raw = String::from_utf8(data).unwrap();
+        assert_eq!(
+            raw,
+            "{\"host\":\"rd.example.com:21116\",\"relay\":\"rd.example.com:21117\",\"api\":\"http://rd.example.com:21114\",\"key\":\"AbCdEf0123456789+/xyz=\"}"
+        );
+    }
+
+    /// All four fields are always present in the share string, even
+    /// when the filename form would omit derivable ones — the string
+    /// must match the manual-config card value for value.
+    #[test]
+    fn server_config_share_keeps_all_fields() {
+        let share = encode_server_config(
+            "rd.example.com:21116",
+            "rd.example.com:21117",
+            "http://rd.example.com:21114",
+            "k",
+        );
+        let rev: String = share.chars().rev().collect();
+        let data = base64::decode_config(&rev, base64::URL_SAFE_NO_PAD).unwrap();
+        let v: Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["host"], "rd.example.com:21116");
+        assert_eq!(v["relay"], "rd.example.com:21117");
+        assert_eq!(v["api"], "http://rd.example.com:21114");
+        assert_eq!(v["key"], "k");
     }
 
     /// Non-standard ports and TLS/override keep the fields embedded.

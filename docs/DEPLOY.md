@@ -387,10 +387,11 @@ cd rustdesk-server-pro-linux-*
 ## v33：生成客户端页增加其他平台官方下载链接
 
 - 功能（2026-11-13）：控制台「生成客户端」页新增「其他平台下载」区，列出最新官方客户端的 macOS（Intel / Apple 芯片 dmg）、Linux（x86_64 与 ARM64 的 .deb 与 AppImage）、Android（arm64 / x86_64 / armv7 / 通用 apk）安装包，每个平台一行：官方 GitHub 直链 + 加速下载链接；另有 iOS 的 App Store 直链（iOS 没有 GitHub 安装包，不走镜像）。其他平台用户装好官方客户端后，按上方「官方客户端手动配置」卡片填写服务器地址与密钥即可使用。本版只做下载链接，不做多平台预绑定生成（Windows 生成客户端不变）。
+- 一键复制配置（2026-11-13）：「官方客户端手动配置」卡片新增「一键复制配置」按钮，复制整份配置为一个字符串，粘贴到官方客户端「设置 → 网络」的粘贴（导入）图标处即可一次填入四项，无需逐项填写。字符串格式与官方客户端自身的导出完全一致（`ServerConfig.encode()`，已对 1.5.0 与 1.5.3 源码核实）：`{"host","relay","api","key"}` 四字段 JSON → base64url（无填充）→ 整体反转；也是生成客户端文件名里用的同一段编码，与付费 Pro 控制台的 Config 字符串同一格式。`GET /api/client-config` 新增 `share` 字段返回该字符串。
 - 接口：新增 `GET /api/client-downloads`（任何登录用户可用，与 `/api/client-config` 同级），返回 `{"ok":true,"version":"1.5.3","platforms":[{"id","name","file","url","mirrors":[...]}]}`。版本号与文件名来自 api.github.com 上 rustdesk/rustdesk 的 `releases/latest`：文件名是 release 里真实的 asset 名（按 `rustdesk-{版本}-` 前缀 + 已知后缀匹配，改名或缺失的 asset 直接让该平台不出列表，绝不拼一个没验证过的链接）；`url` 取 asset 自身的 `browser_download_url`。查不到版本时返回 502 + 中文明错，不编造版本号。
 - 缓存与加速：上游 release 数据内存缓存 1 小时（GitHub 未登录 API 限流 60 次/小时/共享 IP，生成页每次打开都查会很快撞上限）；加速链接不进缓存，每次请求按当前 `github_mirror` 设置现算——管理员改镜像后立即生效。加速用模板下载与在线更新的同一条镜像链（管理员自定义镜像优先，其次内置镜像，最后直连），没有第二套镜像逻辑。检测复用模板下载的最新版解析（镜像优先、直连兜底）。
 - 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
-- 验证：新增 4 个单元测试（按真实 1.5.3 asset 名解析 10 个平台并排除 Windows 安装包/rpm/flatpak/sciter/wayland 变体、缺 tag 报错、镜像 URL 生成、缓存新鲜度），cargo test 60/60（debug 与 release）；端到端 50/50（debug 与 release：版本号与 `gh api` 的最新版一致、平台文件与真实 asset 名逐项核对、官方 URL 格式、镜像含已配置的自定义前缀、匿名 401、普通用户可访问、控制台页面标记）。全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、客户端配置 31/31 ×2、就近选路 12/12 ×2），debug 与 release 均通过。本版改动为全平台统一逻辑，无新增 Windows/release 专属分支，无新增真机确认项。
+- 验证：新增 7 个单元测试（下载链接 4 个：按真实 1.5.3 asset 名解析 10 个平台并排除 Windows 安装包/rpm/flatpak/sciter/wayland 变体、缺 tag 报错、镜像 URL 生成、缓存新鲜度；一键复制 3 个：分享字符串与生成客户端文件名同一编码、与官方客户端导出逐字节一致、四字段始终齐全），cargo test 63/63（debug 与 release）；下载端到端 50/50（debug 与 release：版本号与 `gh api` 的最新版一致、平台文件与真实 asset 名逐项核对、官方 URL 格式、镜像含已配置的自定义前缀、匿名 401、普通用户可访问、控制台页面标记）；客户端配置端到端 38/38 ×2（含分享字符串按客户端解码复刻反向解析、四字段与接口值一致、普通用户同值、控制台页面标记）。全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、就近选路 12/12 ×2），debug 与 release 均通过。本版改动为全平台统一逻辑，无新增 Windows/release 专属分支，无新增真机确认项。
 
 ## API 调用说明
 
@@ -515,10 +516,10 @@ curl -s http://203.0.113.10:21114/api/client-config \
 ```json
 {"api":"http://203.0.113.10:21114","configured":true,"host":"203.0.113.10:21116",
  "key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ok":true,
- "relay":"203.0.113.10:21117"}
+ "relay":"203.0.113.10:21117","share":"Qfi…（整份配置的分享字符串，v33 起）"}
 ```
 
-（`key` 为 44 字符、以 `=` 结尾的服务端公钥，上例为占位符。）
+（`key` 为 44 字符、以 `=` 结尾的服务端公钥，上例为占位符。`share` 是整份配置按官方客户端 `ServerConfig.encode()` 编码的字符串：四字段 JSON → base64url（无填充）→ 整体反转，与生成客户端文件名里的编码同一格式；粘贴到官方客户端「设置 → 网络」的导入处即可一次填入四项。）
 
 **其他平台下载链接** `GET /api/client-downloads`（v33 起）：任意登录用户可查，返回最新官方客户端各平台的下载信息（与控制台「其他平台下载」区一致）。`url` 为官方 GitHub 直链，`mirrors` 为加速链接（管理员 `github_mirror` 设置优先，其次内置镜像链）；iOS 只有 App Store 直链，`mirrors` 为空。GitHub 不可达时返回 502（不编造版本号）；上游数据缓存 1 小时，镜像按当前设置每次现算：
 
