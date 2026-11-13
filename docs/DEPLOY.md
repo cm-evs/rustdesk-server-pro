@@ -356,6 +356,15 @@ cd rustdesk-server-pro-linux-*
 - `MAX_MESSAGE_KB`（环境变量，默认 64，单位 KiB，上限 65536）：hbbs 在 TCP 与 WebSocket 监听上接受的最大消息，超大消息的连接会被断开。默认值能覆盖约 5000 个标准 9–10 位 ID 的在线状态查询；ID 特别长或数量特别多时，客户端可能看不到在线状态，可适当调大。
 - 验证：全量回归（专项 69/69、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、客户端配置 31/31 ×2、就近选路 12/12 ×2、cargo test 全过，含上游新增的中继/控制台单测），debug 与 release 均通过。本版改动为全平台统一的协议与超时加固，无新增 Windows/release 专属分支，无新增真机确认项。
 
+## v30：新增 ARM64 Linux 包（glibc / musl 双变体）
+
+- 内容（2026-11-13）：服务端新增 ARM64（aarch64）Linux 构建，与 v30 代码一致（合并提交 0a76ebe，无代码改动，纯交叉编译），回应 issue #2 的 ARM 软路由部署需求。两个包：
+  - `rustdesk-server-pro-linux-aarch64-glibc-v30.zip`：动态链接 glibc 版，给 Debian / Ubuntu / Armbian / 树莓派 OS 等常规 ARM64 Linux 发行版；
+  - `rustdesk-server-pro-linux-aarch64-musl-v30.zip`：静态链接 musl 版，单个二进制无系统库依赖，给 OpenWrt 等软路由系统（OpenWrt 没有 glibc，glibc 版跑不了）。
+- 选哪个：`uname -m` 是 aarch64/arm64 的机器，先看系统——常规发行版用 glibc 版；OpenWrt / 软路由固件用 musl 版；不确定时 musl 版在两种系统上都能跑（静态链接不依赖系统库），只是体积稍大。
+- 部署：与 x86_64 Linux 包用法完全一致（start.sh / server.env / systemd 服务脚本通用），解压后按上文快速开始操作；端口、配置、控制台均相同。软路由上内存与存储有限时，可删掉包里的 geoip-city.mmdb（就近选路会回退到轮询，不影响基本功能）。
+- 验证：ARM64 glibc 版在 qemu-user 模拟环境通过控制台 28/28 ×2、锚定 17/17、客户端配置 31/31、模板 17/17（含自动解析 1.5.3）；musl 版通过启动与控制台 28/28 ×2 冒烟。ARM64 真机上的长期运行表现仍待实机回报。
+
 ## 日志
 
 - hbbs / hbbr 运行时同时输出到终端和文件：程序目录下自动生成
