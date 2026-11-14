@@ -4,7 +4,7 @@
 
 > 本项目是独立的二次开发分支，与官方付费版 RustDesk Server Pro 无关。许可证为 AGPL-3.0，与上游一致。
 
-📖 **[中文说明（含运行截图）](docs/中文说明.md)** ｜ 📦 **[部署文档](docs/DEPLOY.md)**
+📖 **[中文说明（含运行截图）](docs/中文说明.md)** ｜ 📦 **[部署文档](docs/DEPLOY.md)** ｜ 📦 **[Deployment guide (English)](docs/DEPLOY-en.md)**
 
 ![控制台设备列表](docs/images/console-devices.png)
 

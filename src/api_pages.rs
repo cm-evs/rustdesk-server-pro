@@ -1,5 +1,15 @@
 // Web pages for the API service: client OIDC login page and the web console.
 // Plain server-rendered HTML shells + vanilla JS calling the JSON APIs in api.rs.
+//
+// i18n: the console is Chinese by default with an English switch. Static
+// text stays Chinese inline in the HTML (the page stays usable without JS,
+// and existing page-marker checks keep passing); elements carry
+// data-i18n="key" (text), data-i18n-ph="key" (placeholder),
+// data-i18n-title="key" (title) or data-i18n-aria="key" (aria-label) and
+// the I18N_JS dictionary swaps them at runtime. JS-rendered text goes
+// through t('key'). The choice is kept in localStorage ('rdp-lang',
+// 'zh' default). API error strings are NOT translated: clients depend
+// on their exact text.
 
 pub const CSS: &str = r#"
 *{box-sizing:border-box}body{margin:0;font-family:-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:#0f1419;color:#e6edf3}
@@ -27,45 +37,295 @@ code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:13px}
 .capq{font-size:18px;font-weight:600;white-space:nowrap}
 .linkbtn{background:none;border:0;color:#58a6ff;padding:0;font-size:13px;cursor:pointer;text-decoration:underline}.linkbtn:hover{background:none}
 .changelog{white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;font-size:13px;line-height:1.6}
+.langrow{display:flex;gap:6px;justify-content:flex-end;margin-bottom:12px}
+button.langbtn{padding:6px 10px;font-size:13px}button.langbtn.active{background:#1f6feb;border-color:#1f6feb}
 "#;
+
+// Shared i18n dictionary + helpers, injected into every page by page().
+// Placeholders {n} / {v} are replaced by the caller with .replace().
+// NOTE: never introduce a double-quote immediately followed by a hash
+// in here: it would terminate the Rust raw string. JS strings use
+// single quotes and contain no ASCII apostrophes.
+const I18N_JS: &str = r#"<script>
+const I18N={zh:{
+'app.title':'RustDesk 服务控制台','app.logout':'退出','app.loading':'加载中…',
+'app.load_failed':'加载失败','app.colon':'：','app.period':'。','app.retry':'重试',
+'app.po':'（','app.pc':'）',
+'app.unknown_err':'未知错误','app.network_err':'网络错误，请重试','app.op_failed':'操作失败',
+'app.failed':'失败','app.copy':'复制','app.copied':'已复制','app.copy_failed':'复制失败',
+'app.download':'下载','app.delete':'删除',
+'app.load_fail_refresh':'加载失败，请检查网络后刷新页面','app.who_admin':'（管理员）',
+'auth.username':'用户名','auth.password':'密码','auth.password_min':'密码（至少 6 位）',
+'auth.captcha':'验证码','auth.cap_img_ph':'输入图片中的字符','auth.cap_text_ph':'输入计算结果',
+'auth.cap_refresh':'点击刷新验证码','auth.cap_aria':'刷新验证码','auth.cap_alt':'图片验证码','auth.cap_loading':'加载中…',
+'auth.cap_load_fail':'加载失败，请重试','auth.cap_to_text':'看不清？改用文字题',
+'auth.cap_to_img':'改用图片验证码','auth.signin':'登录','auth.signup':'注册',
+'auth.signin_fail':'登录失败','auth.signup_fail':'注册失败','auth.signup_title':'注册账号',
+'auth.no_account':'没有账号？','auth.first_admin':'（首个注册用户自动成为管理员）',
+'auth.has_account':'已有账号？','auth.network_err':'网络错误，请检查连接后重试',
+'auth.login_page_title':'登录 - RustDesk 服务控制台','auth.register_page_title':'注册 - RustDesk 服务控制台',
+'auth.oidc_title':'登录 RustDesk','auth.oidc_desc':'使用你的账号登录，登录后请返回 RustDesk 客户端。',
+'auth.oidc_ok_title':'登录成功','auth.oidc_ok_desc':'请返回 RustDesk 客户端，登录状态会自动完成。可以关闭此页面。',
+'nav.overview':'概览','nav.devices':'设备','nav.users':'用户管理','nav.tokens':'API Token',
+'nav.genclient':'生成客户端','nav.settings':'服务器设置',
+'ov.users':'注册用户','ov.devices':'已绑定设备','ov.peers':'已注册终端（hbbs）',
+'ov.about':'说明','ov.about_text':'客户端在「设置 → 网络」填入本服务器地址，或直接使用「生成客户端」里预绑定配置的安装包，即可配合账号登录使用。设备在客户端登录账号后会通过心跳自动绑定到所属用户。',
+'ov.load_fail':'概览加载失败，请刷新重试','ov.load_fail2':'概览加载失败：',
+'dev.title':'设备','dev.refresh':'刷新','dev.updated':'更新于 ',
+'dev.empty':'暂无设备。设备在客户端登录账号后会出现在这里。','dev.id':'设备 ID',
+'dev.status':'状态','dev.hostname':'主机名','dev.os':'系统','dev.owner':'所属用户',
+'dev.version':'版本','dev.last_seen':'最近在线','dev.online':'● 在线','dev.offline':'● 离线',
+'dev.unbound':'未绑定',
+'usr.title':'用户管理','usr.username':'用户名','usr.role':'角色','usr.status':'状态',
+'usr.created':'注册时间','usr.actions':'操作','usr.admin':'管理员','usr.regular':'普通',
+'usr.disabled':'已禁用','usr.active':'正常','usr.enable':'启用','usr.disable':'禁用',
+'usr.unadmin':'取消管理员','usr.make_admin':'设管理员','usr.reset_pwd':'重置密码',
+'usr.delete_confirm':'删除用户 {n}？该账号将无法登录，其设备变为未绑定，名下 API Token 同时吊销；删除不可恢复。',
+'usr.pwd_prompt':'为 {n} 设置新密码（至少 6 位）','usr.pwd_reset':'已重置',
+'tok.title':'API Token（供第三方系统集成）','tok.desc1':'请求带',
+'tok.desc2':'即可调用管理接口。Token 只在创建时显示一次。','tok.name':'名称',
+'tok.name_ph':'如：内部系统','tok.create':'创建 Token','tok.created':'创建时间',
+'tok.last_used':'最近使用','tok.revoke':'吊销','tok.empty':'暂无 Token',
+'tok.new_label':'新 Token（只显示一次，请保存）：',
+'tok.revoke_confirm':'吊销 Token「{n}」？使用该 Token 的程序将立即无法访问，吊销不可恢复。',
+'tok.revoke_failed':'吊销失败',
+'gen.title':'生成预绑定客户端',
+'gen.desc':'生成的安装包已内置本服务器地址与密钥（编码进文件名，界面不显示服务器与密钥设置）。把下载链接发给用户即可，用户安装后直接登录账号使用。',
+'gen.label':'备注（可选）','gen.label_ph':'如：公司办公电脑','gen.btn':'生成 Windows 客户端',
+'gen.file':'文件','gen.remark':'备注','gen.by':'生成者','gen.time':'生成时间',
+'gen.link':'下载链接',
+'gen.empty_admin':'尚未生成。先在「服务器设置」里填公网地址并下载模板。',
+'gen.empty_user':'尚未生成。生成前需管理员先在服务器设置里填公网地址并下载模板。',
+'gen.failed':'生成失败',
+'gen.delete_confirm':'删除生成的客户端「{n}」？删除后，已发出的下载链接立即失效，且不可恢复。',
+'gen.delete_failed':'删除失败',
+'cfg.title':'官方客户端手动配置',
+'cfg.desc':'已经装好官方 RustDesk 客户端的用户不用下载上面的安装包：在官方客户端「设置 → 网络」里填入下面四项，保存后即可登录本服务器的账号使用。下面显示的值与生成客户端内置的配置完全一致。',
+'cfg.unconfigured_admin':'尚未在「服务器设置」里填写公网地址，填好后这里会显示客户端配置。',
+'cfg.unconfigured_user':'管理员尚未填写服务器公网地址，暂时无法显示客户端配置。',
+'cfg.host':'ID 服务器','cfg.relay':'中继服务器','cfg.api':'API 服务器','cfg.key':'密钥（Key）',
+'cfg.copy_all':'一键复制配置',
+'cfg.copy_hint':'复制后，在官方客户端「设置 → 网络」点粘贴图标即可导入整份配置，无需逐项填写。',
+'dl.title':'其他平台下载',
+'dl.desc':'其他平台请下载官方 RustDesk 客户端，安装后按上方「官方客户端手动配置」填写服务器地址与密钥，即可登录本服务器的账号使用。默认显示官方直链；勾选「镜像加速」后切换为经 GitHub 镜像下载的加速链接（iOS 为 App Store 直链，不受影响）。',
+'dl.mirror':'镜像加速','dl.empty':'暂无可下载的版本。','dl.latest':'官方最新版本：',
+'dl.platform':'平台','dl.file':'文件','dl.download':'下载','dl.official':'官方下载',
+'dl.mirror_link':'加速下载','dl.appstore':'App Store',
+'set.title':'服务器设置','set.host_label':'服务器公网地址（域名或 IP，不要带端口，生成客户端必填）',
+'set.host_ph':'如 rd.example.com 或 203.0.113.10',
+'set.api_label':'API 地址覆盖（可空，默认 http://公网地址:21114）','set.api_ph':'可空',
+'set.mirror_label':'GitHub 加速镜像前缀（可空，下载官方客户端模板时优先使用；内置多个公共镜像自动轮询，最后直连）',
+'set.mirror_ph':'如 https://gh-proxy.com',
+'set.hide':'在客户端隐藏服务器/密钥设置（通过心跳下发）',
+'set.allowreg':'允许开放注册（任何人可自助注册账号）',
+'set.allowreg_note':'关闭后，只有管理员登录状态下打开注册页才能新建账号。公网部署建议关闭。',
+'set.allowrc':'允许远程修改配置（通过心跳下发到所有客户端）',
+'set.allowrc_note':'开启后，控制端可以操作被控端的 RustDesk 客户端界面与设置（包括改密码、改配置），不用再逐台到被控端本地勾选。仅在自有设备上开启；已在本机手动改过这一项的客户端以本机设置为准。',
+'set.save':'保存设置','set.saved':'已保存','set.load_fail':'加载设置失败，请刷新重试',
+'set.load_fail2':'加载设置失败：','set.ports_title':'监听端口（当前生效值）',
+'set.ports_loading':'读取中…',
+'set.ports_desc':'端口由启动参数决定，不在这里改：编辑程序目录下的 server.env（没有就从 server.env.example 复制一份），改 HBBS_PORT / HBBR_PORT / API_PORT / RELAY_SERVERS 后重启服务端。改端口后必须重新生成客户端（新客户端才会带新端口），并更新路由器端口转发；已生成的旧客户端会连不上新端口。换端口只能躲开针对默认端口的批量扫描，真正的安全仍靠服务器密钥与账号登录——知道新端口的人仍可注册 ID。',
+'set.ports_rendezvous':'中继/ID：','set.ports_nat':'（NAT 测试 ','set.ports_ws':'，WebSocket ',
+'set.ports_relay':'）｜中继：','set.ports_api':'）｜API：','set.ports_console':'｜控制台（独立监听）：',
+'set.ports_same':'（与 API 同端口）','set.ports_tls':'｜HTTPS：已启用',
+'set.svc_title':'系统服务（Ubuntu）',
+'set.svc_desc':'在程序目录执行下面命令，把服务端注册为 systemd 服务：开机自启、崩溃自动重启。服务跑的就是 start.sh，所以 server.env 里的端口与中继配置同样生效；升级时只需替换 hbbs / hbbr 两个文件，不用重装服务。',
+'set.svc_remove':'# 移除服务','set.svc_logs':'# 看服务日志',
+'set.tpl_title':'官方客户端模板','set.tpl_checking':'检查中…',
+'set.tpl_ver_label':'版本（可空 = 最新版）','set.tpl_ver_ph':'如 1.4.2',
+'set.tpl_btn':'下载/更新模板',
+'set.tpl_desc':'模板是官方 RustDesk Windows 安装程序，生成客户端时会在其基础上改文件名注入配置，不修改程序本身。下载会自动在多个 GitHub 加速镜像与直连之间切换（某个源太慢会自动换下一个）。',
+'set.tpl_ready':'已就绪：','set.tpl_not_dl':'未下载（生成客户端前需要先下载）',
+'set.tpl_downloading':'正在下载官方客户端模板','set.tpl_speed':' · 速度 ',
+'set.tpl_source':' · 来源：','set.tpl_done':'下载完成','set.tpl_failed':'下载失败：',
+'set.tpl_start_failed':'启动下载失败：','set.tpl_downloading2':'正在下载…',
+'set.upd_title':'服务端版本更新','set.upd_loading':'读取中…','set.upd_check':'检测更新',
+'set.upd_desc':'更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。',
+'set.upd_load_fail':'版本信息加载失败，请刷新重试','set.upd_load_fail2':'版本信息加载失败：',
+'set.upd_current':'当前版本：','set.upd_base':'（上游基底 ','set.upd_platform':'）｜平台：',
+'set.upd_staged':'｜已暂存 ','set.upd_staged2':'，重启后生效','set.upd_check_fail':'检测失败',
+'set.upd_latest':'已是最新版本（最新：','set.upd_latest2':'）。',
+'set.upd_notes_na':'更新日志暂不可用（本次检测未能获取到更新说明，可稍后重试）。',
+'set.upd_no_notes':'暂无更新说明。','set.upd_found':'发现新版本：',
+'set.upd_released':'（发布于 ','set.upd_to':'更新到 ',
+'set.upd_confirm':'确定更新到 {v} 吗？将从 GitHub 下载新版安装包（约 35 MB），下载完成后需重启服务端生效。',
+'set.upd_check_netfail':'检测失败：网络错误或检测超时，请重试','set.upd_start_failed':'启动下载失败',
+'set.upd_extracting':'正在解压并暂存…','set.upd_failed':'更新失败：',
+'set.upd_staged_msg':'已暂存 {v}，重启后生效。','set.upd_restart':'立即重启',
+'set.upd_restart_note':'重启后服务会短暂中断，页面会在新版本起来后自动刷新。',
+'set.upd_restart_confirm':'确定立即重启服务端以应用 {v} 吗？正在进行的连接会中断。',
+'set.upd_restart_failed':'重启失败','set.upd_restarting':'正在重启…等待新版本响应后自动刷新。',
+'set.upd_timeout':'等待超时，服务可能未自动恢复。请检查服务端是否在运行（直接运行 hbbs 时需手动启动），然后刷新页面。'
+},en:{
+'app.title':'RustDesk Server Console','app.logout':'Sign out','app.loading':'Loading…',
+'app.load_failed':'Load failed','app.colon':': ','app.period':'. ','app.retry':'Retry',
+'app.po':'(','app.pc':')',
+'app.unknown_err':'Unknown error','app.network_err':'Network error, please retry',
+'app.op_failed':'Operation failed','app.failed':'Failed','app.copy':'Copy','app.copied':'Copied',
+'app.copy_failed':'Copy failed','app.download':'Download','app.delete':'Delete','app.load_fail_refresh':'Failed to load. Check your network and refresh the page.',
+'app.who_admin':' (admin)',
+'auth.username':'Username','auth.password':'Password','auth.password_min':'Password (at least 6 characters)',
+'auth.captcha':'Captcha','auth.cap_img_ph':'Enter the characters in the image',
+'auth.cap_text_ph':'Enter the calculation result','auth.cap_refresh':'Click to refresh the captcha','auth.cap_aria':'Refresh captcha',
+'auth.cap_alt':'Image captcha','auth.cap_loading':'Loading…','auth.cap_load_fail':'Failed to load, please retry',
+'auth.cap_to_text':'Cannot read it? Switch to a text question','auth.cap_to_img':'Switch back to image captcha',
+'auth.signin':'Sign in','auth.signup':'Register','auth.signin_fail':'Sign-in failed',
+'auth.signup_fail':'Registration failed','auth.signup_title':'Create Account',
+'auth.no_account':'No account? ','auth.first_admin':' (the first registered user becomes admin)',
+'auth.has_account':'Already have an account? ','auth.network_err':'Network error. Check your connection and retry.',
+'auth.login_page_title':'Sign in - RustDesk Server Console','auth.register_page_title':'Register - RustDesk Server Console',
+'auth.oidc_title':'Sign in to RustDesk','auth.oidc_desc':'Sign in with your account, then return to the RustDesk client.',
+'auth.oidc_ok_title':'Signed in','auth.oidc_ok_desc':'Return to the RustDesk client; the sign-in will complete automatically. You can close this page.',
+'nav.overview':'Overview','nav.devices':'Devices','nav.users':'User Management','nav.tokens':'API Tokens',
+'nav.genclient':'Generate Client','nav.settings':'Server Settings',
+'ov.users':'Registered users','ov.devices':'Bound devices','ov.peers':'Registered endpoints (hbbs)',
+'ov.about':'About','ov.about_text':'In the client, fill in this server address under Settings → Network, or use a pre-configured installer from Generate Client, then sign in with an account. Devices are bound to their owner automatically via heartbeat after signing in.',
+'ov.load_fail':'Failed to load the overview. Refresh and retry.','ov.load_fail2':'Failed to load the overview: ',
+'dev.title':'Devices','dev.refresh':'Refresh','dev.updated':'Updated at ',
+'dev.empty':'No devices yet. Devices appear here after signing in with an account in the client.',
+'dev.id':'Device ID','dev.status':'Status','dev.hostname':'Hostname','dev.os':'OS',
+'dev.owner':'Owner','dev.version':'Version','dev.last_seen':'Last seen','dev.online':'● Online',
+'dev.offline':'● Offline','dev.unbound':'Unbound',
+'usr.title':'User Management','usr.username':'Username','usr.role':'Role','usr.status':'Status',
+'usr.created':'Registered','usr.actions':'Actions','usr.admin':'Admin','usr.regular':'Regular',
+'usr.disabled':'Disabled','usr.active':'Active','usr.enable':'Enable','usr.disable':'Disable',
+'usr.unadmin':'Remove admin','usr.make_admin':'Make admin','usr.reset_pwd':'Reset password',
+'usr.delete_confirm':'Delete user {n}? The account will no longer be able to sign in, its devices will become unbound, and its API tokens will be revoked. This cannot be undone.',
+'usr.pwd_prompt':'Set a new password for {n} (at least 6 characters)','usr.pwd_reset':'Password reset',
+'tok.title':'API Tokens (for third-party integrations)','tok.desc1':'Send requests with',
+'tok.desc2':'to call the management APIs. A token is shown only once, when created.',
+'tok.name':'Name','tok.name_ph':'e.g. internal system','tok.create':'Create Token',
+'tok.created':'Created','tok.last_used':'Last used','tok.revoke':'Revoke','tok.empty':'No tokens yet',
+'tok.new_label':'New token (shown only once, please save it):',
+'tok.revoke_confirm':'Revoke token “{n}”? Applications using it will immediately lose access. This cannot be undone.',
+'tok.revoke_failed':'Failed to revoke',
+'gen.title':'Generate Pre-configured Client',
+'gen.desc':'The generated installer has this server address and key built in (encoded in the file name; the server and key settings are hidden in the client UI). Share the download link with users; they can sign in with their account right after installing.',
+'gen.label':'Remark (optional)','gen.label_ph':'e.g. office PC','gen.btn':'Generate Windows Client',
+'gen.file':'File','gen.remark':'Remark','gen.by':'Created by','gen.time':'Created',
+'gen.link':'Download link',
+'gen.empty_admin':'Nothing generated yet. Fill in the public address in Server Settings and download the template first.',
+'gen.empty_user':'Nothing generated yet. An admin must fill in the public address in Server Settings and download the template first.',
+'gen.failed':'Generation failed',
+'gen.delete_confirm':'Delete the generated client “{n}”? Issued download links will stop working immediately. This cannot be undone.',
+'gen.delete_failed':'Failed to delete',
+'cfg.title':'Manual Configuration for Official Client',
+'cfg.desc':'Users who already have the official RustDesk client installed do not need the installer above: fill in the four fields below in the official client under Settings → Network, save, and sign in with an account on this server. The values shown here are identical to the configuration built into generated clients.',
+'cfg.unconfigured_admin':'The public address has not been filled in under Server Settings; the client configuration will appear here once it is set.',
+'cfg.unconfigured_user':'The admin has not filled in the public server address, so the client configuration cannot be shown yet.',
+'cfg.host':'ID Server','cfg.relay':'Relay Server','cfg.api':'API Server','cfg.key':'Key',
+'cfg.copy_all':'Copy Configuration',
+'cfg.copy_hint':'After copying, tap the paste icon in Settings → Network of the official client to import the whole configuration; no need to fill in each field.',
+'dl.title':'Other Platform Downloads',
+'dl.desc':'For other platforms, download the official RustDesk client, install it, then fill in the server address and key from “Manual Configuration for Official Client” above to sign in with an account on this server. Direct links are shown by default; check “Use mirror” to switch to accelerated links via a GitHub mirror (iOS uses the App Store link and is unaffected).',
+'dl.mirror':'Use mirror','dl.empty':'No downloadable version available.',
+'dl.latest':'Latest official version: ','dl.platform':'Platform','dl.file':'File',
+'dl.download':'Download','dl.official':'Official download','dl.mirror_link':'Mirror download',
+'dl.appstore':'App Store',
+'set.title':'Server Settings','set.host_label':'Public server address (domain or IP, no port; required for generating clients)',
+'set.host_ph':'e.g. rd.example.com or 203.0.113.10',
+'set.api_label':'API URL override (optional; default http://<public address>:21114)','set.api_ph':'Optional',
+'set.mirror_label':'GitHub mirror prefix (optional; used first when downloading the official client template; built-in public mirrors are tried automatically, then direct)',
+'set.mirror_ph':'e.g. https://gh-proxy.com',
+'set.hide':'Hide server/key settings in clients (pushed via heartbeat)',
+'set.allowreg':'Allow open registration (anyone can self-register)',
+'set.allowreg_note':'When off, new accounts can only be created by an admin opening the registration page while signed in. Turn it off for public deployments.',
+'set.allowrc':'Allow remote configuration changes (pushed to all clients via heartbeat)',
+'set.allowrc_note':'When on, controllers can operate the controlled side’s RustDesk client UI and settings (including changing passwords and configuration) without enabling it locally on each machine. Only enable this on your own devices; clients where this was set manually keep their local setting.',
+'set.save':'Save Settings','set.saved':'Saved','set.load_fail':'Failed to load settings. Refresh and retry.',
+'set.load_fail2':'Failed to load settings: ','set.ports_title':'Listening Ports (current values)',
+'set.ports_loading':'Loading…',
+'set.ports_desc':'Ports are decided by startup arguments, not changed here: edit server.env in the program directory (copy server.env.example if there is none), change HBBS_PORT / HBBR_PORT / API_PORT / RELAY_SERVERS, then restart the server. After changing ports you must regenerate clients (only new clients carry the new ports) and update router port forwarding; previously generated clients cannot reach the new ports. Changing ports only dodges bulk scans aimed at the default ports; real security still comes from the server key and account sign-in — anyone who knows the new port can still register an ID.',
+'set.ports_rendezvous':'Relay/ID: ','set.ports_nat':' (NAT test ','set.ports_ws':', WebSocket ',
+'set.ports_relay':') | Relay: ','set.ports_api':') | API: ','set.ports_console':' | Console (separate listener): ',
+'set.ports_same':' (same port as API)','set.ports_tls':' | HTTPS: enabled',
+'set.svc_title':'System Service (Ubuntu)',
+'set.svc_desc':'Run the commands below in the program directory to register the server as a systemd service: auto-start on boot, auto-restart on crash. The service runs start.sh, so the ports and relay settings in server.env apply; when upgrading, just replace the hbbs / hbbr binaries — no need to reinstall the service.',
+'set.svc_remove':'# Remove the service','set.svc_logs':'# View service logs',
+'set.tpl_title':'Official Client Template','set.tpl_checking':'Checking…',
+'set.tpl_ver_label':'Version (empty = latest)','set.tpl_ver_ph':'e.g. 1.4.2',
+'set.tpl_btn':'Download/Update Template',
+'set.tpl_desc':'The template is the official RustDesk Windows installer; generating a client injects the configuration by renaming it, without modifying the program itself. Downloads automatically switch between several GitHub mirrors and direct access (a slow source is skipped for the next one).',
+'set.tpl_ready':'Ready: ','set.tpl_not_dl':'Not downloaded (download it before generating clients)',
+'set.tpl_downloading':'Downloading the official client template','set.tpl_speed':' · Speed ',
+'set.tpl_source':' · Source: ','set.tpl_done':'Download complete','set.tpl_failed':'Download failed: ',
+'set.tpl_start_failed':'Failed to start download: ','set.tpl_downloading2':'Downloading…',
+'set.upd_title':'Server Update','set.upd_loading':'Loading…','set.upd_check':'Check for Updates',
+'set.upd_desc':'Update packages come from this project’s GitHub Releases and are selected automatically for the current platform. GitHub acceleration uses the “GitHub mirror prefix” setting above, or the built-in mirror chain when unset. After downloading, the new files are staged; clicking “Restart Now” lets the launcher (rdsvc / start.sh / start.ps1 / systemd) replace them during restart. If you run hbbs directly (no launcher), rename hbbs.new / hbbr.new over the original files manually before starting.',
+'set.upd_load_fail':'Failed to load version info. Refresh and retry.','set.upd_load_fail2':'Failed to load version info: ',
+'set.upd_current':'Current version: ','set.upd_base':' (upstream base ','set.upd_platform':') | Platform: ',
+'set.upd_staged':' | Staged ','set.upd_staged2':', takes effect after restart','set.upd_check_fail':'Detection failed',
+'set.upd_latest':'Already up to date (latest: ','set.upd_latest2':').',
+'set.upd_notes_na':'Release notes unavailable (could not be fetched this time; please retry later).',
+'set.upd_no_notes':'No release notes.','set.upd_found':'New version available: ',
+'set.upd_released':' (released ','set.upd_to':'Update to ',
+'set.upd_confirm':'Update to {v}? The new package (about 35 MB) will be downloaded from GitHub, and the server must be restarted to apply it.',
+'set.upd_check_netfail':'Detection failed: network error or timeout, please retry','set.upd_start_failed':'Failed to start download',
+'set.upd_extracting':'Extracting and staging…','set.upd_failed':'Update failed: ',
+'set.upd_staged_msg':'Staged {v}; it will take effect after restart.','set.upd_restart':'Restart Now',
+'set.upd_restart_note':'The service will be briefly interrupted during the restart; the page will refresh automatically once the new version is up.',
+'set.upd_restart_confirm':'Restart the server now to apply {v}? Active connections will be interrupted.',
+'set.upd_restart_failed':'Restart failed','set.upd_restarting':'Restarting… waiting for the new version to respond, then refreshing automatically.',
+'set.upd_timeout':'Timed out waiting; the service may not have recovered automatically. Check whether the server is running (start hbbs manually if you run it directly), then refresh the page.'
+}};
+function curLang(){try{const l=localStorage.getItem('rdp-lang');return l==='en'?'en':'zh';}catch(e){return 'zh';}}
+function t(k){const d=I18N[curLang()]||I18N.zh;if(d[k]!=null)return d[k];if(I18N.zh[k]!=null)return I18N.zh[k];return k;}
+function applyI18n(){
+  const l=curLang();document.documentElement.lang=l;
+  document.querySelectorAll('[data-i18n]').forEach(el=>{const v=t(el.getAttribute('data-i18n'));if(v)el.textContent=v;});
+  document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=t(el.getAttribute('data-i18n-ph'));});
+  document.querySelectorAll('[data-i18n-title]').forEach(el=>{el.title=t(el.getAttribute('data-i18n-title'));});
+  document.querySelectorAll('[data-i18n-aria]').forEach(el=>{el.setAttribute('aria-label',t(el.getAttribute('data-i18n-aria')));});
+  document.querySelectorAll('[data-i18n-alt]').forEach(el=>{el.alt=t(el.getAttribute('data-i18n-alt'));});
+  document.querySelectorAll('.langbtn').forEach(b=>b.classList.toggle('active',b.getAttribute('data-lang')===l));
+  if(window.__pageTitleKey){const ti=t(window.__pageTitleKey);if(ti&&ti!==window.__pageTitleKey)document.title=ti;}
+}
+function setLang(l){try{localStorage.setItem('rdp-lang',l==='en'?'en':'zh');}catch(e){}applyI18n();if(window.__onLangChange)window.__onLangChange();}
+document.addEventListener('click',e=>{const b=e.target.closest?e.target.closest('.langbtn'):null;if(b)setLang(b.getAttribute('data-lang'));});
+document.addEventListener('DOMContentLoaded',applyI18n);
+</script>"#;
 
 fn page(title: &str, body: &str) -> String {
     format!(
-        "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>{CSS}</style></head><body>{body}</body></html>"
+        "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>{CSS}</style></head><body>{I18N_JS}{body}</body></html>"
     )
 }
 
 pub fn login_page() -> String {
     page(
         "登录 - RustDesk 服务控制台",
-        r#"<div class="center"><div class="card"><h1>RustDesk 服务控制台</h1>
+        r#"<div class="center"><div class="langrow"><button type="button" class="langbtn ghost" data-lang="zh">中文</button><button type="button" class="langbtn ghost" data-lang="en">English</button></div><div class="card"><h1 data-i18n="app.title">RustDesk 服务控制台</h1>
 <div class="err" id="err"></div>
-<label>用户名</label><input id="u" autocomplete="username">
-<label>密码</label><input id="p" type="password" autocomplete="current-password">
-<label>验证码</label><div class="cap"><input id="c" autocomplete="off" placeholder="输入图片中的字符"><button type="button" id="capbtn" class="capbtn" title="点击刷新验证码" aria-label="刷新验证码"><img id="cap" src="/api/captcha" alt="图片验证码"></button><span id="capq" class="capq" style="display:none"></span></div>
+<label data-i18n="auth.username">用户名</label><input id="u" autocomplete="username">
+<label data-i18n="auth.password">密码</label><input id="p" type="password" autocomplete="current-password">
+<label data-i18n="auth.captcha">验证码</label><div class="cap"><input id="c" autocomplete="off" placeholder="输入图片中的字符" data-i18n-ph="auth.cap_img_ph"><button type="button" id="capbtn" class="capbtn" title="点击刷新验证码" data-i18n-title="auth.cap_refresh" aria-label="刷新验证码" data-i18n-aria="auth.cap_aria"><img id="cap" src="/api/captcha" alt="图片验证码" data-i18n-alt="auth.cap_alt"></button><span id="capq" class="capq" style="display:none"></span></div>
 <p class="muted"><button type="button" id="capmode" class="linkbtn">看不清？改用文字题</button></p>
-<button id="btn" style="width:100%">登录</button>
-<p class="muted">没有账号？<a href="/console/register">注册</a>（首个注册用户自动成为管理员）</p>
+<button id="btn" style="width:100%" data-i18n="auth.signin">登录</button>
+<p class="muted"><span data-i18n="auth.no_account">没有账号？</span><a href="/console/register" data-i18n="auth.signup">注册</a><span data-i18n="auth.first_admin">（首个注册用户自动成为管理员）</span></p>
 </div></div>
 <script>
+window.__pageTitleKey='auth.login_page_title';
 const cap=document.getElementById('cap');
 const capq=document.getElementById('capq');
 let textMode=false;
-async function loadTextCap(){capq.textContent='加载中…';try{const r=await fetch('/api/captcha?mode=text');const j=await r.json();capq.textContent=j.question||'加载失败，请重试';}catch(e){capq.textContent='加载失败，请重试';}}
+async function loadTextCap(){capq.textContent=t('auth.cap_loading');try{const r=await fetch('/api/captcha?mode=text');const j=await r.json();capq.textContent=j.question||t('auth.cap_load_fail');}catch(e){capq.textContent=t('auth.cap_load_fail');}}
 function refreshCap(){if(textMode){loadTextCap();}else{cap.src='/api/captcha?t='+Date.now();}}
 document.getElementById('capbtn').onclick=refreshCap;
-document.getElementById('capmode').onclick=e=>{e.preventDefault();textMode=!textMode;document.getElementById('c').value='';document.getElementById('c').placeholder=textMode?'输入计算结果':'输入图片中的字符';document.getElementById('capbtn').style.display=textMode?'none':'';capq.style.display=textMode?'':'none';e.target.textContent=textMode?'改用图片验证码':'看不清？改用文字题';refreshCap();};
+function syncCapMode(){document.getElementById('c').placeholder=textMode?t('auth.cap_text_ph'):t('auth.cap_img_ph');document.getElementById('capbtn').style.display=textMode?'none':'';capq.style.display=textMode?'':'none';document.getElementById('capmode').textContent=textMode?t('auth.cap_to_img'):t('auth.cap_to_text');}
+window.__onLangChange=syncCapMode;
+document.getElementById('capmode').onclick=e=>{e.preventDefault();textMode=!textMode;document.getElementById('c').value='';syncCapMode();refreshCap();};
 document.getElementById('btn').onclick=async()=>{
   const btn=document.getElementById('btn'); if(btn.disabled)return; btn.disabled=true;
   try{
     const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.value,password:p.value,captcha:c.value})});
     const j=await r.json();
-    if(j.ok){location.href='/console';}else{document.getElementById('err').textContent=j.error||'登录失败';refreshCap();document.getElementById('c').value='';btn.disabled=false;}
-  }catch(e){document.getElementById('err').textContent='网络错误，请检查连接后重试';btn.disabled=false;}
+    if(j.ok){location.href='/console';}else{document.getElementById('err').textContent=j.error||t('auth.signin_fail');refreshCap();document.getElementById('c').value='';btn.disabled=false;}
+  }catch(e){document.getElementById('err').textContent=t('auth.network_err');btn.disabled=false;}
 };
 u.addEventListener('keydown',e=>{if(e.key==='Enter')btn.click();});
 p.addEventListener('keydown',e=>{if(e.key==='Enter')btn.click();});
 c.addEventListener('keydown',e=>{if(e.key==='Enter')btn.click();});
+applyI18n();syncCapMode();
 </script>"#,
     )
 }
@@ -73,34 +333,38 @@ c.addEventListener('keydown',e=>{if(e.key==='Enter')btn.click();});
 pub fn register_page() -> String {
     page(
         "注册 - RustDesk 服务控制台",
-        r#"<div class="center"><div class="card"><h1>注册账号</h1>
+        r#"<div class="center"><div class="langrow"><button type="button" class="langbtn ghost" data-lang="zh">中文</button><button type="button" class="langbtn ghost" data-lang="en">English</button></div><div class="card"><h1 data-i18n="auth.signup_title">注册账号</h1>
 <div class="err" id="err"></div>
-<label>用户名</label><input id="u" autocomplete="username">
-<label>密码（至少 6 位）</label><input id="p" type="password" autocomplete="new-password">
-<label>验证码</label><div class="cap"><input id="c" autocomplete="off" placeholder="输入图片中的字符"><button type="button" id="capbtn" class="capbtn" title="点击刷新验证码" aria-label="刷新验证码"><img id="cap" src="/api/captcha" alt="图片验证码"></button><span id="capq" class="capq" style="display:none"></span></div>
+<label data-i18n="auth.username">用户名</label><input id="u" autocomplete="username">
+<label data-i18n="auth.password_min">密码（至少 6 位）</label><input id="p" type="password" autocomplete="new-password">
+<label data-i18n="auth.captcha">验证码</label><div class="cap"><input id="c" autocomplete="off" placeholder="输入图片中的字符" data-i18n-ph="auth.cap_img_ph"><button type="button" id="capbtn" class="capbtn" title="点击刷新验证码" data-i18n-title="auth.cap_refresh" aria-label="刷新验证码" data-i18n-aria="auth.cap_aria"><img id="cap" src="/api/captcha" alt="图片验证码" data-i18n-alt="auth.cap_alt"></button><span id="capq" class="capq" style="display:none"></span></div>
 <p class="muted"><button type="button" id="capmode" class="linkbtn">看不清？改用文字题</button></p>
-<button id="btn" style="width:100%">注册</button>
-<p class="muted">已有账号？<a href="/console/login">登录</a></p>
+<button id="btn" style="width:100%" data-i18n="auth.signup">注册</button>
+<p class="muted"><span data-i18n="auth.has_account">已有账号？</span><a href="/console/login" data-i18n="auth.signin">登录</a></p>
 </div></div>
 <script>
+window.__pageTitleKey='auth.register_page_title';
 const cap=document.getElementById('cap');
 const capq=document.getElementById('capq');
 let textMode=false;
-async function loadTextCap(){capq.textContent='加载中…';try{const r=await fetch('/api/captcha?mode=text');const j=await r.json();capq.textContent=j.question||'加载失败，请重试';}catch(e){capq.textContent='加载失败，请重试';}}
+async function loadTextCap(){capq.textContent=t('auth.cap_loading');try{const r=await fetch('/api/captcha?mode=text');const j=await r.json();capq.textContent=j.question||t('auth.cap_load_fail');}catch(e){capq.textContent=t('auth.cap_load_fail');}}
 function refreshCap(){if(textMode){loadTextCap();}else{cap.src='/api/captcha?t='+Date.now();}}
 document.getElementById('capbtn').onclick=refreshCap;
-document.getElementById('capmode').onclick=e=>{e.preventDefault();textMode=!textMode;document.getElementById('c').value='';document.getElementById('c').placeholder=textMode?'输入计算结果':'输入图片中的字符';document.getElementById('capbtn').style.display=textMode?'none':'';capq.style.display=textMode?'':'none';e.target.textContent=textMode?'改用图片验证码':'看不清？改用文字题';refreshCap();};
+function syncCapMode(){document.getElementById('c').placeholder=textMode?t('auth.cap_text_ph'):t('auth.cap_img_ph');document.getElementById('capbtn').style.display=textMode?'none':'';capq.style.display=textMode?'':'none';document.getElementById('capmode').textContent=textMode?t('auth.cap_to_img'):t('auth.cap_to_text');}
+window.__onLangChange=syncCapMode;
+document.getElementById('capmode').onclick=e=>{e.preventDefault();textMode=!textMode;document.getElementById('c').value='';syncCapMode();refreshCap();};
 document.getElementById('btn').onclick=async()=>{
   const btn=document.getElementById('btn'); if(btn.disabled)return; btn.disabled=true;
   try{
     const r=await fetch('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.value,password:p.value,captcha:c.value})});
     const j=await r.json();
-    if(j.ok){location.href='/console';}else{document.getElementById('err').textContent=j.error||'注册失败';refreshCap();document.getElementById('c').value='';btn.disabled=false;}
-  }catch(e){document.getElementById('err').textContent='网络错误，请检查连接后重试';btn.disabled=false;}
+    if(j.ok){location.href='/console';}else{document.getElementById('err').textContent=j.error||t('auth.signup_fail');refreshCap();document.getElementById('c').value='';btn.disabled=false;}
+  }catch(e){document.getElementById('err').textContent=t('auth.network_err');btn.disabled=false;}
 };
 u.addEventListener('keydown',e=>{if(e.key==='Enter')btn.click();});
 p.addEventListener('keydown',e=>{if(e.key==='Enter')btn.click();});
 c.addEventListener('keydown',e=>{if(e.key==='Enter')btn.click();});
+applyI18n();syncCapMode();
 </script>"#,
     )
 }
@@ -121,28 +385,32 @@ pub fn oidc_login_page(code: &str, err: &str) -> String {
         format!("<div class=\"err\">{}</div>", esc_html(err))
     };
     let mut body = format!(
-        r#"<div class="center"><div class="card"><h1>登录 RustDesk</h1>
-<p class="muted">使用你的账号登录，登录后请返回 RustDesk 客户端。</p>
+        r#"<div class="center"><div class="langrow"><button type="button" class="langbtn ghost" data-lang="zh">中文</button><button type="button" class="langbtn ghost" data-lang="en">English</button></div><div class="card"><h1 data-i18n="auth.oidc_title">登录 RustDesk</h1>
+<p class="muted" data-i18n="auth.oidc_desc">使用你的账号登录，登录后请返回 RustDesk 客户端。</p>
 {err_html}
 <form method="post" action="/oidc/login">
 <input type="hidden" name="code" value="{code}">
-<label>用户名</label><input name="username" autocomplete="username" required>
-<label>密码</label><input name="password" type="password" autocomplete="current-password" required>
-<label>验证码</label><div class="cap"><input name="captcha" id="c" autocomplete="off" placeholder="输入图片中的字符"><button type="button" id="capbtn" class="capbtn" title="点击刷新验证码" aria-label="刷新验证码"><img id="cap" src="/api/captcha" alt="图片验证码"></button><span id="capq" class="capq" style="display:none"></span></div>
+<label data-i18n="auth.username">用户名</label><input name="username" autocomplete="username" required>
+<label data-i18n="auth.password">密码</label><input name="password" type="password" autocomplete="current-password" required>
+<label data-i18n="auth.captcha">验证码</label><div class="cap"><input name="captcha" id="c" autocomplete="off" placeholder="输入图片中的字符" data-i18n-ph="auth.cap_img_ph"><button type="button" id="capbtn" class="capbtn" title="点击刷新验证码" data-i18n-title="auth.cap_refresh" aria-label="刷新验证码" data-i18n-aria="auth.cap_aria"><img id="cap" src="/api/captcha" alt="图片验证码" data-i18n-alt="auth.cap_alt"></button><span id="capq" class="capq" style="display:none"></span></div>
 <p class="muted"><button type="button" id="capmode" class="linkbtn">看不清？改用文字题</button></p>
-<button style="width:100%">登录</button>
+<button style="width:100%" data-i18n="auth.signin">登录</button>
 </form>
 </div></div>"#
     );
     body.push_str(
         r#"<script>
+window.__pageTitleKey='auth.oidc_title';
 const cap=document.getElementById('cap');
 const capq=document.getElementById('capq');
 let textMode=false;
-async function loadTextCap(){capq.textContent='加载中…';try{const r=await fetch('/api/captcha?mode=text');const j=await r.json();capq.textContent=j.question||'加载失败，请重试';}catch(e){capq.textContent='加载失败，请重试';}}
+async function loadTextCap(){capq.textContent=t('auth.cap_loading');try{const r=await fetch('/api/captcha?mode=text');const j=await r.json();capq.textContent=j.question||t('auth.cap_load_fail');}catch(e){capq.textContent=t('auth.cap_load_fail');}}
 function refreshCap(){if(textMode){loadTextCap();}else{cap.src='/api/captcha?t='+Date.now();}}
 document.getElementById('capbtn').onclick=refreshCap;
-document.getElementById('capmode').onclick=e=>{e.preventDefault();textMode=!textMode;document.getElementById('c').value='';document.getElementById('c').placeholder=textMode?'输入计算结果':'输入图片中的字符';document.getElementById('capbtn').style.display=textMode?'none':'';capq.style.display=textMode?'':'none';e.target.textContent=textMode?'改用图片验证码':'看不清？改用文字题';refreshCap();};
+function syncCapMode(){document.getElementById('c').placeholder=textMode?t('auth.cap_text_ph'):t('auth.cap_img_ph');document.getElementById('capbtn').style.display=textMode?'none':'';capq.style.display=textMode?'':'none';document.getElementById('capmode').textContent=textMode?t('auth.cap_to_img'):t('auth.cap_to_text');}
+window.__onLangChange=syncCapMode;
+document.getElementById('capmode').onclick=e=>{e.preventDefault();textMode=!textMode;document.getElementById('c').value='';syncCapMode();refreshCap();};
+applyI18n();syncCapMode();
 </script>"#,
     );
     page("登录 RustDesk", &body)
@@ -151,9 +419,10 @@ document.getElementById('capmode').onclick=e=>{e.preventDefault();textMode=!text
 pub fn oidc_success_page() -> String {
     page(
         "登录成功",
-        r#"<div class="center"><div class="card"><h1 class="ok">登录成功</h1>
-<p>请返回 RustDesk 客户端，登录状态会自动完成。可以关闭此页面。</p>
-</div></div>"#,
+        r#"<div class="center"><div class="langrow"><button type="button" class="langbtn ghost" data-lang="zh">中文</button><button type="button" class="langbtn ghost" data-lang="en">English</button></div><div class="card"><h1 class="ok" data-i18n="auth.oidc_ok_title">登录成功</h1>
+<p data-i18n="auth.oidc_ok_desc">请返回 RustDesk 客户端，登录状态会自动完成。可以关闭此页面。</p>
+</div></div>
+<script>window.__pageTitleKey='auth.oidc_ok_title';applyI18n();</script>"#,
     )
 }
 
@@ -164,100 +433,101 @@ pub fn console_page() -> String {
 const CONSOLE_BODY: &str = r#"
 <div class="wrap">
 <div style="display:flex;justify-content:space-between;align-items:center">
-<h1>RustDesk 服务控制台</h1>
-<div><span id="who" class="muted"></span> <button class="ghost" id="logout">退出</button></div>
+<h1 data-i18n="app.title">RustDesk 服务控制台</h1>
+<div><span id="who" class="muted"></span> <button class="langbtn ghost" data-lang="zh">中文</button><button class="langbtn ghost" data-lang="en">English</button> <button class="ghost" id="logout" data-i18n="app.logout">退出</button></div>
 </div>
 <nav>
-<button data-s="overview" class="active">概览</button>
-<button data-s="devices">设备</button>
-<button data-s="users" class="adminonly">用户管理</button>
-<button data-s="tokens">API Token</button>
-<button data-s="genclient">生成客户端</button>
-<button data-s="settings" class="adminonly">服务器设置</button>
+<button data-s="overview" class="active" data-i18n="nav.overview">概览</button>
+<button data-s="devices" data-i18n="nav.devices">设备</button>
+<button data-s="users" class="adminonly" data-i18n="nav.users">用户管理</button>
+<button data-s="tokens" data-i18n="nav.tokens">API Token</button>
+<button data-s="genclient" data-i18n="nav.genclient">生成客户端</button>
+<button data-s="settings" class="adminonly" data-i18n="nav.settings">服务器设置</button>
 </nav>
 
 <section id="s-overview" class="active">
 <div class="row adminonly">
-<div class="card"><div class="muted">注册用户</div><div class="stat" id="stat-users">-</div></div>
-<div class="card"><div class="muted">已绑定设备</div><div class="stat" id="stat-devices">-</div></div>
-<div class="card"><div class="muted">已注册终端（hbbs）</div><div class="stat" id="stat-peers">-</div></div>
+<div class="card"><div class="muted" data-i18n="ov.users">注册用户</div><div class="stat" id="stat-users">-</div></div>
+<div class="card"><div class="muted" data-i18n="ov.devices">已绑定设备</div><div class="stat" id="stat-devices">-</div></div>
+<div class="card"><div class="muted" data-i18n="ov.peers">已注册终端（hbbs）</div><div class="stat" id="stat-peers">-</div></div>
 </div>
 <div class="err" id="ov-err"></div>
-<div class="card"><h2>说明</h2>
-<p class="muted">客户端在「设置 → 网络」填入本服务器地址，或直接使用「生成客户端」里预绑定配置的安装包，即可配合账号登录使用。设备在客户端登录账号后会通过心跳自动绑定到所属用户。</p>
+<div class="card"><h2 data-i18n="ov.about">说明</h2>
+<p class="muted" data-i18n="ov.about_text">客户端在「设置 → 网络」填入本服务器地址，或直接使用「生成客户端」里预绑定配置的安装包，即可配合账号登录使用。设备在客户端登录账号后会通过心跳自动绑定到所属用户。</p>
 </div>
 </section>
 
 <section id="s-devices">
-<div class="card"><h2>设备</h2>
-<p class="muted"><button class="ghost" id="dev-refresh">刷新</button> <span id="dev-updated"></span></p>
-<div id="dev-list">加载中…</div></div>
+<div class="card"><h2 data-i18n="dev.title">设备</h2>
+<p class="muted"><button class="ghost" id="dev-refresh" data-i18n="dev.refresh">刷新</button> <span id="dev-updated"></span></p>
+<div id="dev-list" data-i18n="app.loading">加载中…</div></div>
 </section>
 
 <section id="s-users">
-<div class="card"><h2>用户管理</h2><div id="user-list">加载中…</div></div>
+<div class="card"><h2 data-i18n="usr.title">用户管理</h2><div id="user-list" data-i18n="app.loading">加载中…</div></div>
 </section>
 
 <section id="s-tokens">
-<div class="card"><h2>API Token（供第三方系统集成）</h2>
-<p class="muted">请求带 <code>Authorization: Bearer rdt_...</code> 即可调用管理接口。Token 只在创建时显示一次。</p>
+<div class="card"><h2 data-i18n="tok.title">API Token（供第三方系统集成）</h2>
+<p class="muted"><span data-i18n="tok.desc1">请求带</span> <code>Authorization: Bearer rdt_...</code> <span data-i18n="tok.desc2">即可调用管理接口。Token 只在创建时显示一次。</span></p>
 <div class="err" id="tok-err"></div><div class="ok" id="tok-new"></div>
-<label>名称</label><input id="tok-name" placeholder="如：内部系统">
-<button id="tok-create">创建 Token</button>
-<div id="tok-list" style="margin-top:12px">加载中…</div></div>
+<label data-i18n="tok.name">名称</label><input id="tok-name" placeholder="如：内部系统" data-i18n-ph="tok.name_ph">
+<button id="tok-create" data-i18n="tok.create">创建 Token</button>
+<div id="tok-list" style="margin-top:12px" data-i18n="app.loading">加载中…</div></div>
 </section>
 
 <section id="s-genclient">
-<div class="card"><h2>生成预绑定客户端</h2>
-<p class="muted">生成的安装包已内置本服务器地址与密钥（编码进文件名，界面不显示服务器与密钥设置）。把下载链接发给用户即可，用户安装后直接登录账号使用。</p>
+<div class="card"><h2 data-i18n="gen.title">生成预绑定客户端</h2>
+<p class="muted" data-i18n="gen.desc">生成的安装包已内置本服务器地址与密钥（编码进文件名，界面不显示服务器与密钥设置）。把下载链接发给用户即可，用户安装后直接登录账号使用。</p>
 <div class="err" id="gen-err"></div>
-<label>备注（可选）</label><input id="gen-label" placeholder="如：公司办公电脑">
-<button id="gen-btn">生成 Windows 客户端</button>
-<div id="gen-list" style="margin-top:12px">加载中…</div></div>
-<div class="card"><h2>官方客户端手动配置</h2>
-<p class="muted">已经装好官方 RustDesk 客户端的用户不用下载上面的安装包：在官方客户端「设置 → 网络」里填入下面四项，保存后即可登录本服务器的账号使用。下面显示的值与生成客户端内置的配置完全一致。</p>
-<div id="cfg-body">加载中…</div></div>
-<div class="card"><h2>其他平台下载</h2>
-<p class="muted">其他平台请下载官方 RustDesk 客户端，安装后按上方「官方客户端手动配置」填写服务器地址与密钥，即可登录本服务器的账号使用。加速链接经 GitHub 镜像下载，官方链接直连 GitHub。</p>
-<div id="dl-body">加载中…</div></div>
+<label data-i18n="gen.label">备注（可选）</label><input id="gen-label" placeholder="如：公司办公电脑" data-i18n-ph="gen.label_ph">
+<button id="gen-btn" data-i18n="gen.btn">生成 Windows 客户端</button>
+<div id="gen-list" style="margin-top:12px" data-i18n="app.loading">加载中…</div></div>
+<div class="card"><h2 data-i18n="cfg.title">官方客户端手动配置</h2>
+<p class="muted" data-i18n="cfg.desc">已经装好官方 RustDesk 客户端的用户不用下载上面的安装包：在官方客户端「设置 → 网络」里填入下面四项，保存后即可登录本服务器的账号使用。下面显示的值与生成客户端内置的配置完全一致。</p>
+<div id="cfg-body" data-i18n="app.loading">加载中…</div></div>
+<div class="card"><h2 data-i18n="dl.title">其他平台下载</h2>
+<p class="muted" data-i18n="dl.desc">其他平台请下载官方 RustDesk 客户端，安装后按上方「官方客户端手动配置」填写服务器地址与密钥，即可登录本服务器的账号使用。默认显示官方直链；勾选「镜像加速」后切换为经 GitHub 镜像下载的加速链接（iOS 为 App Store 直链，不受影响）。</p>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="dl-mirror" style="width:auto;margin:0"> <span data-i18n="dl.mirror">镜像加速</span></label>
+<div id="dl-body" data-i18n="app.loading">加载中…</div></div>
 </section>
 
 <section id="s-settings">
-<div class="card"><h2>服务器设置</h2>
+<div class="card"><h2 data-i18n="set.title">服务器设置</h2>
 <div class="err" id="set-err"></div><div class="ok" id="set-ok"></div>
-<label>服务器公网地址（域名或 IP，不要带端口，生成客户端必填）</label>
-<input id="set-host" placeholder="如 rd.example.com 或 203.0.113.10">
-<label>API 地址覆盖（可空，默认 http://公网地址:21114）</label>
-<input id="set-api" placeholder="可空">
-<label>GitHub 加速镜像前缀（可空，下载官方客户端模板时优先使用；内置多个公共镜像自动轮询，最后直连）</label>
-<input id="set-mirror" placeholder="如 https://gh-proxy.com">
-<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-hide" style="width:auto;margin:0"> 在客户端隐藏服务器/密钥设置（通过心跳下发）</label>
-<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-allowreg" style="width:auto;margin:0"> 允许开放注册（任何人可自助注册账号）</label>
-<p class="muted">关闭后，只有管理员登录状态下打开注册页才能新建账号。公网部署建议关闭。</p>
-<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-allowrc" style="width:auto;margin:0"> 允许远程修改配置（通过心跳下发到所有客户端）</label>
-<p class="muted">开启后，控制端可以操作被控端的 RustDesk 客户端界面与设置（包括改密码、改配置），不用再逐台到被控端本地勾选。仅在自有设备上开启；已在本机手动改过这一项的客户端以本机设置为准。</p>
-<button id="set-save">保存设置</button></div>
-<div class="card"><h2>监听端口（当前生效值）</h2>
-<p class="muted" id="ports-line">读取中…</p>
-<p class="muted">端口由启动参数决定，不在这里改：编辑程序目录下的 server.env（没有就从 server.env.example 复制一份），改 HBBS_PORT / HBBR_PORT / API_PORT / RELAY_SERVERS 后重启服务端。改端口后必须重新生成客户端（新客户端才会带新端口），并更新路由器端口转发；已生成的旧客户端会连不上新端口。换端口只能躲开针对默认端口的批量扫描，真正的安全仍靠服务器密钥与账号登录——知道新端口的人仍可注册 ID。</p></div>
-<div class="card"><h2>系统服务（Ubuntu）</h2>
-<p class="muted">在程序目录执行下面命令，把服务端注册为 systemd 服务：开机自启、崩溃自动重启。服务跑的就是 start.sh，所以 server.env 里的端口与中继配置同样生效；升级时只需替换 hbbs / hbbr 两个文件，不用重装服务。</p>
-<div style="font-family:monospace;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px">sudo ./install-service.sh<br>sudo ./uninstall-service.sh&nbsp;&nbsp;# 移除服务<br>systemctl status rustdesk-server-pro<br>journalctl -u rustdesk-server-pro -f&nbsp;&nbsp;# 看服务日志</div></div>
-<div class="card"><h2>官方客户端模板</h2>
-<p class="muted" id="tpl-status">检查中…</p>
-<label>版本（可空 = 最新版）</label><input id="tpl-ver" placeholder="如 1.4.2">
-<button id="tpl-btn">下载/更新模板</button>
+<label data-i18n="set.host_label">服务器公网地址（域名或 IP，不要带端口，生成客户端必填）</label>
+<input id="set-host" placeholder="如 rd.example.com 或 203.0.113.10" data-i18n-ph="set.host_ph">
+<label data-i18n="set.api_label">API 地址覆盖（可空，默认 http://公网地址:21114）</label>
+<input id="set-api" placeholder="可空" data-i18n-ph="set.api_ph">
+<label data-i18n="set.mirror_label">GitHub 加速镜像前缀（可空，下载官方客户端模板时优先使用；内置多个公共镜像自动轮询，最后直连）</label>
+<input id="set-mirror" placeholder="如 https://gh-proxy.com" data-i18n-ph="set.mirror_ph">
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-hide" style="width:auto;margin:0"> <span data-i18n="set.hide">在客户端隐藏服务器/密钥设置（通过心跳下发）</span></label>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-allowreg" style="width:auto;margin:0"> <span data-i18n="set.allowreg">允许开放注册（任何人可自助注册账号）</span></label>
+<p class="muted" data-i18n="set.allowreg_note">关闭后，只有管理员登录状态下打开注册页才能新建账号。公网部署建议关闭。</p>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-allowrc" style="width:auto;margin:0"> <span data-i18n="set.allowrc">允许远程修改配置（通过心跳下发到所有客户端）</span></label>
+<p class="muted" data-i18n="set.allowrc_note">开启后，控制端可以操作被控端的 RustDesk 客户端界面与设置（包括改密码、改配置），不用再逐台到被控端本地勾选。仅在自有设备上开启；已在本机手动改过这一项的客户端以本机设置为准。</p>
+<button id="set-save" data-i18n="set.save">保存设置</button></div>
+<div class="card"><h2 data-i18n="set.ports_title">监听端口（当前生效值）</h2>
+<p class="muted" id="ports-line" data-i18n="set.ports_loading">读取中…</p>
+<p class="muted" data-i18n="set.ports_desc">端口由启动参数决定，不在这里改：编辑程序目录下的 server.env（没有就从 server.env.example 复制一份），改 HBBS_PORT / HBBR_PORT / API_PORT / RELAY_SERVERS 后重启服务端。改端口后必须重新生成客户端（新客户端才会带新端口），并更新路由器端口转发；已生成的旧客户端会连不上新端口。换端口只能躲开针对默认端口的批量扫描，真正的安全仍靠服务器密钥与账号登录——知道新端口的人仍可注册 ID。</p></div>
+<div class="card"><h2 data-i18n="set.svc_title">系统服务（Ubuntu）</h2>
+<p class="muted" data-i18n="set.svc_desc">在程序目录执行下面命令，把服务端注册为 systemd 服务：开机自启、崩溃自动重启。服务跑的就是 start.sh，所以 server.env 里的端口与中继配置同样生效；升级时只需替换 hbbs / hbbr 两个文件，不用重装服务。</p>
+<div style="font-family:monospace;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px">sudo ./install-service.sh<br>sudo ./uninstall-service.sh&nbsp;&nbsp;<span data-i18n="set.svc_remove"># 移除服务</span><br>systemctl status rustdesk-server-pro<br>journalctl -u rustdesk-server-pro -f&nbsp;&nbsp;<span data-i18n="set.svc_logs"># 看服务日志</span></div></div>
+<div class="card"><h2 data-i18n="set.tpl_title">官方客户端模板</h2>
+<p class="muted" id="tpl-status" data-i18n="set.tpl_checking">检查中…</p>
+<label data-i18n="set.tpl_ver_label">版本（可空 = 最新版）</label><input id="tpl-ver" placeholder="如 1.4.2" data-i18n-ph="set.tpl_ver_ph">
+<button id="tpl-btn" data-i18n="set.tpl_btn">下载/更新模板</button>
 <div id="tpl-prog" style="display:none;margin-top:12px">
 <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;height:14px;overflow:hidden">
 <div id="tpl-bar" style="height:100%;width:0%;background:#1f6feb;transition:width .5s"></div>
 </div>
 <p class="muted" id="tpl-detail"></p>
 </div>
-<p class="muted">模板是官方 RustDesk Windows 安装程序，生成客户端时会在其基础上改文件名注入配置，不修改程序本身。下载会自动在多个 GitHub 加速镜像与直连之间切换（某个源太慢会自动换下一个）。</p></div>
-<div class="card"><h2>服务端版本更新</h2>
-<p class="muted" id="upd-current">读取中…</p>
+<p class="muted" data-i18n="set.tpl_desc">模板是官方 RustDesk Windows 安装程序，生成客户端时会在其基础上改文件名注入配置，不修改程序本身。下载会自动在多个 GitHub 加速镜像与直连之间切换（某个源太慢会自动换下一个）。</p></div>
+<div class="card"><h2 data-i18n="set.upd_title">服务端版本更新</h2>
+<p class="muted" id="upd-current" data-i18n="set.upd_loading">读取中…</p>
 <div class="err" id="upd-err"></div>
-<button id="upd-check">检测更新</button>
+<button id="upd-check" data-i18n="set.upd_check">检测更新</button>
 <div id="upd-result" style="display:none;margin-top:12px"></div>
 <div id="upd-prog" style="display:none;margin-top:12px">
 <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;height:14px;overflow:hidden">
@@ -265,24 +535,34 @@ const CONSOLE_BODY: &str = r#"
 </div>
 <p class="muted" id="upd-detail"></p>
 </div>
-<p class="muted">更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。</p></div>
+<p class="muted" data-i18n="set.upd_desc">更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。</p></div>
 </section>
 </div>
 
 <script>
+window.__pageTitleKey='app.title';
 const $=id=>document.getElementById(id);
 let ME=null;
 async function api(url,opts={}){const r=await fetch(url,opts);if(r.status===401){location.href='/console/login';throw new Error('unauth');}return r.json();}
-async function copyText(t,btn){let ok=false;try{await navigator.clipboard.writeText(t);ok=true;}catch(e){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy');}catch(_){}ta.remove();}if(btn){const o=btn.textContent;btn.textContent=ok?'已复制':'复制失败';setTimeout(()=>btn.textContent=o,1200);}}
+async function copyText(t,btn){let ok=false;try{await navigator.clipboard.writeText(t);ok=true;}catch(e){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy');}catch(_){}ta.remove();}if(btn){const o=btn.textContent;btn.textContent=ok?window.t('app.copied'):window.t('app.copy_failed');setTimeout(()=>btn.textContent=o,1200);}}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function loadFail(el,fnName,msg){el.innerHTML='<p class="err">加载失败'+(msg?('：'+esc(msg)):'')+'。<button class="ghost" onclick="'+fnName+'()">重试</button></p>';}
+function loadFail(el,fnName,msg){el.innerHTML='<p class="err">'+window.t('app.load_failed')+(msg?(window.t('app.colon')+esc(msg)):'')+window.t('app.period')+'<button class="ghost" onclick="'+fnName+'()">'+window.t('app.retry')+'</button></p>';}
 async function init(){
-  try{ ME=await api('/api/me'); }catch(e){ if(e.message!=='unauth')$('who').textContent='加载失败，请检查网络后刷新页面'; return; }
+  applyI18n();
+  try{ ME=await api('/api/me'); }catch(e){ if(e.message!=='unauth')$('who').textContent=t('app.load_fail_refresh'); return; }
   if(!ME.ok){location.href='/console/login';return;}
-  $('who').textContent=ME.username+(ME.is_admin?'（管理员）':'');
+  $('who').textContent=ME.username+(ME.is_admin?t('app.who_admin'):'');
   if(!ME.is_admin){document.querySelectorAll('.adminonly').forEach(e=>e.style.display='none');}
   loadOverview(); loadDevices();
 }
+window.__onLangChange=()=>{
+  if(ME)$('who').textContent=ME.username+(ME.is_admin?t('app.who_admin'):'');
+  const active=document.querySelector('nav button.active');
+  const s=active?active.dataset.s:'overview';
+  if(s==='overview')loadOverview(); if(s==='devices')loadDevices();
+  if(s==='users')loadUsers(); if(s==='tokens')loadTokens();
+  if(s==='genclient'){loadGen();loadCfg();loadDl();} if(s==='settings')loadSettings();
+};
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');
   document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));$('s-'+b.dataset.s).classList.add('active');
@@ -295,111 +575,123 @@ $('logout').onclick=async()=>{try{await api('/api/auth/logout',{method:'POST'});
 
 async function loadOverview(){
   if(!ME.is_admin)return;
-  let j; try{ j=await api('/api/admin/overview'); }catch(e){ if(e.message!=='unauth')$('ov-err').textContent='概览加载失败，请刷新重试'; return; }
-  if(!j.ok){ $('ov-err').textContent='概览加载失败：'+(j.error||'未知错误'); return; }
+  let j; try{ j=await api('/api/admin/overview'); }catch(e){ if(e.message!=='unauth')$('ov-err').textContent=t('ov.load_fail'); return; }
+  if(!j.ok){ $('ov-err').textContent=t('ov.load_fail2')+(j.error||t('app.unknown_err')); return; }
   $('ov-err').textContent='';
   $('stat-users').textContent=j.users; $('stat-devices').textContent=j.devices; $('stat-peers').textContent=j.peers;
 }
 async function loadDevices(){
   let j; try{ j=await api('/api/devices'); }catch(e){ if(e.message!=='unauth')loadFail($('dev-list'),'loadDevices'); return; }
   if(!j.ok){ loadFail($('dev-list'),'loadDevices',j.error); return; }
-  $('dev-updated').textContent='更新于 '+new Date().toLocaleTimeString();
-  if(!j.devices.length){$('dev-list').innerHTML='<p class="muted">暂无设备。设备在客户端登录账号后会出现在这里。</p>';return;}
-  $('dev-list').innerHTML='<table><tr><th>设备 ID</th><th>状态</th><th>主机名</th><th>系统</th><th>所属用户</th><th>版本</th><th>最近在线</th></tr>'+
-    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">● 在线</span>':'<span class="muted">● 离线</span>'}</td><td>${esc(d.hostname||'')}</td><td>${esc(d.os||'')}</td><td>${d.username?esc(d.username):'<span class=muted>未绑定</span>'}</td><td>${esc(d.version||'')}</td><td>${new Date(d.last_seen*1000).toLocaleString()}</td></tr>`).join('')+'</table>';
+  $('dev-updated').textContent=t('dev.updated')+new Date().toLocaleTimeString();
+  if(!j.devices.length){$('dev-list').innerHTML='<p class="muted">'+t('dev.empty')+'</p>';return;}
+  $('dev-list').innerHTML='<table><tr><th>'+t('dev.id')+'</th><th>'+t('dev.status')+'</th><th>'+t('dev.hostname')+'</th><th>'+t('dev.os')+'</th><th>'+t('dev.owner')+'</th><th>'+t('dev.version')+'</th><th>'+t('dev.last_seen')+'</th></tr>'+
+    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">'+t('dev.online')+'</span>':'<span class="muted">'+t('dev.offline')+'</span>'}</td><td>${esc(d.hostname||'')}</td><td>${esc(d.os||'')}</td><td>${d.username?esc(d.username):'<span class=muted>'+t('dev.unbound')+'</span>'}</td><td>${esc(d.version||'')}</td><td>${new Date(d.last_seen*1000).toLocaleString()}</td></tr>`).join('')+'</table>';
 }
 let USERS=[];
 async function loadUsers(){
   let j; try{ j=await api('/api/admin/users'); }catch(e){ if(e.message!=='unauth')loadFail($('user-list'),'loadUsers'); return; }
   if(!j.ok){ loadFail($('user-list'),'loadUsers',j.error); return; }
   USERS=j.users;
-  $('user-list').innerHTML='<table><tr><th>用户名</th><th>角色</th><th>状态</th><th>注册时间</th><th>操作</th></tr>'+
-    j.users.map((u,i)=>`<tr><td>${esc(u.username)}</td><td>${u.is_admin?'管理员':'普通'}</td><td>${u.disabled?'已禁用':'正常'}</td><td>${new Date(u.created_at*1000).toLocaleString()}</td>
-    <td><button class="ghost" onclick="uact(USERS[${i}].username,'${u.disabled?'enable':'disable'}')">${u.disabled?'启用':'禁用'}</button>
-    <button class="ghost" onclick="uact(USERS[${i}].username,'${u.is_admin?'unadmin':'admin'}')">${u.is_admin?'取消管理员':'设管理员'}</button>
-    <button class="ghost" onclick="upwd(USERS[${i}].username)">重置密码</button>
-    <button class="danger" onclick="uact(USERS[${i}].username,'delete')">删除</button></td></tr>`).join('')+'</table>';
+  $('user-list').innerHTML='<table><tr><th>'+t('usr.username')+'</th><th>'+t('usr.role')+'</th><th>'+t('usr.status')+'</th><th>'+t('usr.created')+'</th><th>'+t('usr.actions')+'</th></tr>'+
+    j.users.map((u,i)=>`<tr><td>${esc(u.username)}</td><td>${u.is_admin?t('usr.admin'):t('usr.regular')}</td><td>${u.disabled?t('usr.disabled'):t('usr.active')}</td><td>${new Date(u.created_at*1000).toLocaleString()}</td>
+    <td><button class="ghost" onclick="uact(USERS[${i}].username,'${u.disabled?'enable':'disable'}')">${u.disabled?t('usr.enable'):t('usr.disable')}</button>
+    <button class="ghost" onclick="uact(USERS[${i}].username,'${u.is_admin?'unadmin':'admin'}')">${u.is_admin?t('usr.unadmin'):t('usr.make_admin')}</button>
+    <button class="ghost" onclick="upwd(USERS[${i}].username)">${t('usr.reset_pwd')}</button>
+    <button class="danger" onclick="uact(USERS[${i}].username,'delete')">${t('app.delete')}</button></td></tr>`).join('')+'</table>';
 }
 async function uact(name,act){
-  if(act==='delete'&&!confirm('删除用户 '+name+'？该账号将无法登录，其设备变为未绑定，名下 API Token 同时吊销；删除不可恢复。'))return;
-  const j=await api('/api/admin/users/'+encodeURIComponent(name)+'/'+act,{method:'POST'}); if(j.ok)loadUsers(); else alert(j.error||'操作失败');
+  if(act==='delete'&&!confirm(t('usr.delete_confirm').replace('{n}',name)))return;
+  const j=await api('/api/admin/users/'+encodeURIComponent(name)+'/'+act,{method:'POST'}); if(j.ok)loadUsers(); else alert(j.error||t('app.op_failed'));
 }
 async function upwd(name){
-  const pw=prompt('为 '+name+' 设置新密码（至少 6 位）'); if(!pw)return;
+  const pw=prompt(t('usr.pwd_prompt').replace('{n}',name)); if(!pw)return;
   const j=await api('/api/admin/users/'+encodeURIComponent(name)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
-  alert(j.ok?'已重置':(j.error||'失败'));
+  alert(j.ok?t('usr.pwd_reset'):(j.error||t('app.failed')));
 }
 let TOKENS=[];
 async function loadTokens(){
   let j; try{ j=await api('/api/tokens'); }catch(e){ if(e.message!=='unauth')loadFail($('tok-list'),'loadTokens'); return; }
   if(!j.ok){ loadFail($('tok-list'),'loadTokens',j.error); return; }
   TOKENS=j.tokens;
-  $('tok-list').innerHTML=j.tokens.length?'<table><tr><th>名称</th><th>创建时间</th><th>最近使用</th><th></th></tr>'+
-    j.tokens.map((t,i)=>`<tr><td>${esc(t.name)}</td><td>${new Date(t.created_at*1000).toLocaleString()}</td><td>${t.last_used_at?new Date(t.last_used_at*1000).toLocaleString():'-'}</td><td><button class="danger" onclick="tdel(${i})">吊销</button></td></tr>`).join('')+'</table>':'<p class="muted">暂无 Token</p>';
+  $('tok-list').innerHTML=j.tokens.length?'<table><tr><th>'+t('tok.name')+'</th><th>'+t('tok.created')+'</th><th>'+t('tok.last_used')+'</th><th></th></tr>'+
+    j.tokens.map((t,i)=>`<tr><td>${esc(t.name)}</td><td>${new Date(t.created_at*1000).toLocaleString()}</td><td>${t.last_used_at?new Date(t.last_used_at*1000).toLocaleString():'-'}</td><td><button class="danger" onclick="tdel(${i})">${window.t('tok.revoke')}</button></td></tr>`).join('')+'</table>':'<p class="muted">'+t('tok.empty')+'</p>';
 }
 $('tok-create').onclick=async()=>{
   const btn=$('tok-create'); if(btn.disabled)return; btn.disabled=true;
   try{
     const j=await api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('tok-name').value})});
-    if(j.ok){$('tok-err').textContent='';$('tok-new').innerHTML='新 Token（只显示一次，请保存）：<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">复制</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||'失败';}
-  }catch(e){ if(e.message!=='unauth')$('tok-err').textContent='网络错误，请重试'; }
+    if(j.ok){$('tok-err').textContent='';$('tok-new').innerHTML=t('tok.new_label')+'<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">'+t('app.copy')+'</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||t('app.failed');}
+  }catch(e){ if(e.message!=='unauth')$('tok-err').textContent=t('app.network_err'); }
   btn.disabled=false;
 };
 async function tdel(i){
   const t=TOKENS[i]; if(!t)return;
-  if(!confirm('吊销 Token「'+t.name+'」？使用该 Token 的程序将立即无法访问，吊销不可恢复。'))return;
-  const j=await api('/api/tokens/'+t.id,{method:'DELETE'}); if(j.ok)loadTokens(); else alert(j.error||'吊销失败');
+  if(!confirm(window.t('tok.revoke_confirm').replace('{n}',t.name)))return;
+  const j=await api('/api/tokens/'+t.id,{method:'DELETE'}); if(j.ok)loadTokens(); else alert(j.error||window.t('tok.revoke_failed'));
 }
 let GEN=[];
 async function loadGen(){
   let j; try{ j=await api('/api/admin/gen-clients'); }catch(e){ if(e.message!=='unauth')loadFail($('gen-list'),'loadGen'); return; }
   if(!j.ok){ loadFail($('gen-list'),'loadGen',j.error); return; }
   GEN=j.clients;
-  $('gen-list').innerHTML=j.clients.length?'<table class="gent"><colgroup><col style="width:24%"><col style="width:9%"><col style="width:10%"><col style="width:12%"><col style="width:37%"><col style="width:8%"></colgroup><tr><th>文件</th><th>备注</th><th>生成者</th><th>生成时间</th><th>下载链接</th><th></th></tr>'+
+  $('gen-list').innerHTML=j.clients.length?'<table class="gent"><colgroup><col style="width:24%"><col style="width:9%"><col style="width:10%"><col style="width:12%"><col style="width:37%"><col style="width:8%"></colgroup><tr><th>'+t('gen.file')+'</th><th>'+t('gen.remark')+'</th><th>'+t('gen.by')+'</th><th>'+t('gen.time')+'</th><th>'+t('gen.link')+'</th><th></th></tr>'+
     j.clients.map((c,i)=>`<tr><td class="fname">${esc(c.filename)}</td><td>${esc(c.label||'')}</td><td>${esc(c.created_by||'')}</td><td class="nowrap">${new Date(c.created_at*1000).toLocaleString()}</td>
-    <td><div class="dl"><input readonly value="${esc(c.download_url)}"><button class="ghost" onclick="copyText(this.closest('.dl').querySelector('input').value,this)">复制</button><button class="ghost" onclick="window.open(this.closest('.dl').querySelector('input').value,'_blank')">下载</button></div></td>
-    <td class="nowrap"><button class="danger" onclick="gdel(${i})">删除</button></td></tr>`).join('')+'</table>':'<p class="muted">尚未生成。'+(ME.is_admin?'先在「服务器设置」里填公网地址并下载模板。':'生成前需管理员先在服务器设置里填公网地址并下载模板。')+'</p>';
+    <td><div class="dl"><input readonly value="${esc(c.download_url)}"><button class="ghost" onclick="copyText(this.closest('.dl').querySelector('input').value,this)">${t('app.copy')}</button><button class="ghost" onclick="window.open(this.closest('.dl').querySelector('input').value,'_blank')">${t('app.download')}</button></div></td>
+    <td class="nowrap"><button class="danger" onclick="gdel(${i})">${t('app.delete')}</button></td></tr>`).join('')+'</table>':'<p class="muted">'+(ME.is_admin?t('gen.empty_admin'):t('gen.empty_user'))+'</p>';
 }
 async function loadCfg(){
   let j; try{ j=await api('/api/client-config'); }catch(e){ if(e.message!=='unauth')loadFail($('cfg-body'),'loadCfg'); return; }
   if(!j.ok){ loadFail($('cfg-body'),'loadCfg',j.error); return; }
-  if(!j.configured){ $('cfg-body').innerHTML='<p class="muted">'+(ME.is_admin?'尚未在「服务器设置」里填写公网地址，填好后这里会显示客户端配置。':'管理员尚未填写服务器公网地址，暂时无法显示客户端配置。')+'</p>'; return; }
-  const row=(label,val)=>'<label>'+label+'</label><div class="dl"><input readonly value="'+esc(val)+'"><button class="ghost" onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">复制</button></div>';
-  $('cfg-body').innerHTML=row('ID 服务器',j.host)+row('中继服务器',j.relay)+row('API 服务器',j.api)+row('密钥（Key）',j.key)+'<div class="dl" style="margin-top:8px"><input type="hidden" value="'+esc(j.share)+'"><button onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">一键复制配置</button></div><p class="muted">复制后，在官方客户端「设置 → 网络」点粘贴图标即可导入整份配置，无需逐项填写。</p>';
+  if(!j.configured){ $('cfg-body').innerHTML='<p class="muted">'+(ME.is_admin?t('cfg.unconfigured_admin'):t('cfg.unconfigured_user'))+'</p>'; return; }
+  const row=(label,val)=>'<label>'+label+'</label><div class="dl"><input readonly value="'+esc(val)+'"><button class="ghost" onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">'+t('app.copy')+'</button></div>';
+  $('cfg-body').innerHTML=row(t('cfg.host'),j.host)+row(t('cfg.relay'),j.relay)+row(t('cfg.api'),j.api)+row(t('cfg.key'),j.key)+'<div class="dl" style="margin-top:8px"><input type="hidden" value="'+esc(j.share)+'"><button onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">'+t('cfg.copy_all')+'</button></div><p class="muted">'+t('cfg.copy_hint')+'</p>';
+}
+let DL_DATA=null;
+let DL_MIRROR=false;
+try{DL_MIRROR=localStorage.getItem('rdp-dl-mirror')==='1';}catch(e){}
+function renderDl(){
+  if(!DL_DATA)return;
+  const j=DL_DATA;
+  if(!j.platforms.length){$('dl-body').innerHTML='<p class="muted">'+t('dl.empty')+'</p>';return;}
+  const row=p=>{
+    let href=p.url, label=t('dl.official');
+    if(p.id==='ios'){label=t('dl.appstore');}
+    else if(DL_MIRROR&&p.mirrors&&p.mirrors.length){href=p.mirrors[0];label=t('dl.mirror_link');}
+    return '<tr><td>'+esc(p.name)+'</td><td class="fname">'+esc(p.file||'App Store')+'</td><td class="nowrap"><a href="'+esc(href)+'" target="_blank" rel="noopener">'+label+'</a></td></tr>';
+  };
+  $('dl-body').innerHTML='<p class="muted">'+t('dl.latest')+esc(j.version)+'</p><table><tr><th>'+t('dl.platform')+'</th><th>'+t('dl.file')+'</th><th>'+t('dl.download')+'</th></tr>'+j.platforms.map(row).join('')+'</table>';
 }
 async function loadDl(){
   let j; try{ j=await api('/api/client-downloads'); }catch(e){ if(e.message!=='unauth')loadFail($('dl-body'),'loadDl'); return; }
   if(!j.ok){ loadFail($('dl-body'),'loadDl',j.error); return; }
-  if(!j.platforms.length){ $('dl-body').innerHTML='<p class="muted">暂无可下载的版本。</p>'; return; }
-  const row=p=>{
-    const links='<a href="'+esc(p.url)+'" target="_blank" rel="noopener">官方下载</a>'+(p.mirrors&&p.mirrors.length?' ｜ <a href="'+esc(p.mirrors[0])+'" target="_blank" rel="noopener">加速下载</a>':'');
-    return '<tr><td>'+esc(p.name)+'</td><td class="fname">'+esc(p.file||'App Store')+'</td><td class="nowrap">'+links+'</td></tr>';
-  };
-  $('dl-body').innerHTML='<p class="muted">官方最新版本：'+esc(j.version)+'</p><table><tr><th>平台</th><th>文件</th><th>下载</th></tr>'+j.platforms.map(row).join('')+'</table>';
+  DL_DATA=j; renderDl();
 }
+$('dl-mirror').checked=DL_MIRROR;
+$('dl-mirror').onchange=e=>{DL_MIRROR=e.target.checked;try{localStorage.setItem('rdp-dl-mirror',DL_MIRROR?'1':'0');}catch(_){}renderDl();};
 $('gen-btn').onclick=async()=>{
   const btn=$('gen-btn'); if(btn.disabled)return; btn.disabled=true;
   try{
     const j=await api('/api/admin/gen-client',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:$('gen-label').value})});
-    if(j.ok){$('gen-err').textContent='';loadGen();}else{$('gen-err').textContent=j.error||'生成失败';}
-  }catch(e){ if(e.message!=='unauth')$('gen-err').textContent='网络错误，请重试'; }
+    if(j.ok){$('gen-err').textContent='';loadGen();}else{$('gen-err').textContent=j.error||t('gen.failed');}
+  }catch(e){ if(e.message!=='unauth')$('gen-err').textContent=t('app.network_err'); }
   btn.disabled=false;
 };
 async function gdel(i){
   const c=GEN[i]; if(!c)return;
-  if(!confirm('删除生成的客户端「'+(c.label||c.filename)+'」？删除后，已发出的下载链接立即失效，且不可恢复。'))return;
-  const j=await api('/api/admin/gen-clients/'+c.id,{method:'DELETE'}); if(j.ok)loadGen(); else alert(j.error||'删除失败');
+  if(!confirm(t('gen.delete_confirm').replace('{n}',(c.label||c.filename))))return;
+  const j=await api('/api/admin/gen-clients/'+c.id,{method:'DELETE'}); if(j.ok)loadGen(); else alert(j.error||t('gen.delete_failed'));
 }
 async function loadSettings(){
-  let j; try{ j=await api('/api/admin/settings'); }catch(e){ if(e.message!=='unauth')$('set-err').textContent='加载设置失败，请刷新重试'; return; }
-  if(!j.ok){ $('set-err').textContent='加载设置失败：'+(j.error||'未知错误'); return; }
+  let j; try{ j=await api('/api/admin/settings'); }catch(e){ if(e.message!=='unauth')$('set-err').textContent=t('set.load_fail'); return; }
+  if(!j.ok){ $('set-err').textContent=t('set.load_fail2')+(j.error||t('app.unknown_err')); return; }
   $('set-host').value=j.settings.public_host||''; $('set-api').value=j.settings.api_url_override||'';
   $('set-mirror').value=j.settings.github_mirror||'';
   $('set-hide').checked=!!j.settings.hide_server_settings;
   $('set-allowreg').checked=j.settings.allow_register!==false;
   $('set-allowrc').checked=!!j.settings.allow_remote_config;
-  if(j.ports){let pl='中继/ID：'+j.ports.rendezvous+'（NAT 测试 '+j.ports.nat_test+'，WebSocket '+j.ports.ws_rendezvous+'）｜中继：'+j.ports.relay+'（WebSocket '+j.ports.ws_relay+'）｜API：'+j.ports.api; if(j.ports.console){pl+='｜控制台（独立监听）：'+j.ports.console_listen;}else{pl+='（与 API 同端口）';} if(j.ports.tls){pl+='｜HTTPS：已启用';} $('ports-line').textContent=pl;}
-  $('tpl-status').textContent=j.template_ready?('已就绪：'+(j.template_version||'')):'未下载（生成客户端前需要先下载）';
+  if(j.ports){let pl=t('set.ports_rendezvous')+j.ports.rendezvous+t('set.ports_nat')+j.ports.nat_test+t('set.ports_ws')+j.ports.ws_rendezvous+t('set.ports_relay')+j.ports.relay+t('set.ports_ws')+j.ports.ws_relay+t('set.ports_api')+j.ports.api; if(j.ports.console){pl+=t('set.ports_console')+j.ports.console_listen;}else{pl+=t('set.ports_same');} if(j.ports.tls){pl+=t('set.ports_tls');} $('ports-line').textContent=pl;}
+  $('tpl-status').textContent=j.template_ready?(t('set.tpl_ready')+(j.template_version||'')):t('set.tpl_not_dl');
   pollTpl();
   loadUpdate();
 }
@@ -408,8 +700,8 @@ $('set-save').onclick=async()=>{
   $('set-ok').textContent=''; $('set-err').textContent='';
   try{
     const j=await api('/api/admin/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({public_host:$('set-host').value,api_url_override:$('set-api').value,github_mirror:$('set-mirror').value,hide_server_settings:$('set-hide').checked,allow_register:$('set-allowreg').checked,allow_remote_config:$('set-allowrc').checked})});
-    if(j.ok){$('set-ok').textContent='已保存';}else{$('set-err').textContent=j.error||'失败';}
-  }catch(e){ if(e.message!=='unauth')$('set-err').textContent='网络错误，请重试'; }
+    if(j.ok){$('set-ok').textContent=t('set.saved');}else{$('set-err').textContent=j.error||t('app.failed');}
+  }catch(e){ if(e.message!=='unauth')$('set-err').textContent=t('app.network_err'); }
   btn.disabled=false;
 };
 let tplTimer=null, tplLastBytes=0, tplLastTime=0, tplSpeed=0;
@@ -428,21 +720,21 @@ async function pollTpl(){
     $('tpl-prog').style.display='block'; $('tpl-btn').disabled=true;
     const pct=j.total>0?Math.min(100,j.downloaded/j.total*100):0;
     $('tpl-bar').style.width=pct+'%';
-    $('tpl-status').textContent='正在下载官方客户端模板'+(j.version?(' '+j.version):'');
-    $('tpl-detail').textContent=(j.total>0?(fmtMB(j.downloaded)+' / '+fmtMB(j.total)+'（'+pct.toFixed(1)+'%）'):fmtMB(j.downloaded))+
-      ' · 速度 '+fmtSpeed(tplSpeed)+(j.source?(' · 来源：'+j.source):'');
+    $('tpl-status').textContent=t('set.tpl_downloading')+(j.version?(' '+j.version):'');
+    $('tpl-detail').textContent=(j.total>0?(fmtMB(j.downloaded)+' / '+fmtMB(j.total)+t('app.po')+pct.toFixed(1)+'%'+t('app.pc')):fmtMB(j.downloaded))+
+      t('set.tpl_speed')+fmtSpeed(tplSpeed)+(j.source?(t('set.tpl_source')+j.source):'');
     tplTimer=setTimeout(pollTpl,1000);
   }else{
     $('tpl-btn').disabled=false;
     if(j.state==='done'){
       $('tpl-bar').style.width='100%';
-      $('tpl-detail').textContent='下载完成';
-      $('tpl-status').textContent='已就绪：'+(j.template_version||j.version||'');
+      $('tpl-detail').textContent=t('set.tpl_done');
+      $('tpl-status').textContent=t('set.tpl_ready')+(j.template_version||j.version||'');
     }else if(j.state==='error'){
-      $('tpl-status').textContent='下载失败：'+(j.error||'未知错误');
+      $('tpl-status').textContent=t('set.tpl_failed')+(j.error||t('app.unknown_err'));
       $('tpl-detail').textContent='';
     }else if(j.template_ready){
-      $('tpl-status').textContent='已就绪：'+(j.template_version||'');
+      $('tpl-status').textContent=t('set.tpl_ready')+(j.template_version||'');
     }
     if(tplTimer){clearTimeout(tplTimer);tplTimer=null;}
   }
@@ -450,16 +742,16 @@ async function pollTpl(){
 $('tpl-btn').onclick=async()=>{
   tplLastBytes=0; tplLastTime=0; tplSpeed=0;
   const j=await api('/api/admin/template/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:$('tpl-ver').value})});
-  if(!j.ok){$('tpl-status').textContent='启动下载失败：'+(j.error||'');return;}
-  $('tpl-prog').style.display='block'; $('tpl-status').textContent='正在下载…';
+  if(!j.ok){$('tpl-status').textContent=t('set.tpl_start_failed')+(j.error||'');return;}
+  $('tpl-prog').style.display='block'; $('tpl-status').textContent=t('set.tpl_downloading2');
   pollTpl();
 };
 let UPD={current:'',latest:null};
 async function loadUpdate(){
-  let j; try{ j=await api('/api/admin/update/status'); }catch(e){ if(e.message!=='unauth')$('upd-current').textContent='版本信息加载失败，请刷新重试'; return; }
-  if(!j.ok){ $('upd-current').textContent='版本信息加载失败：'+(j.error||'未知错误'); return; }
+  let j; try{ j=await api('/api/admin/update/status'); }catch(e){ if(e.message!=='unauth')$('upd-current').textContent=t('set.upd_load_fail'); return; }
+  if(!j.ok){ $('upd-current').textContent=t('set.upd_load_fail2')+(j.error||t('app.unknown_err')); return; }
   UPD.current=j.current||'';
-  $('upd-current').textContent='当前版本：'+j.current+'（上游基底 '+j.upstream_base+'）｜平台：'+j.platform+(j.staged?('｜已暂存 '+j.staged_version+'，重启后生效'):'');
+  $('upd-current').textContent=t('set.upd_current')+j.current+t('set.upd_base')+j.upstream_base+t('set.upd_platform')+j.platform+(j.staged?(t('set.upd_staged')+j.staged_version+t('set.upd_staged2')):'');
   if(j.staged){ showStaged(j.staged_version); }
   if(j.running){ pollUpd(); }
 }
@@ -468,29 +760,29 @@ $('upd-check').onclick=async()=>{
   $('upd-err').textContent=''; $('upd-result').style.display='none'; $('upd-result').innerHTML='';
   try{
     const j=await api('/api/admin/update/check',{method:'POST'});
-    if(!j.ok){ $('upd-err').textContent=j.error||'检测失败'; return; }
+    if(!j.ok){ $('upd-err').textContent=j.error||t('set.upd_check_fail'); return; }
     $('upd-result').style.display='block';
     if(!j.has_update){
-      $('upd-result').innerHTML='<p class="ok">已是最新版本（最新：'+esc(j.latest)+'）。</p>';
+      $('upd-result').innerHTML='<p class="ok">'+t('set.upd_latest')+esc(j.latest)+t('set.upd_latest2')+'</p>';
       return;
     }
     UPD.latest=j.latest;
     let notesHtml='';
-    if(j.notes_unavailable){ notesHtml='<p class="muted">更新日志暂不可用（本次检测未能获取到更新说明，可稍后重试）。</p>'; }
-    else if(!j.release_notes){ notesHtml='<p class="muted">暂无更新说明。</p>'; }
+    if(j.notes_unavailable){ notesHtml='<p class="muted">'+t('set.upd_notes_na')+'</p>'; }
+    else if(!j.release_notes){ notesHtml='<p class="muted">'+t('set.upd_no_notes')+'</p>'; }
     else { notesHtml='<div class="changelog" id="upd-notes"></div>'; }
-    $('upd-result').innerHTML='<p>发现新版本：<b>'+esc(j.latest)+'</b>'+(j.published_at?('（发布于 '+esc(j.published_at.slice(0,10))+'）'):'')+'</p>'+notesHtml+'<p><button id="upd-dl">更新到 '+esc(j.latest)+'</button></p>';
+    $('upd-result').innerHTML='<p>'+t('set.upd_found')+'<b>'+esc(j.latest)+'</b>'+(j.published_at?(t('set.upd_released')+esc(j.published_at.slice(0,10))+t('app.pc')):'')+'</p>'+notesHtml+'<p><button id="upd-dl">'+t('set.upd_to')+esc(j.latest)+'</button></p>';
     const notesEl=$('upd-notes'); if(notesEl) notesEl.textContent=j.release_notes;
     $('upd-dl').onclick=()=>{
-      if(!confirm('确定更新到 '+UPD.latest+' 吗？将从 GitHub 下载新版安装包（约 35 MB），下载完成后需重启服务端生效。'))return;
+      if(!confirm(t('set.upd_confirm').replace('{v}',UPD.latest)))return;
       startUpdDownload(UPD.latest);
     };
-  }catch(e){ if(e.message!=='unauth')$('upd-err').textContent='检测失败：网络错误或检测超时，请重试'; }
+  }catch(e){ if(e.message!=='unauth')$('upd-err').textContent=t('set.upd_check_netfail'); }
   btn.disabled=false;
 };
 async function startUpdDownload(version){
   const j=await api('/api/admin/update/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version})});
-  if(!j.ok){$('upd-err').textContent=j.error||'启动下载失败';return;}
+  if(!j.ok){$('upd-err').textContent=j.error||t('set.upd_start_failed');return;}
   $('upd-prog').style.display='block';
   updLastBytes=0; updLastTime=0; updSpeed=0;
   pollUpd();
@@ -509,35 +801,35 @@ async function pollUpd(){
     $('upd-prog').style.display='block';
     const pct=j.total>0?Math.min(100,j.downloaded/j.total*100):0;
     $('upd-bar').style.width=pct+'%';
-    $('upd-detail').textContent=j.state==='extracting'?'正在解压并暂存…':(j.total>0?(fmtMB(j.downloaded)+' / '+fmtMB(j.total)+'（'+pct.toFixed(1)+'%）'):fmtMB(j.downloaded))+' · 速度 '+fmtSpeed(updSpeed)+(j.source?(' · 来源：'+j.source):'');
+    $('upd-detail').textContent=j.state==='extracting'?t('set.upd_extracting'):(j.total>0?(fmtMB(j.downloaded)+' / '+fmtMB(j.total)+t('app.po')+pct.toFixed(1)+'%'+t('app.pc')):fmtMB(j.downloaded))+t('set.tpl_speed')+fmtSpeed(updSpeed)+(j.source?(t('set.tpl_source')+j.source):'');
     updTimer=setTimeout(pollUpd,1000);
   }else{
     if(updTimer){clearTimeout(updTimer);updTimer=null;}
     if(j.state==='done'){
       $('upd-bar').style.width='100%';
-      $('upd-detail').textContent='下载完成';
+      $('upd-detail').textContent=t('set.tpl_done');
       showStaged(j.version);
       loadUpdate();
     }else if(j.state==='error'){
-      $('upd-err').textContent='更新失败：'+(j.error||'未知错误');
+      $('upd-err').textContent=t('set.upd_failed')+(j.error||t('app.unknown_err'));
       $('upd-detail').textContent='';
     }
   }
 }
 function showStaged(version){
   $('upd-result').style.display='block';
-  $('upd-result').innerHTML='<p class="ok">已暂存 '+esc(version)+'，重启后生效。</p><p><button id="upd-restart">立即重启</button></p><p class="muted">重启后服务会短暂中断，页面会在新版本起来后自动刷新。</p>';
+  $('upd-result').innerHTML='<p class="ok">'+t('set.upd_staged_msg').replace('{v}',esc(version))+'</p><p><button id="upd-restart">'+t('set.upd_restart')+'</button></p><p class="muted">'+t('set.upd_restart_note')+'</p>';
   $('upd-restart').onclick=async()=>{
-    if(!confirm('确定立即重启服务端以应用 '+version+' 吗？正在进行的连接会中断。'))return;
+    if(!confirm(t('set.upd_restart_confirm').replace('{v}',version)))return;
     const j=await api('/api/admin/update/restart',{method:'POST'});
-    if(!j.ok){$('upd-err').textContent=j.error||'重启失败';return;}
+    if(!j.ok){$('upd-err').textContent=j.error||t('set.upd_restart_failed');return;}
     sessionStorage.setItem('upd-just-restarted','1');
-    $('upd-result').innerHTML='<p class="muted">正在重启…等待新版本响应后自动刷新。</p>';
+    $('upd-result').innerHTML='<p class="muted">'+t('set.upd_restarting')+'</p>';
     setTimeout(()=>waitForServer(0,UPD.current),4000);
   };
 }
 async function waitForServer(n,oldVer){
-  if(n>45){ $('upd-result').innerHTML='<p class="err">等待超时，服务可能未自动恢复。请检查服务端是否在运行（直接运行 hbbs 时需手动启动），然后刷新页面。</p>'; return; }
+  if(n>45){ $('upd-result').innerHTML='<p class="err">'+t('set.upd_timeout')+'</p>'; return; }
   try{
     const r=await fetch('/api/admin/update/status');
     if(r.ok){ const j=await r.json(); if(j.ok&&j.current&&j.current!==oldVer){ location.reload(); return; } }

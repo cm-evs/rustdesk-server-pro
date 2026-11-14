@@ -393,6 +393,14 @@ cd rustdesk-server-pro-linux-*
 - 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
 - 验证：新增 7 个单元测试（下载链接 4 个：按真实 1.5.3 asset 名解析 10 个平台并排除 Windows 安装包/rpm/flatpak/sciter/wayland 变体、缺 tag 报错、镜像 URL 生成、缓存新鲜度；一键复制 3 个：分享字符串与生成客户端文件名同一编码、与官方客户端导出逐字节一致、四字段始终齐全），cargo test 63/63（debug 与 release）；下载端到端 50/50（debug 与 release：版本号与 `gh api` 的最新版一致、平台文件与真实 asset 名逐项核对、官方 URL 格式、镜像含已配置的自定义前缀、匿名 401、普通用户可访问、控制台页面标记）；客户端配置端到端 38/38 ×2（含分享字符串按客户端解码复刻反向解析、四字段与接口值一致、普通用户同值、控制台页面标记）。全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、就近选路 12/12 ×2），debug 与 release 均通过。本版改动为全平台统一逻辑，无新增 Windows/release 专属分支，无新增真机确认项。
 
+## v34：控制台中英切换 + 英文部署文档 + 下载镜像加速复选框
+
+- 语言切换（2026-11-14）：控制台右上角新增「中文 / English」切换，登录/注册页与客户端登录页同样有切换按钮。默认中文；切换立即生效，刷新/换页后仍保持（选择存在浏览器 localStorage 里，键 `rdp-lang`）。翻译覆盖控制台全部界面文案（登录、注册、概览、设备、用户管理、API Token、生成客户端、服务器设置各页的标签、按钮、提示语与确认框）；API 返回的错误字符串不翻译（客户端依赖原文，如 OIDC 的 "No authed oidc is found"）。实现是 JS 词典（src/api_pages.rs 内嵌，约 135 个键；页面源码里中文仍为默认文案，英文在运行时替换，所以页面标记检查不受影响）。
+- 英文部署文档（2026-11-14）：新增 docs/DEPLOY-en.md，DEPLOY.md 的完整英文翻译（各版本章节、端口表、API 调用说明、ARM 一节齐全）；根 README 顶部加了英文文档链接；安装包里同时带 README.md（中文）与 README-en.md（英文）。
+- 镜像加速复选框（2026-11-14）：「其他平台下载」卡片改成默认只显示官方直链；卡片上方新增「镜像加速」复选框（英文界面显示 "Use mirror"），勾选后各平台链接切换为镜像加速地址，取消切回直链。镜像地址仍用模板下载/在线更新的同一条镜像链（管理员 `github_mirror` 设置优先，其次内置镜像），没有第二套逻辑；复选框状态存在 localStorage 里（键 `rdp-dl-mirror`），刷新后保持。iOS 只有 App Store 直链，没有镜像，不受复选框影响。`GET /api/client-downloads` 返回结构不变（每平台本来就同时带 `url` 与 `mirrors`）。
+- 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
+- 验证：cargo test 63/63（debug 与 release；无新增服务端逻辑，单测只改版本号断言）；浏览器端到端 43/43（debug 与 release，Playwright 真实浏览器：默认中文、切换英文后各页文案与动态表格均变英文、刷新后保持英文、切回中文正常；镜像复选框默认未勾选且链接为直链、勾选后变镜像、iOS 不变、取消切回、刷新后保持勾选状态）；下载端到端 50/50 ×2、客户端配置端到端 38/38 ×2；全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、就近选路 12/12 ×2），debug 与 release 均通过。本版改动为全平台统一逻辑，无新增 Windows/release 专属分支；语言切换与复选框在真实浏览器上的表现已由 Playwright 套件覆盖，无新增真机确认项。
+
 ## API 调用说明
 
 服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/client-downloads`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。

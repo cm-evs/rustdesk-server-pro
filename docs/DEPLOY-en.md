@@ -1,0 +1,561 @@
+# RustDesk Server (Account-Enhanced Edition) — Deployment and Usage Guide
+
+Based on the official open-source rustdesk-server (hbbs/hbbr 1.1.17), with additions the official open-source edition doesn't have:
+
+- **Account system**: user registration/login; the official RustDesk client can log in directly with an account
+- **Web admin console**: user management, device list, API Token, server settings
+- **Client generation**: one click in the console generates a Windows client installer pre-bound to this server; the client UI does not show the server address or key, and a shareable download link is provided after generation
+- **Integrated Token**: call admin APIs with `Authorization: Bearer rdt_...`
+
+The database stays the official SQLite (device DB `db_v2.sqlite3` + account DB `api_v1.sqlite3`).
+
+**Platform requirements**: the prebuilt packages are built on Ubuntu 24.04 (glibc 2.39) and need a system with glibc ≥ 2.39 (Ubuntu 24.04 / Debian 13, etc.). On older systems, build from the included source package: install Rust on the target machine, enter the source directory and run `cargo build --release`; the binaries land in `target/release/{hbbs,hbbr}`.
+
+## Quick Start (Linux)
+
+```bash
+unzip rustdesk-server-pro-linux-*.zip
+cd rustdesk-server-pro-linux-*
+./start.sh          # 前台运行；或用 systemd/守护方式见下文
+```
+
+After the first start, open `http://<server IP>:21114/console/register` and register an account. **The first registered user automatically becomes an administrator.**
+
+Then, in the admin console:
+1. In "Server Settings", fill in the server's **public address** (domain or public IP)
+2. In "Server Settings", click "Download/Update Template" (fetches the latest official Windows client; the page shows live progress and speed. On networks in China it rotates through several GitHub acceleration mirrors by default, switching to the next one automatically when a source stalls, and only falls back to a direct connection at the end; you can also fill in your own mirror prefix in settings to use it first)
+3. In "Generate Client", click Generate → copy the **download link** and send it to users
+4. After users download and install, they open the client and log in with their registered account
+
+## Ports to Open
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| 21114 | TCP | API + web admin console (new in this project) |
+| 21115 | TCP | NAT type test |
+| 21116 | TCP/UDP | ID/signaling service (UDP must be open) |
+| 21117 | TCP | Relay service hbbr |
+| 21118 | TCP | WebSocket (web client) |
+| 21119 | TCP | Relay WebSocket |
+
+## New hbbs Parameters
+
+```
+--api-listen 0.0.0.0:21114   API/后台监听地址（默认即此值；off 关闭）
+--api-db api_v1.sqlite3      账号数据库文件（默认服务端目录，见 v21）
+```
+
+In short: `--api-listen` sets the API/console listen address (the default value is shown; `off` disables it), and `--api-db` sets the account database file (defaults to the server directory; see v21).
+
+Environment variable `TEST_HBBS=no`: skips hbbs's self-connection test at startup. On restricted networks (firewalls that block the server from connecting to itself on 21116, etc.) the self-check fails and hbbs exits; be sure to set this variable in that case. This package's start.sh already sets it by default.
+
+## Working with the Official Client
+
+- Users who already have the official client installed: in the client, go to "Settings → Network → ID/Relay Server", enter this server's address, enter the server's public key as the key (the console's Server Settings page shows the contents of `id_ed25519.pub`, which the server reads automatically), and set the API server to `http://<public address>:21114`; they can then log in with an account.
+- The installer distributed via "Generate Client" is recommended: the configuration is pre-bound, no setup is needed, server and key information is not shown, and after login a policy pushed via heartbeat hides the server settings area (this behavior can be turned off in "Server Settings"). Regular users can also generate/download clients of their own in the console (they can only see and delete records they generated themselves); Server Settings, template download, and user management remain admin-only. Devices are automatically bound to their owning user via heartbeat after the client logs in with an account, and regular users can only see their own devices on the "Devices" page.
+
+## v5 fix: 1.5.0 client remote-control handshake timeout
+
+- Symptom: the client has registered and shows ready, but starting a remote session reports `Failed to secure tcp: deadline has elapsed`.
+- Cause: a 1.5.0 client with a server key configured and an account logged in waits for the server to send a key-exchange message after connecting to the relay server (21116 TCP); this server is based on the official open-source edition (which predates the key-exchange feature), and never speaks first after a TCP connection, so the client waits until the timeout and errors out. Clients without a configured key or without a logged-in account don't take this handshake path, so they are unaffected.
+- Fix: hbbs now sends an empty greeting message first on TCP connect, and the client continues the relay handshake in plaintext per the official docs' legacy-server compatibility logic (the same behavior as before the key-exchange feature existed). Note: the relay channel itself is therefore unencrypted, but the remote session between the two ends is still encrypted via end-to-end key exchange and is unaffected. WebSocket connections are unaffected by this issue (the client skips that handshake).
+
+## v7: Captcha on console login/registration
+
+- The web console's login and registration pages now have an image captcha (server-generated SVG, 5 characters, valid for 5 minutes, single-use). The captcha is stored on the server only as a hash; the browser only holds the challenge id, and the answer is not visible in the page source or cookies.
+- The captcha is verified before the password check: a wrong captcha does not reveal whether the account/password is correct; after a failure the image refreshes automatically (a single-use captcha is void once used).
+- Note: login inside the client app (`/api/login`) has no captcha — the official client has no captcha input UI, and adding one would break client login; the OIDC browser login page is also unchanged (it is part of the client login flow). The captcha is a basic anti-bot measure (against automated credential stuffing) and does not stop professional OCR; for stronger verification, add a third-party verification service or SMS/email codes later.
+
+## v6 fix: "FormatException" error on the home page
+
+- Symptom: the bottom of the client home page shows `FormatException: Unexpected end of input`, and clicking "Retry" doesn't help (even when logged in).
+- Cause: every time the client home page starts, it POSTs `/api/currentUser` to refresh the logged-in user and parses the response body as JSON with no protection; this server previously had no such endpoint, and the 404 empty body directly triggered a parse exception. The device-group and address-book endpoints themselves were always fine — the error actually came from the home page's user-refresh widget, not the device-group page.
+- Fix: added `POST /api/currentUser` (authenticated with the Bearer login token), returning the current user's `name / display_name / status / is_admin` fields; when not logged in or the token is invalid it returns a 401 JSON — never an empty body.
+
+## v9: Client device list isolated per logged-in account
+
+- Symptom: other accounts' devices appeared in the client's device-group list (an admin logging in could see all users' devices, even devices that had only registered and never logged in with an account).
+- Cause: `/api/peers` (device list) and `/api/users` (left-side user bar) returned the full set for admins: all bound devices, plus a merged entry for unbound devices.
+- Fix: these two client endpoints now always return only the caller's own account data, admins included. The left-side user bar therefore only shows yourself — otherwise selecting another user would only yield an empty list.
+- Unchanged: the web console's devices page (`/api/devices`) is still the admin's full view; regular users in the console still only see their own devices. Upgrading only requires replacing hbbs; the database and keys stay untouched.
+
+## v10: Custom listen ports + Ubuntu system service
+
+### Listen ports
+- How it works: hbbs's `-p` (default 21116) sets the relay/ID port (with the NAT test port at −1 and WebSocket at +2); hbbr's `-p` (default 21117) sets the relay port (WebSocket at +2); hbbs's `--api-listen` (default 0.0.0.0:21114) sets the API/console port. When a client connects, an address with a port takes precedence over the default port, so generated clients embed the currently effective ports in their configuration.
+- How to change: edit server.env in the program directory (copy it from server.env.example if it doesn't exist), change HBBS_PORT / HBBR_PORT / API_PORT / RELAY_SERVERS, then restart. The port in RELAY_SERVERS must match HBBR_PORT, or the relay handshake will look on the wrong port.
+- Three things to do after changing ports: regenerate clients (old clients still connect to the old ports), update router port forwarding, and confirm the listen ports in the startup log. The console's "Server Settings" page shows all currently effective ports.
+- Reminder: changing ports only dodges bulk scans aimed at the default ports; anyone who knows the new ports can still register an ID. Real control still requires the server key and account login.
+- Upgrade note: v10's start.sh became a parameterized version that reads server.env. To upgrade, replace only the hbbs / hbbr files — do not unzip over the whole directory, or you'll lose your edited start.sh. One-time migration: write the old start.sh's --relay-servers value into server.env; after that start.sh itself no longer matters and overwriting it on upgrade is fine.
+
+### Ubuntu system service
+- In the program directory, run `sudo ./install-service.sh`: it registers rustdesk-server-pro.service, with start-on-boot and automatic restart on crash. The service runs start.sh, so server.env settings apply the same way.
+- Before installing, stop any manually started instance (otherwise the ports conflict and the install script will refuse outright).
+- To remove: `sudo ./uninstall-service.sh`. Check status: `systemctl status rustdesk-server-pro`; view logs: `journalctl -u rustdesk-server-pro -f`.
+
+## v11: Self-connection refused
+- Symptom: previously you could enter your own ID in the client and connect (your own machine would pop up an accept/password dialog); now the server refuses outright and the client shows "Cannot connect to this machine".
+- How it works: the connection request (PunchHoleRequest) carries a login token, and the server uses it to look up the requesting device's ID in the account database's client_tokens; if it equals the target ID, it's a self-connection, so the request is refused directly and never forwarded to the local machine. Both direct and relay connections start from this request, so both paths are blocked.
+- Note: your own entry in the list is still clickable (greying it out would require changing the client UI — a separate large project), but clicking it fails immediately and no password dialog pops up.
+- Boundary: a client that isn't logged in has no token, so the server can't tell whether it's the local machine and can't block it (it follows the old flow as usual). Logged-in generated clients all carry a token, so all of them can be blocked.
+- Upgrade: replace hbbs only (hbbr untouched); v11 includes everything in v10.
+
+## v13: Admin console fully switches to GoAdmin; Rust legacy console retired
+
+- Change: the admin console switches from the Rust hbbs built-in console to a standalone GoAdmin service (`rustdesk-server-pro-admin`, listening on **21113** by default). Rust hbbs keeps only the client protocol endpoints (login, device list, address book, OIDC, heartbeat binding) and tokenized downloads (`/dl/`); the old console pages and admin endpoints are all retired: `/console`, `/console/login`, `/console/register`, `/api/auth/*`, `/api/captcha`, `/api/me`, `/api/admin/*`, `/api/devices`, `/api/tokens`, and the template and generated-client management endpoints. Old addresses return 404; the root path `/` becomes a plain-text note pointing to `/admin` on 21113.
+- Switch steps (in order):
+  1. Stop hbbs.
+  2. Replace the hbbs binary (the hbbs in the v13 package; hbbr is unchanged, no need to replace it).
+  3. Run the schema SQL against `api_v1.sqlite3` (idempotent, safe to run repeatedly): `sqlite3 api_v1.sqlite3 < goadmin-schema-sqlite.sql` (included in the admin package).
+  4. Start the admin service (`start-admin.sh` in the admin package: listens on `0.0.0.0:21113` by default, `-db` points at the `api_v1.sqlite3` shared with hbbs, `-clients-dir` shares the directory with hbbs, `GIN_MODE=release`).
+  5. Start hbbs.
+- Admin login moves to `http://<server address>:21113/admin`; the initial account is **admin/admin — change it on first login**. Note: GoAdmin login accounts and client login accounts (the `users` table) are two separate systems; client login accounts are unaffected (existing test accounts keep working as before).
+- Generated-client links are now issued by GoAdmin (generated in `/admin`; downloads still go through `/dl/` token links). Old `/dl/` links keep working on 21114 (hbbs retains `/dl/` and shares the clients directory with GoAdmin).
+- Templates must be placed manually: automatic template download paused along with the retirement of the old console; put the official client exe at the `-template` path (default `client-templates/rustdesk-windows.exe`) before generating.
+- The captcha retired with the old console: GoAdmin login currently has no captcha.
+- Real-time device online status: GoAdmin can only see `last_seen`; real-time online status lives in the hbbs runtime.
+- Account creation: the old `/console/register` registration entry is retired; accounts are now created by the GoAdmin admin in the users table, then the password is set via the password-setting endpoint before the account can log in.
+- rdt_ tokens: new ones are issued by GoAdmin's `POST /admin/api/tokens` (body: username + name; the raw token is returned only once). Note: the v13 Rust side no longer provides rdt_-authenticated admin endpoints (the old endpoints are retired); external tools that used rdt_ against the old admin endpoints need to switch to GoAdmin session authentication until rdt_ authentication is added to GoAdmin.
+- Ports addendum: 21113 (TCP, GoAdmin admin console) needs to be opened/forwarded separately (it is not in the original 21114–21119 forwarding range); 21114 now only serves client protocol APIs and `/dl/`.
+- Rollback: swap back to the v12 hbbs binary and restart, and the old console is restored. The database is shared: users created, clients generated, and settings changed by GoAdmin during the v13 period all live in the same database, and the old console can see them; the new hbbs does not write the `web_sessions`/`captcha_codes` tables (the schema stays untouched), and the old hbbs resumes writing them after restoration — the data is unaffected.
+- Upgrade: v13 includes everything in v12 (Windows package in the same batch).
+
+## v14 (admin side only): GoAdmin login captcha
+
+- Admin package v14 (the server package is still v13, no need to replace it): the GoAdmin login page gets a captcha. Login submission goes through `POST /admin/signin`, and the captcha is checked before the password: SVG image, server stores only the sha256, 5-minute expiry, single-use, password not checked on failure; click the image on the login page to refresh, and it refreshes automatically on failure.
+- Upgrading the admin side: replace only the `rustdesk-server-pro-admin` binary in the admin package and restart the admin service (`start-admin.sh` unchanged); the database doesn't need a schema re-import (the captcha lives in process memory, not in a table).
+- Note: the captcha is a basic anti-automation measure, not OCR-proof; no rate limiting/account lockout has been added; the initial admin/admin still must be changed on first login.
+
+## Windows Deployment (two packages used together)
+
+- Two packages: `rustdesk-server-pro-windows-x86_64-v16.zip` (hbbs.exe, hbbr.exe, start.bat, start.ps1, server.env.example, check-windows-v13.ps1) and `rustdesk-server-pro-admin-windows-x86_64-v17.zip` (rustdesk-server-pro-admin.exe, start-admin.bat, start-admin.ps1, goadmin-schema-sqlite.sql, src/). **Extract both packages into the same directory** (move the admin package's files into the server directory), so the server and admin sides share the same `api_v1.sqlite3` and `clients` directory and old `/dl/` links keep working.
+- v16 fix (script encoding only, program unchanged): the three .ps1 files are now UTF-8 with BOM — the v15 scripts were UTF-8 without BOM, which Windows PowerShell 5.1 misreads as the system ANSI code page (GBK on Chinese systems), breaking parsing of Chinese text; v16 can simply overwrite the old scripts.
+- Startup order: first double-click `start.bat` (server side: hbbr in its own window + hbbs in the foreground; hbbr stops automatically on exit), then double-click `start-admin.bat` (admin side, listens on `0.0.0.0:21113` by default). Allow 21113–21119 through the firewall popup on first run.
+- External relay: first copy `server.env.example` to `server.env` and fill in `RELAY_SERVERS=<public address>:<relay port>` (the port must match HBBR_PORT), then start; if left unset, external controllers report "Cannot connect to the relay server". Default ports: HBBS 21116, HBBR 21117, API 21114; changeable in server.env.
+- Schema: the admin side auto-imports the GoAdmin system tables on first start (embedded `goadmin-schema-sqlite.sql`, skips tables that already exist), so no sqlite3 CLI is needed; manual import remains a fallback.
+- Admin login: `http://<server>:21113/admin` (login has a captcha; the initial admin/admin must be changed on first login). Use `check-windows-v13.ps1` for a smoke test (read-only): three processes, 21113 + 21114–21119 listening, login-page captcha, old console 404, root-path note, key files, relay reminder.
+- Rollback: stop both services, swap back to the old binaries and restart; the database is shared, so data from the new version is visible to the old version as well.
+
+## v17 (admin side only): /admin redirects to the login page
+
+- GoAdmin itself only mounts pages under `/admin/*` (login, auth, info pages); the bare `/admin` path has no handler, so opening it in a browser returns 404 — this is not a broken deployment, it's GoAdmin's default behavior. From v17 the admin side 302-redirects `/admin` to `/admin/login`, so the login address in the docs works directly.
+- The Linux and Windows admin packages are both at v17; the server package is untouched; upgrading the admin side only requires replacing the admin binary and restarting the admin service.
+
+## v18 (admin side only): static background on the login page
+
+- The GoAdmin login page comes with a particles.js particle-animation background (redrawing constantly); viewing this page over remote desktop forces the encoder to keep re-sending frames, which is the main source of lag. From v18 the login page drops the particle canvas and uses a solid-color background (#222d32); captcha login is unaffected.
+- The Linux and Windows admin packages are both at v18; the server package is untouched; upgrading the admin side only requires replacing the admin binary and restarting the admin service.
+
+## Rolling Back to the Old Console (v12, replacing GoAdmin)
+
+- After GoAdmin took over, a few things the old console had were lost: automatic template download, real-time device online status, a single account system, rdt_ token authentication; to switch back to the old console, use the v12 package (`rustdesk-server-pro-windows-x86_64-v12.zip` / `rustdesk-server-pro-linux-x86_64-glibc-v12.zip`).
+- Steps: stop the GoAdmin admin service (21113) and hbbs/hbbr → replace hbbs/hbbr with the v12 ones → restart. The database is shared (`api_v1.sqlite3`); users, devices, generation records, tokens, and settings from the GoAdmin period are all visible to the old console; GoAdmin's own tables stay in the database unused and are harmless.
+- On Windows it's recommended to keep v16's `start.ps1` + `server.env` (v12's `start.bat` is a minimal version without relay-servers) and replace only the two exes; and confirm RELAY_SERVERS is filled in server.env, or external controllers will report they cannot connect to the relay server. The old console is at `http://<server>:21114/console/login` (with the v7 captcha); log in with a users-table account (i.e. a client login account), not GoAdmin's admin/admin. After rolling back, stop using `check-windows-v13.ps1` (it checks for a 404 on the old console, which now returns 200 and would be misreported); use `check-windows-v1.ps1` instead.
+
+## v19: Console security and UX fixes (based on the v12 console line)
+
+- A batch of fixes after a UX review, all on the old console: row data rendering on the four lists (devices/users/tokens/generated clients) is fully escaped, OIDC login page parameters are escaped, closing stored and reflected XSS; revoking a token, deleting a generated client, and deleting a user now all use confirmation dialogs explaining the consequences; deleting a user now also revokes that user's API Tokens (previously a token stayed usable after the account was deleted); "Revoke Admin" now has a guard against acting on yourself (same rule as delete/disable).
+- Failure states: all lists now show "Load failed + Retry" on load failure instead of sitting on "Loading…" forever; login/register/create-token/save-settings/generate-client buttons get in-progress disabling and network-error hints.
+- Devices page: switching back to the tab or clicking "Refresh" re-fetches, with an "Updated at" timestamp; a new status column shows online when there has been a heartbeat within 5 minutes (judged by server time).
+- Captcha: refresh is now a real button (keyboard-reachable), and the image is larger; a text-question fallback was added — clicking "Can't read it? Use a text question instead" switches to a plain-text arithmetic question (`GET /api/captcha?mode=text`), sharing the same single-use verification as the image captcha, for screen-reader users and under remote-desktop-compressed video.
+- A newly created one-time token is shown in a read-only input with a copy button; button hover contrast was fixed to WCAG AA (#2270d4); the generated-client table gets a "Generated by" column.
+- Upgrade: stop the service → replace hbbs (hbbr unchanged this release, no need to replace it) → start. Database, server.env, and keys stay untouched. Confirm the v12 rollback works before upgrading to v19.
+
+## v20: Template download switches to the built-in download component (no longer depends on system curl)
+
+- Background (2026-10-31, real-machine feedback from the user): v19 and earlier called the system `curl` when downloading the official client template. On Windows machines without curl.exe (or with it not on PATH), every download source reported "Cannot run curl: program not found" at the same time, and the template could never be downloaded; no matter how good the GitHub acceleration mirrors configured in the console were, they never got used, because every download source died at the step of launching curl.
+- Change: version resolution and template file download in `src/api.rs` now use the program's built-in download component (the reqwest library hbbs already links; system TLS on Windows, rustls on Linux) and no longer call any external program.
+- Behavior unchanged: mirror order is still custom mirror → built-in mirrors → direct GitHub; stall detection is still there (aborts and switches to the next source if no data arrives for 20 seconds, or throughput stays below 10 KB/s for 15 seconds); completed downloads are still verified by file size and MZ file header; the console status page still shows progress (downloaded/total size, current source) as usual. Environment-variable proxies (HTTPS_PROXY, etc.) are still honored.
+- Upgrade: stop the service → replace hbbs (hbbr unchanged this release, no need to replace it) → start. Database, server.env, and keys stay untouched.
+- Verification: on the Linux side, template download was actually tested 17/17 in an environment with no curl anywhere in PATH — including the same configuration as the user's real machine (custom mirror gh.gic.de5.net + hand-entered version 1.5.0), blank version auto-resolution, and automatic switch to the next source on a bad mirror; the downloaded file was 25,887,600 bytes, matching the official release size. Console regression suite 28/28 ×2, cargo test 20/20. The Windows exe was not actually run on this machine (no Windows environment); the real-machine smoke test is authoritative.
+
+## v21: All runtime files land in the server directory
+
+- Requirement (2026-10-31, user): all files the server produces at runtime should live in the server directory. Previously each file was placed relative to the process's current working directory — when started from another directory (double-click, shortcut, running from another path), the databases, keys, logs, and generated clients scattered into the directory where the process was started, and the server directory itself had none of them.
+- Change: the first step at hbbs and hbbr startup is to anchor the working directory to the executable's directory; after that, all relative paths — `db_v2.sqlite3`, `api_v1.sqlite3`, `id_ed25519` / `id_ed25519.pub`, `logs/`, `client-templates/`, `clients/`, and the `.env` hbbr reads — are rooted at the server directory. Starting with start.sh / start.ps1 behaves the same as before (the scripts already switch to the script directory, which is the same as the program directory).
+- Migration note: if you ever started from another directory before, the old data files stayed in that old directory. After moving to v21, first move the old directory's `api_v1.sqlite3`, `db_v2.sqlite3`, and `id_ed25519*` into the server directory before starting; if the old files are scattered across several directories, use the set that was most recently being updated. Starting without finding the old files generates a brand-new empty database and new key, and all existing clients will fail to match.
+- Upgrade: stop the service → replace both hbbs and hbbr → start. server.env stays untouched.
+- Verification: on the Linux side, both programs were started together from an unrelated directory and actually tested 17/17 — all of the above files landed in the program directory and the starting directory stayed completely empty, and registration, login, template directory creation, and client generation all actually worked; regression suite 28/28 ×2, template download (no-curl environment) 17/17, cargo test 20/20, and the release binaries used for packaging were re-tested the same way. The Windows exe was not actually run on this machine (no Windows environment); the real machine is authoritative.
+
+## v22: Show client configuration (fill in an existing official client directly)
+
+- Requirement (2026-10-31, user): add a display of the client configuration, so users with an existing official client can configure it directly.
+- Content: the "Generate Client" page gains a "Manual Configuration for Official Client" card showing four items — ID server, relay server, API server, and key (Key), each with a one-click copy button. Users who already have the official RustDesk client installed can fill in these four items in the client's "Settings → Network", save, and log in with this server's account — no need to download the generated installer again.
+- Implementation: new `GET /api/client-config` (any logged-in user can use it; when the admin hasn't filled in the public address yet it returns an unconfigured state and the page shows the corresponding hint). The configuration values share one computation with client generation (public address + startup-parameter ports, API address override takes priority), guaranteeing both sides agree at the source; the generated client's filename was actually decoded and compared item by item with the endpoint's return values, and they matched exactly (including the API address override scenario). These values are already encoded in every generated client's filename and distributed publicly with the download link, so displaying them adds no new exposure surface.
+- Upgrade: stop the service → replace hbbs only (hbbr unchanged this release) → start. Database, server.env, and keys stay untouched.
+- Verification: the new endpoint and card were actually tested 31/31 (anonymous 401, unconfigured state, the four values, item-by-item match with the generated client's decoded values, visible to regular users, override scenario, page markers); console regression 28/28 ×2, console JS syntax check passed, cargo test 20/20; the release binaries used for packaging were re-tested. The Windows exe was not actually run on this machine (no Windows environment); the real machine is authoritative.
+
+## v23: Security hardening (rate-limit lockout, registration switch, audit log, management-plane split, optional HTTPS)
+
+- Background (2026-10-31, user): the 21114 web port exposed on the public internet would be brute-forced, so security hardening was requested; management-plane split and optional HTTPS were added on top.
+- Login rate limiting and lockout: the four entry points — web login, client password login (/api/login), OIDC browser login, and registration — are protected uniformly. Failures are counted in a 10-minute window on two dimensions, "account + source IP": the same account failing 5 times → locked for 15 minutes, doubling on repeated triggers (30, 60… capped at 12 hours); the same IP failing 30 times → locked by IP (during a password-spraying attack, accounts that never failed will also be blocked — that's expected behavior). A successful login clears that account's failure count. During a lockout even the correct password is rejected, with a hint of roughly how many minutes remain. Thresholds can be tuned with environment variables: RD_AUTH_FAIL_MAX (default 5), RD_AUTH_IP_FAIL_MAX (30), RD_AUTH_WINDOW_SECS (600), RD_AUTH_LOCK_SECS (900), RD_AUTH_REG_MAX (10), RD_AUTH_REG_WINDOW_SECS (3600). Counts live only in memory and are cleared on restart; the audit log is the persistent record.
+- Registration switch and throttling: the Server Settings page gains an "Allow open registration" switch (on by default, matching old behavior; turning it off is recommended for public deployments). When off, unlogged-in visitors registering get a 403; two exceptions: when the database has no accounts yet (first-deployment bootstrap) registration is still allowed, and a logged-in admin submitting registration can still create accounts. Registration itself has a separate per-IP limit of 10 per hour (RD_AUTH_REG_MAX).
+- Authentication audit log: all login successes/failures, lockout triggers, attempts during lockout, and registration successes/blocks are written to logs/hbbs.log in structured form with an `[auth]` prefix, with fields for kind (web/client/oidc), account, source IP, and reason. Example: `[auth] lockout kind=client user=admin ip=1.2.3.4 scope=account key=admin level=1 lock_secs=900`. To check who is brute-forcing: `grep "[auth]" logs/hbbs.log`.
+- Management-plane split: new startup parameter `--console-listen <address:port>`. When set, the API listener (e.g. public 21114) serves only client endpoints (login, heartbeat, OIDC, device groups, download links), and the web console (/console, /api/auth/*, /api/admin/*, /api/me, etc.) is served only on that address; don't forward this port on the router — fill in an internal address (e.g. 192.168.1.10:21120). start.ps1 / start.sh / server.env already support the CONSOLE_LISTEN variable; the listen-info line on the Server Settings page shows the console's separate listen address and HTTPS status. Without this parameter, behavior is exactly as in older versions (one listener, full functionality).
+- Optional HTTPS: new `--tls-cert <PEM certificate>` and `--tls-key <PEM private key>` (must appear as a pair); once enabled, both the API and console listeners use HTTPS, and the API address in generated clients and on the configuration card automatically becomes https:// (the API address override still takes priority). The startup scripts have matching TLS_CERT and TLS_KEY variables. Important: the official client verifies the API server's certificate, so a trusted certificate (domain + Let's Encrypt, etc.) is required; a self-signed certificate is only suitable for local debugging, and client login will fail with it. Without a domain, prefer "management-plane split + rate-limit lockout" instead of forcing a self-signed certificate. If the certificate files are missing or mismatched, the API service exits with an error directly (the hbbs main service is unaffected); after enabling, confirm the console and API are reachable.
+- Upgrade: stop the service → replace hbbs only (hbbr unchanged this release) → start. The existing server.env can stay as-is; to enable the split/HTTPS, add CONSOLE_LISTEN, TLS_CERT, TLS_KEY to server.env and restart.
+- Verification: v23 dedicated suite 44/44 (account lockout and automatic unlock on expiry, IP lockout covering innocent accounts, registration throttling, registration switch including the admin exception and audit log landing on disk, mutual route isolation under split listeners, full HTTPS flow including client-config automatically switching to https), passing on both the debug and packaged release binaries; console regression 28/28 ×2, client configuration 31/31, template download 17/17, cross-directory anchoring 17/17, cargo test 25/25 (5 new lockout-logic unit tests added). The Windows exe was not actually run on this machine (no Windows environment); the real machine is authoritative.
+
+## v24: Fix download links after the split + add captcha to the client login page
+
+- Background (2026-10-31, user reported after enabling the v23 split on a real machine): ① generated-client download links wouldn't open; ② the web login page reached from the client's login had no captcha and still had a registration entry.
+- Download links: links are served by the /dl/ endpoint (on the API listener), but the old version built them from "the address used to open the console". After the split, the console sits on a separate address, so the assembled links pointed at the console port — where there is no /dl/ endpoint — and naturally couldn't download. From v24, links are assembled from the API's public identity: the "API address override" is used first (if set), otherwise the "server public address" setting + the API listen port (https when TLS is enabled). When no public address is set, the old method (the address the console was opened with) is still used, so single-machine intranet use is unaffected. Note: old records don't need to be regenerated — just re-copy the link from the list (the link content is assembled live).
+- Client login page (OIDC): this is the web page the client's "account login" goes through, a different page from the console login page. v24 adds the same captcha as the console (image + text-question fallback; the password is only checked after the captcha passes, and failures don't count toward the lockout), and removes the "Register first" link from the page — registration is a management-plane matter and is no longer exposed from the client login page. The captcha endpoint (/api/captcha) is now served on both listeners.
+- Upgrade: stop the service → replace hbbs only (hbbr unchanged; the startup scripts are the same as v23 and don't need replacing) → start.
+- Verification: 14 new dedicated items — in split mode, the download links in both the generation response and the list point at the API public address (without the console port), a file was actually downloaded through the API listener, and the captcha endpoint is reachable on both listeners; the OIDC page contains a captcha, has no registration entry, rejects submissions with no captcha / a wrong captcha, and a correct captcha + password logs in and retrieves a token. The v23 dedicated suite grew to 58/58, passing on both debug and release; console regression 28/28 ×2, client configuration 31/31, template 17/17, anchoring 17/17, cargo test all passing. The Windows exe was not actually run on this machine; the real machine is authoritative.
+
+## v25: Registering as a Windows system service + service management batch files
+
+- Background (2026-10-31, user): the Windows server should be registerable as a Windows service, with a batch file to uniformly manage start/stop/restart.
+- Why an extra program is needed: hbbs/hbbr are ordinary console programs that don't speak the Windows Service Control Manager (SCM) protocol; registering them directly with sc.exe fails with error 1053 at startup. A new **rdsvc.exe** serves as the service host (written in Go, source in the winservice/ directory): it reads the same server.env, launches hbbr and hbbs with exactly the same parameters as start.ps1, restarts a child 3 seconds after an unexpected exit, and stops both children when the service stops; its own runtime log is at logs/rdsvc.log, and the children's console output goes to logs/rdsvc-hbbs.exe.log / rdsvc-hbbr.exe.log.
+- New files (Windows package only): `rdsvc.exe`, `install-service.bat` (registers the service, auto-starts on boot, and sets an auto-restart-on-crash policy for the host), `uninstall-service.bat` (stops and uninstalls; data files are kept), `service.bat` (management entry: double-click for a menu, or pass start|stop|restart|status as arguments; all three scripts request administrator privileges automatically; the batch files are GBK-encoded to suit cmd on Chinese Windows).
+- The service is named `RustDeskPro`, display name RustDesk Server Pro, running as the LocalSystem account. **Once the service is installed, don't double-click start.bat again** — both sides would fight over the same ports; configuration is still changed in server.env, then restart with service.bat. service.bat automatically manages by process when the service isn't installed (starting via start.bat, stopping by killing the hbbs/hbbr processes), so it works whether or not the service is installed.
+- rdsvc.exe can also manage directly from the command line: `rdsvc.exe install|uninstall|start|stop|restart|status`. install only updates the program path for an existing service of the same name (after moving the server directory, just re-run install-service.bat — no need to uninstall first).
+- Upgrade: stop the service (or close the start.bat window) → replace hbbs.exe (this release's hbbs/hbbr are identical to v24, so in practice you only need to place the 4 new files in the server directory) → register with install-service.bat → manage with service.bat afterward.
+- Verification: rdsvc.exe cross-compiled successfully, go vet passed; the batch files passed GBK+CRLF round-trip checks. **This machine has no Windows environment, so service registration and start/stop were not actually run** — the real machine is authoritative; if install errors, send back the window text.
+
+## v26: Console switch "Allow remote configuration changes" (uniform push via heartbeat)
+
+- Background (2026-11-01, user): the official client by default doesn't let the controller operate the controlled side's RustDesk client window (main UI, settings), and going to each controlled machine locally to tick "Allow remote configuration changes" is tedious; it was requested as a console switch managed centrally.
+- Implementation: Server Settings gains a switch `allow_remote_config` (**off by default**). The heartbeat response's strategy.config_options adds `allow-remote-config-modification: Y/N` alongside the existing hide-server-settings, on the same push pipeline as "Hide Server Settings": the client merges it automatically on its 15-second heartbeat, no restart and no client reinstall needed; changing the switch automatically advances the policy timestamp, so the client refreshes on the next beat. Source-verified (official client 1.5.0): the client sets no whitelist on pushed tables, and the key it reads to block remote input is exactly this one.
+- Scope and trade-offs: the policy is global and doesn't distinguish per device (a client that manually changed this setting locally keeps its local setting; what's pushed is the default). Once enabled, anyone who can connect to a machine can change its RustDesk configuration (change the password, change security options), so it's off by default — only turn it on when your own devices need remote maintenance of their clients.
+- Console location: below "Allow open registration" on the Server Settings page, a new checkbox "Allow remote configuration changes (pushed to all clients via heartbeat)".
+- Upgrade: stop the service → replace hbbs only (hbbr and startup scripts unchanged) → start.
+- Verification: 11 new dedicated items (default pushes N, setting read/write round-trip, on → pushes Y and the policy timestamp advances, off → back to N), passing on both debug and release; full regression: dedicated 69/69, console 28/28 ×2, client configuration 31/31, template 17/17, anchoring 17/17, cargo test all passing, console JS syntax check passed. Real-machine check still needed: after turning the switch on and waiting about 15 seconds, "Allow remote configuration changes" in the controlled side's settings should tick itself automatically, and remote input should be able to click its client UI (this machine has no official client runtime, so this item is authoritative on the real machine).
+
+## v27: Nearest-relay selection for multiple relays (latency approximation, for global deployments)
+
+- Background (2026-11-02, user): with multiple relays deployed globally, use "by latency, nearest first" instead of indiscriminate round-robin.
+- Mechanism (server-side only, no client or protocol changes): when hbbs assigns a relay, it uses the bundled city-level IP geolocation database (`geoip-city.mmdb`, GeoLite2-City) to look up the latitude/longitude of the controller, the controlled side, and each relay, and picks the relay minimizing the "sum of great-circle distances to both ends"; relays within 1.3× + 250 km of the best score form the "near set", and round-robin continues within the set for load distribution (i.e. the user's "round-robin by latency"). Geographic distance is the latency approximation the server can obtain: measuring the actual client↔relay RTT would require changing the client protocol, and the official client only accepts the address hbbs assigns, so it can't be done.
+- Conditions and fallback: it only activates with ≥2 relays and the geolocation database file in the server directory (or a path given by the RELAY_GEOIP_DB environment variable); when there's no database, an endpoint's IP has no coordinates (private addresses, anycast addresses, etc.), or a relay itself can't be located, it automatically falls back to the original full round-robin with no degradation in behavior. Selection only picks from the health-checked live list (the existing 3-second liveness probe and removal logic is unchanged). Delete/rename the mmdb file and restart to turn off nearest-relay selection.
+- Configuration: just write multiple relays comma-separated into RELAY_SERVERS as usual; relay addresses are used for geolocation, so fill in public IPs or domains that resolve publicly. The geolocation database is a 2026-11 GeoLite2-City snapshot, city-level precision (tens to hundreds of kilometers of error; country/region-level judgment is reliable); to refresh it later, replace it with a file of the same name (any MaxMind-format city database is compatible, e.g. DB-IP city lite); it also works long-term without refreshing, except newly allocated IP ranges may not resolve and fall back to round-robin.
+- Observation: the startup log has a line `relay geo selection: enabled (db: ...)` or `no city db ... round-robin`; use it to confirm whether it's enabled.
+- Upgrade: stop the service → replace hbbs (the new package includes geoip-city.mmdb — just place it in the server directory) → start. hbbr and scripts unchanged.
+- Verification: selection unit tests 7/7 (including a real-database lookup placing a Guangdong Telecom IP in Guangzhou, and private addresses having no coordinates); end-to-end smoke test with the built-in tg probe 12/12 (China/US/Australia/Europe each assigned to their continent's relay, cross-continent sessions staying in the near set with the best one taking its turn, same-city dual relays round-robining each other, full round-robin without a database); full regression 69/69, 28/28 ×2, 31/31, 17/17, 17/17, cargo test all passing. The actual latency improvement of real cross-border sessions is subject to real deployment (this machine has no global nodes to test with).
+
+## v28: Fix device database escaping on Windows + service.bat menu
+
+- Background (2026-11-02, user real-machine report): ① running hbbs as a service, the startup log showed the device database landing at `C:\WINDOWS\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\db_v2.sqlite3` — another file that didn't land in the server directory; ② in the service.bat menu, pressing any number only showed the service status.
+- Root cause of issue one (located in source): upstream peer.rs has a dedicated branch for **Windows release builds** that places db_v2.sqlite3 in a client-style configuration directory (the parent directory of `Config::icon_path()`, i.e. the running account's %APPDATA%\RustDesk\config); Linux and Windows debug builds both use the current directory, so local testing never exposed it (which is also why it dodged the v21 anchoring suite). Fix: the platform branch was deleted; all platforms now uniformly use `./db_v2.sqlite3` under the server directory (the process anchors to the program directory at startup; the DB_URL startup parameter can still override it). Impact: after upgrading, the first start no longer reads the db_v2.sqlite3 at the old location; device records are rebuilt automatically when clients re-register (within about a minute); to keep the old records, copy the old path's db_v2.sqlite3 into the server directory before starting. Also a reminder: if the `Key:` in the startup log doesn't match the one the console / live clients use, this instance is not reading the original directory's id_ed25519 (most likely it was extracted into a new directory) — copy the original directory's id_ed25519, id_ed25519.pub (and api_v1.sqlite3) over before starting, or old clients will fail signature verification.
+- Issue two fix: the service.bat menu used the `choice` command + errorlevel cascading checks, which behaved abnormally in the user's environment (any keypress fell through to the status branch). It has been replaced with the most robust approach: `set /p` to read input + string-by-string comparison jumps, with no reliance on errorlevel at all; and before executing it echoes a line "Action: xxx", so a wrong press is visible at a glance; entering a wrong number prompts and re-displays the menu. The final versions of all three .bat files are also stored in the source repository's winservice/ directory. Encoding is still GBK + CRLF, verified by decode-and-read-back and line-by-line diff; but this machine has no Windows cmd to execute them, so the menu's real-machine behavior is subject to next use.
+- Upgrade: stop the service → replace hbbs only (hbbr, rdsvc unchanged) + replace service.bat → start.
+- Verification: full regression (dedicated 69/69, console 28/28 ×2, anchoring 17/17, nearest-relay selection 12/12, cargo test all passing), passing on both debug and release. The Windows release build's database path branch has been deleted and the logic is unified across all platforms, so Linux-side verification covers the unified code path; on the real machine, just confirm the startup log shows `DB_URL=./db_v2.sqlite3`.
+
+## v29: Sync upstream relay UUID validation hardening
+
+- Content (2026-11-06): merged 3 new upstream rustdesk-server commits after fork base 873230e; the core is 44de977 "Validate relay UUIDs before forwarding": hbbs validates the relay UUID before forwarding it on the RequestRelay / RelayResponse paths — empty, over 128 bytes, or containing characters outside `[A-Za-z0-9_-]` (including newlines, spaces, NUL) disconnects immediately instead of being forwarded verbatim to the relay; empty fields echoed back on peer confirmation are still allowed. The other two commits add unit tests for the validation and delete upstream's CLAUDE.md.
+- Compatibility with our own changes: only touches src/rendezvous_server.rs; doesn't touch nearest-relay selection (geo_relay), self-connection refusal, the console, or the API; the three-way merge had zero conflicts. UUIDs / ULIDs used by normal clients all pass validation; already-issued clients are unaffected.
+- Upgrade: stop the service → replace hbbs only → start (hbbr, rdsvc, scripts, and the geolocation database unchanged).
+- Verification: full regression (dedicated 69/69, console 28/28 ×2, template 17/17, anchoring 17/17, client configuration 31/31, nearest-relay selection 12/12, cargo test all passing, including upstream's new relay_uuid_validation unit test), passing on both debug and release. This release's change is a platform-uniform protocol validation with no platform-specific branches and no Windows-specific behavior changes; no new real-machine confirmation items.
+
+## v30: Sync upstream hardening — message size limits and relay/console fixes
+
+- Content (2026-11-12): merged 8 new upstream rustdesk-server commits after v29 (2026-11-07 to 11-08), all hardening and bug fixes, no new features, no account changes: 0415b0e adds message size limits to hbbs and hbbr (hbbs default 64 KiB, hbbr pre-pairing limit 128 KiB, new `MAX_MESSAGE_KB` setting); 680b603 fixes IPv4 relay blacklist matching failing under hbbr dual-stack; 98ffcee / 36a0996 add timeouts and anti-truncation to admin console replies; 1bd3938 adds timeouts to relay bidirectional writes; 474fbc7 limits WebSocket handshake duration; e5c0a42 preserves the original port when forwarding WebSocket IPs; 134008e fixes waiter expiry after pair ID reuse. Upstream also upgraded tungstenite / tokio-tungstenite from 0.17 to 0.29 (rustdesk-org fork).
+- Compatibility with our own changes: 2 conflicts at merge time, both hand-merged keeping both sides' changes — one in src/rendezvous_server.rs (upstream's message size limit merged with our greeting message for 1.5.0+ clients); one in Cargo.lock (hbbs dependencies keep our tokio-rustls 0.23.4, tokio-tungstenite adopts upstream's 0.29.0). Nearest-relay selection (geo_relay), self-connection refusal, relay UUID validation, console, and API are all unaffected.
+- Upgrade: stop the service → **replace both the hbbs and hbbr binaries** (unlike v29, which only replaced hbbs — this batch of changes is mainly in relay_server.rs) → start (rdsvc, scripts, geolocation database unchanged).
+- `MAX_MESSAGE_KB` (environment variable, default 64, unit KiB, max 65536): the largest message hbbs accepts on its TCP and WebSocket listeners; connections sending oversized messages are disconnected. The default covers online-status queries for about 5000 standard 9–10 digit IDs; with unusually long or numerous IDs, the client may not see online status — raise it as appropriate.
+- Verification: full regression (dedicated 69/69, console 28/28 ×2, template 17/17 ×2, anchoring 17/17 ×2, client configuration 31/31 ×2, nearest-relay selection 12/12 ×2, cargo test all passing, including upstream's new relay/console unit tests), passing on both debug and release. This release's changes are platform-uniform protocol and timeout hardening, with no new Windows/release-specific branches and no new real-machine confirmation items.
+
+## v30: New ARM64 Linux packages (glibc / musl variants)
+
+- Content (2026-11-13): the server gains ARM64 (aarch64) Linux builds, with the same code as v30 (merge commit 0a76ebe, no code changes, pure cross-compilation), responding to issue #2's ARM soft-router deployment request. Two packages:
+  - `rustdesk-server-pro-linux-aarch64-glibc-v30.zip`: dynamically linked glibc build, for regular ARM64 Linux distributions such as Debian / Ubuntu / Armbian / Raspberry Pi OS;
+  - `rustdesk-server-pro-linux-aarch64-musl-v30.zip`: statically linked musl build, a single binary with no system library dependencies, for OpenWrt and other soft-router systems (OpenWrt has no glibc, so the glibc build can't run there).
+- Which one to pick: on a machine where `uname -m` is aarch64/arm64, first look at the system — regular distributions use the glibc build; OpenWrt / soft-router firmware uses the musl build; if unsure, the musl build runs on both kinds of system (statically linked, doesn't depend on system libraries), just slightly larger.
+- Deployment: exactly the same as the x86_64 Linux package (start.sh / server.env / systemd service scripts are shared); after extracting, follow the Quick Start above; ports, configuration, and console are all the same. On soft routers with limited memory and storage, the geoip-city.mmdb in the package can be deleted (nearest-relay selection falls back to round-robin; basic functionality is unaffected).
+- Verification: the ARM64 glibc build passed console 28/28 ×2, anchoring 17/17, client configuration 31/31, template 17/17 (including auto-resolution of 1.5.3) in a qemu-user emulated environment; the musl build passed startup and console 28/28 ×2 smoke tests. Long-term running behavior on real ARM64 hardware still awaits field reports.
+
+## v31: Fix generated-client "File name too long (os error 36)"
+
+- Background (2026-11-13, issue #1 and a real-machine reproduction by the user): the console's "Generate Pre-bound Client" reported `File name too long (os error 36)`, the same with both the 1.5.1 and 1.5.3 templates. Root cause: the generated client's configuration is encoded into the filename (`rustdesk--<base64(JSON)>.exe`), and the filename grows with the public address — when the public address exceeds about 24 characters the filename exceeds 255 bytes, and creating the file under `clients/` fails directly (os error 36), with the raw error thrown back at the console verbatim.
+- Fix (src/api.rs): omit fields the client can derive itself at generation time. Verified against the official client 1.5.0 source: all four `CustomServer` fields have `#[serde(default)]`, so missing JSON fields are treated as empty; an empty api is derived as the ID server port minus 2, and an empty relay uses the relay address hbbs pushes (falling back further to port plus 1). Under the standard layout (no API override, TLS off, api port = rendezvous port − 2, relay port = rendezvous port + 1), api / relay are no longer written into the filename; with non-standard ports, TLS, or an API override, the fields are embedded as before. If the encoded filename still exceeds 200 characters, it falls back to the plaintext short form `rustdesk-host=...,key=...,relay=...` (the client parses it the same way; the plaintext form writes the key into the filename, so it's only a fallback); if the plaintext form also exceeds 255 characters, it returns a clear Chinese error: 「公网地址太长，生成的客户端文件名超出系统限制，请使用更短的公网地址」 ("The public address is too long; the generated client's filename exceeds the system limit. Please use a shorter public address"). `GET /api/client-config` returns the same values as before and still shows the complete configuration; already-issued clients are unaffected.
+- Upgrade: stop the service → replace hbbs only → start (hbbr, rdsvc, scripts, geolocation database unchanged).
+- Verification: 5 new unit tests (field omission, a 40-character domain still using the encoded form, over-long fallback to plaintext, over-long Chinese error, omission decision), cargo test 47/47 (debug and release); end-to-end 19/19 (debug and release: a 40-character domain generates successfully, filename 161 characters with host/key correct after decoding and api/relay omitted; an 85-character domain takes the plaintext fallback; a 240-character domain reports the clear Chinese error). Full regression (dedicated 69/69 ×2, console 28/28 ×2, template 17/17 ×2, anchoring 17/17 ×2, client configuration 31/31 ×2, nearest-relay selection 12/12 ×2), passing on both debug and release. This release's change is platform-uniform filename generation logic, with no new Windows/release-specific branches and no new real-machine confirmation items.
+
+## v32: Online one-click update + API usage notes
+
+- Feature (2026-11-13): the console's Server Settings page gains a "Server Update" section, showing the current version v32 (with upstream base 1.1.17) and the running platform (one of windows-x86_64 / linux-x86_64-glibc / linux-aarch64-glibc / linux-aarch64-musl); the "Check for Updates" button queries this repository's (wirh/rustdesk-server-pro) latest release; when a new version is available, a full changelog panel (scrollable, so you can see what the new version changes before clicking update) is shown above the "Update" button; download progress and source are shown during download; once staged, it shows "Staged vX, takes effect after restart" + a "Restart Now" button; after restart the page waits automatically and shows the new version once the server responds again. Version comparison strips the leading `v` and compares numerically (v32 > v31); a non-numeric tag is treated as no update and displayed as-is.
+- Flow: check → download and stage → restart and replace. Downloads only fetch the matching platform's package from this repository's releases: the version is strictly validated against `^v[0-9]+$` and caller-supplied arbitrary URLs are never accepted; downloads are verified (at least 1MB + ZIP magic `PK\x03\x04`); the hbbs and hbbr binaries are extracted and staged as `hbbs.new` / `hbbr.new` in the exe directory (on Windows `hbbs.exe.new` / `hbbr.exe.new`), with `update/staged.json` written to record the version; on failure, temporary files are cleaned up and no half-written binary is left behind. Downloads run in a background thread; poll progress with `GET /api/admin/update/status` (see the API section below).
+- Check retries: first queries `releases/latest` directly on api.github.com; on failure it retries the same API request through the mirror chain in turn; if the mirror APIs also fail, it requests the `releases/latest` page through the mirror chain and takes the version from the redirect Location (this path yields only the version number, not the changelog — the response marks `notes_unavailable` and the UI shows "Changelog temporarily unavailable"). Only when all paths fail does the check report failure (502), noting that both direct and accelerated paths were tried.
+- Download fallback: when the API can't retrieve release info (e.g. GitHub's unauthenticated API limit of 60 requests/hour on a shared IP), it switches to the deterministic `releases/download/{version}/{package name}` direct link and downloads through the mirror chain; that URL is built from the validated version and the compile-time platform, accepts no caller input, and the anti-SSRF guarantee is unchanged. A nonexistent version 404s on all download sources and ultimately still lands in the error state.
+- Restart and replace: replacement must happen before the launcher executes the binary (on Windows a running exe is locked and hbbs can't replace itself at startup; on Linux replacing at hbbs startup would leave the old binary running for that run). rdsvc (the Windows service host), start.sh, start.ps1, and systemd (the unit generated by install-service.sh has an `ExecStartPre`) all check for `.new` files in the same directory before starting child processes and overwrite the official files, deleting `update/staged.json` on success; a failed replacement is only logged and doesn't block startup (it retries on the next restart). When hbbs is run directly (no launcher managing it), `.new` files are not replaced automatically: manually rename `hbbs.new` to `hbbs` (`hbbr.new` to `hbbr`), delete `update/staged.json`, and then start — the console text explains this.
+- Mirror settings: update downloads and checks reuse the existing `github_mirror` setting on the Server Settings page and the same built-in mirror chain as template downloads — there is no second mirror setting.
+- New dependency: extraction uses `zip` 8.6.0 (only the `deflate-flate2` feature); the Cargo.lock changes only involve that crate and its transitive dependencies (flate2, miniz_oxide, crc32fast version unification).
+- Upgrade: stop the service → replace hbbs (hbbr unchanged, no need to replace it) → **on Windows also replace rdsvc.exe, on Linux also replace start.sh / install-service.sh (on Windows replace start.ps1)** — the replacement logic lives in the launcher; old launchers have no `.new` check, so a restart after staging won't take effect → start. See the next section for API usage notes.
+- Verification: cargo test 56/56 (debug and release, each including 9 new unit tests: version parsing/comparison, platform mapping, version parameter validation, mirror candidates, tag from redirect, release parsing, extract round-trip); end-to-end 55/55 (debug and release: real GitHub check with the changelog matching the release body verbatim, real v31 download and staging, a supervising script simulating restart-and-replace with file hashes matching the staged ones, service resuming response); full regression (dedicated 69/69 ×2, console 28/28 ×2, template 17/17 ×2, anchoring 17/17 ×2, client configuration 31/31 ×2, nearest-relay selection 12/12 ×2). Real-machine boundary: rdsvc and start.ps1 replacement logic was only verified at the cross-compile + go vet + encoding-check level and needs confirmation in a real Windows service environment; systemd's `ExecStartPre` needs confirmation on real Ubuntu.
+
+## v33: Other platforms' official download links on the Generate Client page
+
+- Feature (2026-11-13): the console's "Generate Client" page gains an "Other Platform Downloads" section listing the latest official client's macOS (Intel / Apple Silicon dmg), Linux (x86_64 and ARM64 .deb and AppImage), and Android (arm64 / x86_64 / armv7 / universal apk) packages, one line per platform: official GitHub direct link + accelerated download link; plus a direct App Store link for iOS (iOS has no GitHub package and doesn't go through mirrors). After users on other platforms install the official client, they fill in the server address and key from the "Manual Configuration for Official Client" card above and can start using it. This release only adds download links — no multi-platform pre-bound generation (Windows generated clients unchanged).
+- One-click copy configuration (2026-11-13): the "Manual Configuration for Official Client" card gains a "Copy Configuration" button, copying the whole configuration as a single string; paste it at the paste (import) icon in the official client's "Settings → Network" to fill in all four items at once, no item-by-item entry needed. The string format is exactly the same as the official client's own export (`ServerConfig.encode()`, verified against the 1.5.0 and 1.5.3 source): `{"host","relay","api","key"}` four-field JSON → base64url (no padding) → whole string reversed; it's the same encoding used in generated-client filenames, and the same format as the paid Pro console's Config string. `GET /api/client-config` gains a `share` field returning this string.
+- API: new `GET /api/client-downloads` (any logged-in user can use it, same level as `/api/client-config`), returning `{"ok":true,"version":"1.5.3","platforms":[{"id","name","file","url","mirrors":[...]}]}`. The version and filenames come from rustdesk/rustdesk's `releases/latest` on api.github.com: filenames are the real asset names in the release (matched by the `rustdesk-{version}-` prefix + known suffixes; a renamed or missing asset simply keeps that platform out of the list — a link that hasn't been verified is never fabricated); `url` takes the asset's own `browser_download_url`. When the version can't be found it returns 502 + a clear Chinese error, never inventing a version number.
+- Caching and acceleration: upstream release data is cached in memory for 1 hour (GitHub's unauthenticated API limit is 60/hour/shared IP, and querying on every page open would hit the limit quickly); acceleration links are not cached — they're computed fresh on each request from the current `github_mirror` setting, so changing the mirror takes effect immediately. Acceleration uses the same mirror chain as template downloads and online updates (admin custom mirror first, then the built-in mirrors, then direct), with no second mirror logic. Detection reuses the template download's latest-version resolution (mirrors first, direct as fallback).
+- Upgrade: stop the service → replace hbbs only → start (hbbr, rdsvc, scripts, geolocation database unchanged).
+- Verification: 7 new unit tests (4 for download links: parsing 10 platforms from the real 1.5.3 asset names while excluding Windows installers/rpm/flatpak/sciter/wayland variants, missing tag error, mirror URL generation, cache freshness; 3 for one-click copy: the share string uses the same encoding as generated-client filenames, byte-identical to the official client's export, all four fields always present), cargo test 63/63 (debug and release); download end-to-end 50/50 (debug and release: version matches `gh api`'s latest, platform files checked item by item against the real asset names, official URL format, mirrors containing the configured custom prefix, anonymous 401, accessible to regular users, console page markers); client configuration end-to-end 38/38 ×2 (including the share string reverse-parsed with a replica of the client decoder, four fields matching the endpoint values, same values for regular users, console page markers). Full regression (dedicated 69/69 ×2, console 28/28 ×2, template 17/17 ×2, anchoring 17/17 ×2, nearest-relay selection 12/12 ×2), passing on both debug and release. This release's change is platform-uniform logic, with no new Windows/release-specific branches and no new real-machine confirmation items.
+
+## v34: Console Chinese/English switch + English deployment guide + download mirror checkbox
+
+- Language switch (2026-11-14): a "中文 / English" toggle was added at the top right of the console, with the same toggle on the sign-in / registration pages and the client sign-in page. Chinese is the default; switching takes effect immediately and survives refreshes and page changes (the choice is stored in the browser's localStorage, key `rdp-lang`). The translation covers all console UI text (labels, buttons, hints, and confirmation dialogs on the sign-in, registration, overview, devices, user management, API token, generate-client, and server-settings pages); error strings returned by the API are not translated (clients depend on their exact text, e.g. the OIDC "No authed oidc is found"). It is implemented as a JavaScript dictionary (embedded in src/api_pages.rs, about 135 keys; the page source still carries Chinese as the default text and English is swapped in at runtime, so page-marker checks are unaffected).
+- English deployment guide (2026-11-14): this file, docs/DEPLOY-en.md, is the complete English translation of DEPLOY.md (all version sections, port tables, API usage notes, and the ARM section); the root README links to it, and the release packages carry both README.md (Chinese) and README-en.md (English).
+- Mirror checkbox (2026-11-14): the "Other Platform Downloads" card now shows only the official direct links by default; a "Use mirror" checkbox above the card ("镜像加速" in the Chinese UI) switches each platform's link to the accelerated mirror address, and unchecking switches back to the direct link. Mirror URLs still use the same mirror chain as the template download and online update (the admin's `github_mirror` setting first, then the built-in mirrors) — no second mirror implementation; the checkbox state is stored in localStorage (key `rdp-dl-mirror`) and survives refreshes. iOS has only the App Store direct link, no mirror, and is unaffected by the checkbox. The `GET /api/client-downloads` response is unchanged (each platform already carried both `url` and `mirrors`).
+- Upgrade: stop the service → replace hbbs only → start (hbbr, rdsvc, scripts, and the GeoIP database are unchanged).
+- Verification: cargo test 63/63 (debug and release; no new server-side logic, the only unit-test change is the version assertion); browser end-to-end 43/43 (debug and release, real browser via Playwright: Chinese by default, all page text and dynamic tables switch to English, English survives reload, switching back to Chinese works; the mirror checkbox is unchecked by default with direct links, switches to mirrors when checked, iOS unchanged, switches back when unchecked, and stays checked after reload); download end-to-end 50/50 ×2, client-configuration end-to-end 38/38 ×2; full regression (dedicated 69/69 ×2, console 28/28 ×2, template 17/17 ×2, anchoring 17/17 ×2, geo-nearest 12/12 ×2), passing on both debug and release. The changes in this release are platform-uniform logic with no new Windows/release-only branches; the language switch and checkbox behavior in a real browser are covered by the Playwright suite, so there are no new real-machine confirmation items.
+
+## API Usage Notes
+
+The server provides HTTP interfaces on the API port: the login/device protocol interfaces the official client uses, and the admin interfaces the console uses (generating clients, device list, online updates, etc.). This section follows the actual route table in src/api.rs; tokens and keys in the examples are truncated or replaced with placeholders, with formats matching real responses. All examples below have been actually run against a local hbbs (curl-tested: `/api/me`, `/api/devices`, `/api/client-config`, `/api/client-downloads`, `/api/admin/update/status`, `/api/tokens`, `/api/login`, `/api/peers`, `/api/users`, `/api/currentUser`, `/api/admin/gen-client`, `/api/admin/gen-clients`, download links, and invalidation after deletion).
+
+### Base URL
+
+Default `http://<server address>:21114` (`--api-listen` defaults to `0.0.0.0:21114`; address/port can be changed, `off` disables it). After enabling TLS (`--tls-cert` / `--tls-key`), use `https://`. After the management-plane split (`--console-listen`, see the v23 section), note the two addresses:
+
+- API address (21114): client protocol interfaces (`/api/login`, `/api/peers`, `/api/users`, `/api/currentUser`, `/api/heartbeat`, `/api/sysinfo`, `/api/ab`, `/api/sysinfo_ver`, `/api/oidc/*`) + download links `/dl/*` + `/oidc/login`;
+- Console address: console pages (`/console/*`) and admin interfaces (`/api/auth/*`, `/api/me`, `/api/client-config`, `/api/admin/*`, `/api/devices`, `/api/tokens*`).
+
+After the split, admin interfaces must be called with the console address and port; using the API address returns 404. Without the split, both are on the same address.
+
+Except `/dl/*` (file stream) and `/api/sysinfo_ver` (plain text `1`), all interfaces take and return JSON; POST requests should carry `Content-Type: application/json`.
+
+### Authentication: Three Credentials, Not Interchangeable
+
+1. **API Token (`rdt_`, recommended for script/program calls)**: created on the console's "API Token" page (any logged-in user can create their own; the full token is shown only once on creation, and the server only stores its SHA-256 hash — if lost, it can only be deleted and recreated). Usage: `Authorization: Bearer rdt_...`. Permissions equal the creating account's: an admin's token can call admin interfaces, a regular user's token can only see data in their own scope. Each use updates `last_used_at`.
+2. **Session Cookie (`rdp_sid`)**: issued by `POST /api/auth/login` after browser login to the console (`Set-Cookie`, valid for 24 hours); subsequent requests carry `Cookie: rdp_sid=...`. Web login requires passing the captcha first (`GET /api/captcha` to fetch the image, then put the recognized characters in the `captcha` field); for script calls it's simpler to use an `rdt_` token directly.
+3. **Client access token (the `access_token` returned by `POST /api/login`)**: only for official client protocol interfaces (`/api/peers`, `/api/users`, `/api/currentUser`, etc.). It can't call admin interfaces (actually tested: returns 401 `未登录`, "not logged in"); conversely, an `rdt_` token can't call client protocol interfaces (those interfaces only accept tokens issued at login).
+
+Example conventions: below, `TOKEN` means an `rdt_` token, `CTOKEN` means a client access token, and the server address is `203.0.113.10` (a documentation-reserved address — replace it with the real one):
+
+```bash
+TOKEN="rdt_0123456789abcdef..."   # 控制台 API Token 页创建
+CTOKEN="0123456789abcdef..."      # POST /api/login 返回的 access_token
+```
+
+### Error Format
+
+- **Admin/console interfaces**: HTTP status code + `{"ok":false,"error":"..."}`. 401 not logged in (no credential, invalid or expired credential); 403 requires admin privileges (or the resource doesn't belong to the current user); 400 parameter error (message is a Chinese explanation); 404 record not found / link invalid; 429 logins too frequent, locked; 500 server error.
+- **Client protocol interfaces**: errors also return HTTP 200, with body `{"error":"..."}` (the format the official client expects); only unauthenticated requests are HTTP 401 `{"error":"Please login"}`. When writing scripts, don't just look at the status code — check whether the body has an `error` field.
+
+### Rate Limiting and Lockout (from v23)
+
+- **Password login** (web and client share the same counters): the same account failing 5 times in 10 minutes → locked starting at 15 minutes, doubling on repeated triggers (15 minutes → 30 minutes → 1 hour… capped at 12 hours, level reset after 24 hours with no further trigger); the same IP failing 30 times in 10 minutes → that IP is locked under the same rules (affecting all accounts on that IP). A successful login clears the account counter; attempts during a lockout don't extend it. Lockout state lives in memory and clears on server restart; lockouts and login failures are both logged to `logs/hbbs.log` (lines starting with `[auth]`). Thresholds can be adjusted with the `RD_AUTH_FAIL_MAX` / `RD_AUTH_IP_FAIL_MAX` / `RD_AUTH_WINDOW_SECS` / `RD_AUTH_LOCK_SECS` environment variables.
+- **Registration**: at most 10 per IP per hour (`RD_AUTH_REG_MAX` / `RD_AUTH_REG_WINDOW_SECS` adjustable). After turning off "Allow open registration", anonymous registration returns 403 (the first admin can still be created when there are zero users; a logged-in admin can still create accounts).
+- Captcha failures don't count toward the lockout. When client login is locked, it returns 200 + `{"error":"Too many failed attempts, temporarily locked. Try again in about N min"}`; when web login is locked, it returns 429.
+
+### Client Protocol Interfaces (client access token)
+
+**Client login** `POST /api/login`: body is `{"username","password"}`, optionally with `"id"` (device ID) and `"uuid"` (client device identifier, used for device binding). On success returns:
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+```json
+{"access_token":"ee8762dfbc822be5…（64 位十六进制）","type":"access_token",
+ "user":{"name":"admin","email":"","note":"","status":1,"is_admin":true,"info":{}}}
+```
+
+Wrong username or password returns HTTP 200 + `{"error":"Username or password is incorrect"}`. To log out: `POST /api/logout` (with the client token; the server deletes that token).
+
+**Device list** `GET /api/peers`: returns the logged-in account's own devices (admins also only see their own; use `/api/devices` below to see all devices). Pagination parameters `current` (default 1) and `pageSize` (default 100, max 1000):
+
+```bash
+curl -s "http://203.0.113.10:21114/api/peers?current=1&pageSize=100" \
+  -H "Authorization: Bearer $CTOKEN"
+```
+
+```json
+{"total":1,"data":[{"id":"1234730355","user":"admin","user_name":"admin","note":"",
+ "device_group_name":"","status":1,
+ "info":{"device_name":"tk","os":"Windows","username":"Administrator"}}]}
+```
+
+**User list** `GET /api/users`: returns only the logged-in account itself (for the client sidebar):
+
+```bash
+curl -s http://203.0.113.10:21114/api/users -H "Authorization: Bearer $CTOKEN"
+```
+
+```json
+{"total":1,"data":[{"name":"admin","display_name":"","avatar":"","email":"",
+ "note":"","status":1,"is_admin":true}]}
+```
+
+**Current user** `POST /api/currentUser`: returns the same single user object as above (without the `total`/`data` wrapper):
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/currentUser \
+  -H "Authorization: Bearer $CTOKEN"
+```
+
+**Other client protocol interfaces** (called internally by the official client; usually no need to call them by hand): `POST /api/heartbeat` (device heartbeat and policy push), `POST /api/sysinfo` (report device info), `GET/POST /api/ab` (address book sync), `GET /api/device-group/accessible` (device groups, currently returns an empty list), `GET /api/login-options` and `/api/oidc/*` (OIDC browser login), `POST /api/sysinfo_ver` (returns plain text `1`, used for client version negotiation).
+
+### Admin Interfaces (`rdt_` token or session cookie)
+
+**Current login info** `GET /api/me`:
+
+```bash
+curl -s http://203.0.113.10:21114/api/me -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"is_admin":true,"ok":true,"username":"admin"}
+```
+
+**Device list (console full view)** `GET /api/devices`: admins see all devices, regular users only their own. `last_seen` is a Unix second timestamp:
+
+```bash
+curl -s http://203.0.113.10:21114/api/devices -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"devices":[{"device_id":"1234730355","uuid":"…","username":"admin",
+ "hostname":"tk","os":"Windows","version":"1.5.3","last_seen":1794566574}],
+ "now":1794566574,"ok":true}
+```
+
+**Client configuration** `GET /api/client-config`: any logged-in user can query it; returns the four values manual configuration of the official client needs (matching the console's "Manual Configuration for Official Client" card); when the public address isn't configured (`public_host` empty) it returns `{"ok":true,"configured":false}`:
+
+```bash
+curl -s http://203.0.113.10:21114/api/client-config \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"api":"http://203.0.113.10:21114","configured":true,"host":"203.0.113.10:21116",
+ "key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ok":true,
+ "relay":"203.0.113.10:21117","share":"Qfi…（整份配置的分享字符串，v33 起）"}
+```
+
+(`key` is the 44-character server public key ending in `=`; the example above is a placeholder. `share` is the whole configuration encoded with the official client's `ServerConfig.encode()`: four-field JSON → base64url (no padding) → whole string reversed, the same format as the encoding in generated-client filenames; pasting it into the import spot in the official client's "Settings → Network" fills in all four items at once.)
+
+**Other platform download links** `GET /api/client-downloads` (from v33): any logged-in user can query it; returns download info for the latest official client on each platform (matching the console's "Other Platform Downloads" section). `url` is the official GitHub direct link, `mirrors` are acceleration links (the admin's `github_mirror` setting first, then the built-in mirror chain); iOS has only the App Store direct link, with `mirrors` empty. When GitHub is unreachable it returns 502 (no invented version numbers); upstream data is cached for 1 hour, mirrors are computed fresh from the current settings on each request:
+
+```bash
+curl -s http://203.0.113.10:21114/api/client-downloads \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"ok":true,"version":"1.5.3","platforms":[
+ {"file":"rustdesk-1.5.3-x86_64.dmg","id":"macos-x64","mirrors":[
+  "https://gh-proxy.com/https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg",
+  "…（其余内置镜像）"],"name":"macOS（Intel）",
+  "url":"https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.dmg"},
+ {"file":"","id":"ios","mirrors":[],"name":"iOS",
+  "url":"https://apps.apple.com/us/app/rustdesk-remote-desktop/id1581225015"}]}
+```
+
+(Example truncated: the actual response has 11 platforms — macOS 2, Linux 4, Android 4, iOS 1; Windows is not among them — use generated clients for Windows.)
+
+**Token management**: create `POST /api/tokens` (body `{"name":"..."}`, name optional, defaults to `default`); the returned `token` is shown only this once, so save it immediately; list `GET /api/tokens` (returns only id/name/timestamps, not token values); delete `DELETE /api/tokens/:id`:
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/tokens \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"backup-script"}'
+# {"ok":true,"token":"rdt_…（创建时只显示一次）"}
+
+curl -s http://203.0.113.10:21114/api/tokens -H "Authorization: Bearer $TOKEN"
+# {"ok":true,"tokens":[{"id":1,"name":"backup-script",
+#   "created_at":1794566574,"last_used_at":null}]}
+
+curl -s -X DELETE http://203.0.113.10:21114/api/tokens/1 \
+  -H "Authorization: Bearer $TOKEN"
+# {"ok":true}，不存在的 id 返回 404 {"ok":false,"error":"Token 不存在"}
+```
+
+**Generate client** `POST /api/admin/gen-client`: any logged-in user can generate (the record belongs to the caller). The body may carry `{"label":"..."}` (a note, optional). The Windows template must first be downloaded in the console and the public address configured, otherwise it returns 400. The returned `download_url` is the download link (see below):
+
+```bash
+curl -s -X POST http://203.0.113.10:21114/api/admin/gen-client \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"label":"office-pc"}'
+```
+
+```json
+{"download_url":"http://203.0.113.10:21114/dl/b64c2b88…/rustdesk--Qfi0DMzM…（约 120 字符的编码文件名）.exe",
+ "filename":"rustdesk--Qfi0DMzM….exe","ok":true}
+```
+
+**Generated record list** `GET /api/admin/gen-clients`: admins see all, regular users only their own:
+
+```bash
+curl -s http://203.0.113.10:21114/api/admin/gen-clients \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"clients":[{"created_at":1794566574,"created_by":"admin",
+ "download_url":"http://203.0.113.10:21114/dl/b64c2b88…/rustdesk--Qfi0DMzM….exe",
+ "filename":"rustdesk--Qfi0DMzM….exe","id":1,"label":"office-pc"}],"ok":true}
+```
+
+**Delete generated record** `DELETE /api/admin/gen-clients/:id`: the owner or an admin can delete it; after deletion the record's download link stops working immediately (the file is deleted along with it):
+
+```bash
+curl -s -X DELETE http://203.0.113.10:21114/api/admin/gen-clients/1 \
+  -H "Authorization: Bearer $TOKEN"
+# {"ok":true}，不存在的 id 返回 404 {"ok":false,"error":"记录不存在"}
+```
+
+**Download the generated client** `GET /dl/:token/:filename`: no login needed — the token in the link is itself the credential (it can be sent directly to others for download). On success it returns the exe file stream (`Content-Type: application/octet-stream`, `Content-Disposition: attachment`); on an invalid link or a deleted record it returns 404 `{"ok":false,"error":"下载链接无效或已删除"}`:
+
+```bash
+curl -O "http://203.0.113.10:21114/dl/b64c2b88…/rustdesk--Qfi0DMzM….exe"
+```
+
+**Online update (from v32, admin only)**:
+
+```bash
+# 当前版本与暂存状态
+curl -s http://203.0.113.10:21114/api/admin/update/status \
+  -H "Authorization: Bearer $TOKEN"
+# {"current":"v32","current_num":32,"downloaded":0,"error":"","ok":true,
+#  "platform":"linux-x86_64-glibc","running":false,"source":"",
+#  "staged":false,"staged_version":null,"state":"idle","total":0,
+#  "upstream_base":"1.1.17","version":""}
+# state: idle / downloading / extracting / done / error；
+# 下载中时 downloaded/total 为已下载/总字节数，source 为当前下载源
+
+# 检测更新（直连 API → 镜像 API → 重定向取版本号，全部失败才报 502）
+curl -s -X POST http://203.0.113.10:21114/api/admin/update/check \
+  -H "Authorization: Bearer $TOKEN"
+# {"has_update":false,"latest":"v31","notes_unavailable":false,"ok":true,
+#  "published_at":"2026-11-13T09:31:31Z","release_notes":"# v31\n\n## 修复\n\n…（完整 body）"}
+# 只有版本号、拿不到日志时 notes_unavailable 为 true，release_notes 为空
+
+# 下载并暂存指定版本（version 必须是 v33 这样的格式；立即返回，用 status 轮询进度）
+curl -s -X POST http://203.0.113.10:21114/api/admin/update/download \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"version":"v33"}'
+# {"ok":true,"started":true}（已有下载在进行时 started 为 false）
+
+# 重启生效（仅在已暂存时可用；无暂存返回 400）
+curl -s -X POST http://203.0.113.10:21114/api/admin/update/restart \
+  -H "Authorization: Bearer $TOKEN"
+# {"ok":true}，服务端约 0.5 秒后退出，由启动器换上新版并拉起
+```
+
+**Other admin interfaces** (used internally by console pages): `GET /api/admin/overview` (overview statistics), `GET /api/admin/users` and `POST /api/admin/users/:name/password`, `POST /api/admin/users/:name/:action` (user management), `GET/POST /api/admin/settings` (server settings), `POST /api/admin/template/download` and `GET /api/admin/template/status` (template download). The fields of these interfaces follow the console pages' actual calls and are not listed one by one here.
+
+## Logs
+
+- hbbs / hbbr output to both the terminal and files at runtime: `logs/hbbs.log` and `logs/hbbr.log` are generated automatically under the program directory (appended, never overwriting history).
+- API SQL query logging is off, so logs contain only event-level information. Common checks when troubleshooting connections: a client completing registration shows `update_pk <device ID>`; a rejected registration shows `uuid mismatch` (client identity doesn't match the record in the database) or `too frequent` (registrations from the same IP too frequent, temporarily blocked); the relay pairing process is in the hbbr log.
+- For more detailed output, start with an environment variable: `RUST_LOG=debug ./hbbs` (`trace` is even finer and very noisy).
+
+## Security Recommendations
+
+- 21114 is HTTP by default; from v23, do these in order (see the v23 section above): ① use a strong password for the admin, and turn off "Allow open registration" in Server Settings (logins already have rate-limit lockout and audit logging as a backstop); ② set CONSOLE_LISTEN in server.env to move the web console off the public internet; ③ with a domain, enable native HTTPS with TLS_CERT/TLS_KEY (a trusted certificate is required).
+- You can also terminate HTTPS with an Nginx/Caddy reverse proxy, but after proxying, the source IP the server sees is the proxy machine's address, and IP-dimension lockouts will aggregate by the proxy address — be aware of this.
+
+## License
+
+RustDesk is licensed under **AGPL-3.0**. This modification follows AGPL-3.0 as well: self-use/internal deployment is fine; if you distribute it externally or sell it commercially, you must fulfill AGPL's source-provision obligations. This repository retains all upstream source code and license files.
+
+## Verified and Unverified
+
+Verified locally through automated integration testing (33 items): account registration/login, official client login contract (password login + full OIDC browser login flow), heartbeat/device binding, policy push, user management, Tokens, template download, client generation and download links.
+
+Unverified: end-to-end login and remote-control screen of a real official client on this service — a smoke test needs to be done on a real machine with an installer produced by "Generate Client" (install → log in with an account → appear in the console device list → start one remote session).
