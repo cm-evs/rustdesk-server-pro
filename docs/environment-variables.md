@@ -205,7 +205,10 @@ binaries and does **not** implement `RELAY`, `ENCRYPTED_ONLY`, `KEY_PUB`, or
 ```bash
 # Tell clients where the relay listens because it is not using port 21117.
 hbbs -p 22116 -r rustdesk.example.com:22117
-hbbr -p 22117
+# -k - loads the server keypair (id_ed25519) and makes the relay refuse
+# clients whose key does not match. Start hbbs first (or make sure
+# id_ed25519 already exists): a hbbr started with -k - before the key
+# file exists would generate a divergent keypair of its own.
 ```
 
 ### `.env` file (working directory)

@@ -132,7 +132,32 @@ func loadConfig(dir string) serverConfig {
 }
 
 func (c serverConfig) hbbrArgs() []string {
-	return []string{"-p", c.hbbrPort}
+	// v37: -k - makes hbbr load the server keypair (id_ed25519) and
+	// refuse clients presenting a different key. Without -k, hbbr
+	// validates no keys at all (upstream default).
+	return []string{"-p", c.hbbrPort, "-k", "-"}
+}
+
+// waitForKeyFile waits until the server keypair (id_ed25519) exists in
+// dir, or the service stops. hbbr -k - loads that file — and would
+// GENERATE a fresh keypair if it were missing — so hbbr must never
+// start before hbbs has created it. Returns false on timeout.
+func waitForKeyFile(dir string, stop <-chan struct{}) bool {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "id_ed25519")); err == nil {
+			return true
+		}
+		select {
+		case <-stop:
+			return false
+		default:
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (c serverConfig) hbbsArgs() []string {
@@ -219,6 +244,22 @@ func (s *supervisor) runChild(name string, args []string) {
 			return
 		}
 		s.applyStagedUpdates()
+		// v37: hbbr -k - would generate its own keypair if
+		// id_ed25519 did not exist yet, diverging from hbbs.
+		// Never start hbbr before the key file exists; wait for
+		// hbbs to create it (fresh install) or retry later.
+		if name == "hbbr.exe" && !waitForKeyFile(s.dir, s.stop) {
+			if s.stopped() {
+				return
+			}
+			svcLog("hbbr 未启动：id_ed25519 在 30 秒内未出现（等 hbbs 先创建密钥；10 秒后重试）")
+			select {
+			case <-s.stop:
+				return
+			case <-time.After(10 * time.Second):
+			}
+			continue
+		}
 		cmd := exec.Command(exe, args...)
 		cmd.Dir = s.dir
 		cmd.Env = append(os.Environ(), "TEST_HBBS=no")
@@ -286,8 +327,10 @@ func (rdService) Execute(_ []string, r <-chan svc.ChangeRequest,
 	changes chan<- svc.Status) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
 	sup := newSupervisor(exeDir())
-	go sup.runChild("hbbr.exe", sup.cfg.hbbrArgs())
+	// v37: hbbs first — it creates id_ed25519 on startup, and the
+	// hbbr child waits for that file before starting (see runChild).
 	go sup.runChild("hbbs.exe", sup.cfg.hbbsArgs())
+	go sup.runChild("hbbr.exe", sup.cfg.hbbrArgs())
 	changes <- svc.Status{
 		State:   svc.Running,
 		Accepts: svc.AcceptStop | svc.AcceptShutdown,
