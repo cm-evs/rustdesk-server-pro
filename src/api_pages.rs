@@ -39,6 +39,7 @@ code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:13px}
 .changelog{white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;font-size:13px;line-height:1.6}
 .langrow{display:flex;gap:6px;justify-content:flex-end;margin-bottom:12px}
 button.langbtn{padding:6px 10px;font-size:13px}button.langbtn.active{background:#1f6feb;border-color:#1f6feb}
+.badge{display:inline-block;background:#1f6feb33;border:1px solid #1f6feb;color:#58a6ff;border-radius:4px;padding:1px 6px;font-size:12px;margin-left:6px;white-space:nowrap}
 "#;
 
 // Shared i18n dictionary + helpers, injected into every page by page().
@@ -157,7 +158,40 @@ const I18N={zh:{
 'set.upd_restart_note':'重启后服务会短暂中断，页面会在新版本起来后自动刷新。',
 'set.upd_restart_confirm':'确定立即重启服务端以应用 {v} 吗？正在进行的连接会中断。',
 'set.upd_restart_failed':'重启失败','set.upd_restarting':'正在重启…等待新版本响应后自动刷新。',
-'set.upd_timeout':'等待超时，服务可能未自动恢复。请检查服务端是否在运行（直接运行 hbbs 时需手动启动），然后刷新页面。'
+'set.upd_timeout':'等待超时，服务可能未自动恢复。请检查服务端是否在运行（直接运行 hbbs 时需手动启动），然后刷新页面。',
+'relay.regpage.title':'中继节点注册','relay.regpage.valid':'注册链接有效。在中继机器的安装目录下运行以下命令完成注册。',
+'relay.regpage.used':'此注册链接已被使用。请在控制台重新生成一个注册链接。',
+'relay.regpage.expired':'此注册链接已过期。请在控制台重新生成一个注册链接。',
+'relay.regpage.invalid':'注册链接无效。请检查链接是否完整，或在控制台重新生成。',
+'relay.regpage.cmd_hint':'在中继机器上，进入 relay-agent 与 hbbr 所在目录，运行：',
+'relay.regpage.copy':'复制命令','relay.regpage.copied':'已复制',
+'relay.regpage.warn':'此链接含注册密钥，相当于凭证：注册完成后即失效，请勿转发或公开。',
+'relay.regpage.win_hint':'Windows 上同样在 relay-agent.exe 所在目录运行此命令（PowerShell 或 cmd）。',
+'relay.title':'中继节点','relay.badge':'中继',
+'relay.desc':'中继节点由常驻代理（relay-agent）管理：代理注册后每 20 秒心跳上报状态，控制台下发的配置随心跳响应加密回传。注意：注册只建立管理关系，不会自动把节点加入中继轮询列表——轮询列表仍由服务器启动参数 RELAY_SERVERS 决定。',
+'relay.label':'备注（可选）','relay.label_ph':'如：香港中继','relay.expires':'有效期（小时，1–168）',
+'relay.gen':'生成注册链接','relay.gen_fail':'生成失败',
+'relay.link_once':'注册链接只显示一次，请立即复制并妥善保管：',
+'relay.link_expires':'有效期至 ','relay.cmd_label':'在中继机器上运行：',
+'relay.links_title':'待使用的注册链接','relay.links_empty':'暂无待使用的注册链接',
+'relay.links_created':'生成时间','relay.links_expires':'过期时间','relay.links_used':'已使用',
+'relay.links_revoke':'吊销','relay.links_revoke_confirm':'确定吊销这个注册链接吗？',
+'relay.empty':'暂无中继节点','relay.node':'节点','relay.status':'状态','relay.address':'地址',
+'relay.last_ip':'上次来源 IP','relay.agent_ver':'代理版本','relay.hbbr_ver':'hbbr 版本',
+'relay.hbbr_running':'hbbr 运行中','relay.hbbr_down':'hbbr 未运行','relay.started_at':'hbbr 启动时间',
+'relay.last_hb':'最后心跳','relay.sessions':'会话数','relay.throughput':'吞吐',
+'relay.key_done':'密钥已交付','relay.key_pending':'密钥未交付','relay.cfg_ver':'配置版本',
+'relay.pending_cmd':'待执行命令','relay.detail_back':'← 返回节点列表','relay.cfg_title':'下发配置',
+'relay.port':'监听端口','relay.limit_speed':'限速 LIMIT_SPEED（Mb/s）',
+'relay.limit_total':'总带宽 TOTAL_BANDWIDTH（Mb/s）','relay.limit_single':'单连接带宽 SINGLE_BANDWIDTH（Mb/s）',
+'relay.default_hint':'留空表示 hbbr 默认值（32 / 1024 / 128）','relay.push':'下发配置',
+'relay.push_ok':'配置已下发，将在下次心跳（20 秒内）生效。','relay.push_fail':'下发失败',
+'relay.restart':'重启 hbbr','relay.restart_confirm':'确定远程重启该节点的 hbbr 吗？该节点上正在进行的中继会话会中断。',
+'relay.restart_ok':'重启命令已下发，将在下次心跳执行。','relay.delete':'删除节点',
+'relay.delete_confirm':'确定删除节点 {n} 吗？删除后该节点的凭证立即失效，代理将停止心跳（hbbr 本身继续运行，需在中继机器上手动停止）。',
+'relay.load_fail':'加载中继节点失败','relay.online':'● 在线','relay.offline':'● 离线',
+'relay.unknown_time':'未知','relay.never':'从未',
+'relay.port_change_note':'改端口会重启 hbbr（会话中断）；只改限速时即时生效，不重启。'
 },en:{
 'app.title':'RustDesk Server Console','app.logout':'Sign out','app.loading':'Loading…',
 'app.load_failed':'Load failed','app.colon':': ','app.period':'. ','app.retry':'Retry',
@@ -270,7 +304,40 @@ const I18N={zh:{
 'set.upd_restart_note':'The service will be briefly interrupted during the restart; the page will refresh automatically once the new version is up.',
 'set.upd_restart_confirm':'Restart the server now to apply {v}? Active connections will be interrupted.',
 'set.upd_restart_failed':'Restart failed','set.upd_restarting':'Restarting… waiting for the new version to respond, then refreshing automatically.',
-'set.upd_timeout':'Timed out waiting; the service may not have recovered automatically. Check whether the server is running (start hbbs manually if you run it directly), then refresh the page.'
+'set.upd_timeout':'Timed out waiting; the service may not have recovered automatically. Check whether the server is running (start hbbs manually if you run it directly), then refresh the page.',
+'relay.regpage.title':'Relay Node Registration','relay.regpage.valid':'This registration link is valid. Run the following command in the relay installation directory to complete registration.',
+'relay.regpage.used':'This registration link has already been used. Please generate a new one in the console.',
+'relay.regpage.expired':'This registration link has expired. Please generate a new one in the console.',
+'relay.regpage.invalid':'This registration link is invalid. Check the link, or generate a new one in the console.',
+'relay.regpage.cmd_hint':'On the relay host, enter the directory containing relay-agent and hbbr, then run:',
+'relay.regpage.copy':'Copy command','relay.regpage.copied':'Copied',
+'relay.regpage.warn':'This link contains a registration secret — treat it as a credential. It expires once registration completes; do not forward or publish it.',
+'relay.regpage.win_hint':'On Windows, run the same command in the directory containing relay-agent.exe (PowerShell or cmd).',
+'relay.title':'Relay Nodes','relay.badge':'Relay',
+'relay.desc':'Relay nodes are managed by a resident agent (relay-agent): after registration the agent heartbeats every 20 s, and configuration pushed from the console is returned encrypted in the heartbeat response. Note: registration only establishes management; it does not add the node to the relay rotation list — rotation is still decided by the server startup parameter RELAY_SERVERS.',
+'relay.label':'Label (optional)','relay.label_ph':'e.g. Hong Kong relay','relay.expires':'Validity (hours, 1–168)',
+'relay.gen':'Generate registration link','relay.gen_fail':'Failed to generate',
+'relay.link_once':'The registration link is shown only once — copy it now and keep it safe:',
+'relay.link_expires':'Valid until ','relay.cmd_label':'Run on the relay host:',
+'relay.links_title':'Unused registration links','relay.links_empty':'No unused registration links',
+'relay.links_created':'Created','relay.links_expires':'Expires','relay.links_used':'Used',
+'relay.links_revoke':'Revoke','relay.links_revoke_confirm':'Revoke this registration link?',
+'relay.empty':'No relay nodes yet','relay.node':'Node','relay.status':'Status','relay.address':'Address',
+'relay.last_ip':'Last source IP','relay.agent_ver':'Agent version','relay.hbbr_ver':'hbbr version',
+'relay.hbbr_running':'hbbr running','relay.hbbr_down':'hbbr not running','relay.started_at':'hbbr started at',
+'relay.last_hb':'Last heartbeat','relay.sessions':'Sessions','relay.throughput':'Throughput',
+'relay.key_done':'Key delivered','relay.key_pending':'Key not delivered','relay.cfg_ver':'Config version',
+'relay.pending_cmd':'Pending command','relay.detail_back':'← Back to node list','relay.cfg_title':'Push configuration',
+'relay.port':'Listen port','relay.limit_speed':'Speed limit LIMIT_SPEED (Mb/s)',
+'relay.limit_total':'Total bandwidth TOTAL_BANDWIDTH (Mb/s)','relay.limit_single':'Per-connection bandwidth SINGLE_BANDWIDTH (Mb/s)',
+'relay.default_hint':'Leave empty for the hbbr default (32 / 1024 / 128)','relay.push':'Push configuration',
+'relay.push_ok':'Configuration pushed; it takes effect at the next heartbeat (within 20 s).','relay.push_fail':'Failed to push',
+'relay.restart':'Restart hbbr','relay.restart_confirm':'Restart hbbr on this node? Active relay sessions on the node will drop.',
+'relay.restart_ok':'Restart command queued; it runs at the next heartbeat.','relay.delete':'Delete node',
+'relay.delete_confirm':'Delete node {n}? Its credential is revoked immediately and the agent stops heartbeating (hbbr itself keeps running — stop it on the relay host if needed).',
+'relay.load_fail':'Failed to load relay nodes','relay.online':'● Online','relay.offline':'● Offline',
+'relay.unknown_time':'Unknown','relay.never':'Never',
+'relay.port_change_note':'Changing the port restarts hbbr (sessions drop); changing only the limits applies live without a restart.'
 }};
 function curLang(){try{const l=localStorage.getItem('rdp-lang');return l==='en'?'en':'zh';}catch(e){return 'zh';}}
 function t(k){const d=I18N[curLang()]||I18N.zh;if(d[k]!=null)return d[k];if(I18N.zh[k]!=null)return I18N.zh[k];return k;}
@@ -430,6 +497,59 @@ pub fn oidc_success_page() -> String {
     )
 }
 
+/// Landing page for a relay registration link. The link itself is
+/// the credential (one-time token + link key in the URL), so the
+/// page never logs or echoes the token/key — it only shows the
+/// link's validity and the exact command to run on the relay host
+/// (built in JS from location.href).
+pub fn relay_register_page_html(status: &str) -> String {
+    let (key, fallback) = match status {
+        "valid" => (
+            "relay.regpage.valid",
+            "注册链接有效。在中继机器的安装目录下运行以下命令完成注册。",
+        ),
+        "used" => (
+            "relay.regpage.used",
+            "此注册链接已被使用。请在控制台重新生成一个注册链接。",
+        ),
+        "expired" => (
+            "relay.regpage.expired",
+            "此注册链接已过期。请在控制台重新生成一个注册链接。",
+        ),
+        _ => (
+            "relay.regpage.invalid",
+            "注册链接无效。请检查链接是否完整，或在控制台重新生成。",
+        ),
+    };
+    let cls = if status == "valid" { "ok" } else { "err" };
+    let cmd_block = if status == "valid" {
+        r#"<p class="muted" data-i18n="relay.regpage.cmd_hint">在中继机器上，进入 relay-agent 与 hbbr 所在目录，运行：</p>
+<pre id="cmd" class="changelog"></pre>
+<p><button type="button" id="copybtn" data-i18n="relay.regpage.copy">复制命令</button></p>
+<p class="muted" data-i18n="relay.regpage.warn">此链接含注册密钥，相当于凭证：注册完成后即失效，请勿转发或公开。</p>
+<p class="muted" data-i18n="relay.regpage.win_hint">Windows 上同样在 relay-agent.exe 所在目录运行此命令（PowerShell 或 cmd）。</p>"#
+    } else {
+        ""
+    };
+    let mut body = format!(
+        r#"<div class="center"><div class="langrow"><button type="button" class="langbtn ghost" data-lang="zh">中文</button><button type="button" class="langbtn ghost" data-lang="en">English</button></div><div class="card"><h1 data-i18n="relay.regpage.title">中继节点注册</h1>
+<p class="{cls}" data-i18n="{key}">{fallback}</p>
+{cmd_block}
+</div></div>"#
+    );
+    body.push_str(
+        r#"<script>
+window.__pageTitleKey='relay.regpage.title';
+var c=document.getElementById('cmd');
+if(c){c.textContent='relay-agent register --link '+location.href;}
+var b=document.getElementById('copybtn');
+if(b){b.onclick=function(){var t=document.getElementById('cmd').textContent;function done(){b.textContent=t('relay.regpage.copied');setTimeout(function(){applyI18n();},2000);}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(done).catch(function(){fb();});}else{fb();}function fb(){var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');}catch(e){}document.body.removeChild(ta);done();}};}
+applyI18n();
+</script>"#,
+    );
+    page("中继节点注册", &body)
+}
+
 pub fn console_page() -> String {
     page("RustDesk 服务控制台", CONSOLE_BODY)
 }
@@ -465,6 +585,17 @@ const CONSOLE_BODY: &str = r#"
 <div class="card"><h2 data-i18n="dev.title">设备</h2>
 <p class="muted"><button class="ghost" id="dev-refresh" data-i18n="dev.refresh">刷新</button> <span id="dev-updated"></span></p>
 <div id="dev-list" data-i18n="app.loading">加载中…</div></div>
+<div class="card adminonly" id="relay-card"><h2 data-i18n="relay.title">中继节点</h2>
+<p class="muted" data-i18n="relay.desc">中继节点由常驻代理（relay-agent）管理：代理注册后每 20 秒心跳上报状态，控制台下发的配置随心跳响应加密回传。注意：注册只建立管理关系，不会自动把节点加入中继轮询列表——轮询列表仍由服务器启动参数 RELAY_SERVERS 决定。</p>
+<div class="err" id="relay-err"></div>
+<label data-i18n="relay.label">备注（可选）</label><input id="relay-label" placeholder="如：香港中继" data-i18n-ph="relay.label_ph">
+<label data-i18n="relay.expires">有效期（小时，1–168）</label><input id="relay-hours" type="number" value="24" min="1" max="168">
+<button id="relay-gen" data-i18n="relay.gen">生成注册链接</button>
+<div id="relay-new" style="margin-top:12px"></div>
+<div id="relay-list" style="margin-top:12px" data-i18n="app.loading">加载中…</div>
+<h2 style="margin-top:20px" data-i18n="relay.links_title">待使用的注册链接</h2>
+<div id="relay-links" data-i18n="app.loading">加载中…</div></div>
+<div class="card" id="relay-detail-card" style="display:none"><div id="relay-detail"></div></div>
 </section>
 
 <section id="s-users">
@@ -568,6 +699,7 @@ window.__onLangChange=()=>{
   if(s==='overview')loadOverview(); if(s==='devices')loadDevices();
   if(s==='users')loadUsers(); if(s==='tokens')loadTokens();
   if(s==='genclient'){loadGen();loadCfg();loadDl();} if(s==='settings')loadSettings();
+  if(RELAY_DETAIL_ID)showRelay(RELAY_DETAIL_ID);
 };
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');
@@ -590,9 +722,103 @@ async function loadDevices(){
   let j; try{ j=await api('/api/devices'); }catch(e){ if(e.message!=='unauth')loadFail($('dev-list'),'loadDevices'); return; }
   if(!j.ok){ loadFail($('dev-list'),'loadDevices',j.error); return; }
   $('dev-updated').textContent=t('dev.updated')+new Date().toLocaleTimeString();
-  if(!j.devices.length){$('dev-list').innerHTML='<p class="muted">'+t('dev.empty')+'</p>';return;}
-  $('dev-list').innerHTML='<table><tr><th>'+t('dev.id')+'</th><th>'+t('dev.status')+'</th><th>'+t('dev.hostname')+'</th><th>'+t('dev.os')+'</th><th>'+t('dev.owner')+'</th><th>'+t('dev.version')+'</th><th>'+t('dev.last_seen')+'</th></tr>'+
-    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">'+t('dev.online')+'</span>':'<span class="muted">'+t('dev.offline')+'</span>'}</td><td>${esc(d.hostname||'')}</td><td>${esc(d.os||'')}</td><td>${d.username?esc(d.username):'<span class=muted>'+t('dev.unbound')+'</span>'}</td><td>${esc(d.version||'')}</td><td>${new Date(d.last_seen*1000).toLocaleString()}</td></tr>`).join('')+'</table>';
+  if(!j.devices.length){$('dev-list').innerHTML='<p class="muted">'+t('dev.empty')+'</p>';}
+  else{$('dev-list').innerHTML='<table><tr><th>'+t('dev.id')+'</th><th>'+t('dev.status')+'</th><th>'+t('dev.hostname')+'</th><th>'+t('dev.os')+'</th><th>'+t('dev.owner')+'</th><th>'+t('dev.version')+'</th><th>'+t('dev.last_seen')+'</th></tr>'+
+    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">'+t('dev.online')+'</span>':'<span class="muted">'+t('dev.offline')+'</span>'}</td><td>${esc(d.hostname||'')}</td><td>${esc(d.os||'')}</td><td>${d.username?esc(d.username):'<span class=muted>'+t('dev.unbound')+'</span>'}</td><td>${esc(d.version||'')}</td><td>${new Date(d.last_seen*1000).toLocaleString()}</td></tr>`).join('')+'</table>';}
+  renderRelays(j.relays||[]);
+  if(ME&&ME.is_admin)loadRelayLinks();
+}
+let RELAYS=[];
+function renderRelays(relays){
+  if(!ME||!ME.is_admin)return;
+  RELAYS=relays;
+  const el=$('relay-list'); if(!el)return;
+  if(!relays.length){el.innerHTML='<p class="muted">'+t('relay.empty')+'</p>';return;}
+  el.innerHTML='<table><tr><th>'+t('relay.node')+'</th><th>'+t('relay.status')+'</th><th>'+t('relay.address')+'</th><th>'+t('relay.port')+'</th><th>'+t('relay.sessions')+'</th><th>'+t('relay.throughput')+'</th><th>'+t('relay.last_hb')+'</th></tr>'+
+    relays.map(r=>`<tr><td><a href="javascript:void(0)" onclick="showRelay(${r.id})">${esc(r.name)}</a><span class="badge">${t('relay.badge')}</span></td><td>${r.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>'}</td><td>${esc(r.address||r.last_ip||'')}</td><td>${r.listen_port||'-'}</td><td>${r.sessions}</td><td>${r.total_kbps} kb/s</td><td>${r.last_heartbeat?new Date(r.last_heartbeat*1000).toLocaleString():t('relay.never')}</td></tr>`).join('')+'</table>';
+}
+async function loadRelayLinks(){
+  let j; try{ j=await api('/api/admin/relays/reg-tokens'); }catch(e){ if(e.message!=='unauth')$('relay-links').innerHTML='<p class="err">'+t('relay.load_fail')+'</p>'; return; }
+  if(!j.ok){ $('relay-links').innerHTML='<p class="err">'+esc(j.error||t('relay.load_fail'))+'</p>'; return; }
+  const open=j.tokens.filter(x=>!x.used_at);
+  if(!open.length){$('relay-links').innerHTML='<p class="muted">'+t('relay.links_empty')+'</p>';return;}
+  $('relay-links').innerHTML='<table><tr><th>'+t('relay.label')+'</th><th>'+t('relay.links_created')+'</th><th>'+t('relay.links_expires')+'</th><th></th></tr>'+
+    open.map(x=>`<tr><td>${esc(x.label||x.token_id.slice(0,8))}</td><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${new Date(x.expires_at*1000).toLocaleString()}</td><td><button class="danger" onclick="relayRevokeLink('${esc(x.token_id)}')">${t('relay.links_revoke')}</button></td></tr>`).join('')+'</table>';
+}
+async function relayRevokeLink(tokenId){
+  if(!confirm(t('relay.links_revoke_confirm')))return;
+  const j=await api('/api/admin/relays/reg-tokens/'+encodeURIComponent(tokenId),{method:'DELETE'});
+  if(j.ok)loadRelayLinks(); else alert(j.error||t('app.op_failed'));
+}
+$('relay-gen').onclick=async()=>{
+  const btn=$('relay-gen'); if(btn.disabled)return; btn.disabled=true;
+  try{
+    const hours=parseInt($('relay-hours').value,10)||24;
+    const j=await api('/api/admin/relays/reg-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:$('relay-label').value,expires_hours:Math.max(1,Math.min(168,hours))})});
+    if(j.ok){
+      $('relay-err').textContent='';
+      const cmd='relay-agent register --link '+j.link;
+      $('relay-new').innerHTML='<p class="ok">'+t('relay.link_once')+'</p><div class="dl" style="margin-top:6px"><input readonly value="'+esc(j.link)+'"><button class="ghost" onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">'+t('app.copy')+'</button></div><p class="muted">'+t('relay.link_expires')+new Date(j.expires_at*1000).toLocaleString()+'</p><p class="muted">'+t('relay.cmd_label')+'</p><div class="dl"><input readonly value="'+esc(cmd)+'"><button class="ghost" onclick="copyText(this.closest(\'.dl\').querySelector(\'input\').value,this)">'+t('app.copy')+'</button></div>';
+      loadRelayLinks();
+    }else{$('relay-err').textContent=j.error||t('relay.gen_fail');}
+  }catch(e){ if(e.message!=='unauth')$('relay-err').textContent=t('app.network_err'); }
+  btn.disabled=false;
+};
+let RELAY_DETAIL_ID=null;
+let RELAY_DETAIL_NAME='';
+async function showRelay(id){
+  let j; try{ j=await api('/api/admin/relays/'+id); }catch(e){ if(e.message!=='unauth')alert(t('relay.load_fail')); return; }
+  if(!j.ok){ alert(j.error||t('relay.load_fail')); return; }
+  RELAY_DETAIL_ID=id;
+  RELAY_DETAIL_NAME=j.node.name||'';
+  const n=j.node, cfg=n.config||{};
+  const lim=v=>(v==null?'':v);
+  $('relay-detail').innerHTML='<p><button class="ghost" onclick="backRelay()">'+t('relay.detail_back')+'</button></p>'+
+    '<h2>'+esc(n.name)+'<span class="badge">'+t('relay.badge')+'</span></h2>'+
+    '<table><tr><th>'+t('relay.status')+'</th><td>'+(n.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>')+'</td></tr>'+
+    '<tr><th>'+t('relay.address')+'</th><td>'+esc(n.address||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.last_ip')+'</th><td>'+esc(n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.agent_ver')+'</th><td>'+esc(n.agent_version||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.hbbr_ver')+'</th><td>'+esc(n.hbbr_version||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.hbbr_running')+'</th><td>'+(n.hbbr_running?'<span class="ok">'+t('relay.hbbr_running')+'</span>':'<span class="muted">'+t('relay.hbbr_down')+'</span>')+'</td></tr>'+
+    '<tr><th>'+t('relay.started_at')+'</th><td>'+(n.hbbr_started_at?new Date(n.hbbr_started_at*1000).toLocaleString():t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.last_hb')+'</th><td>'+(n.last_heartbeat?new Date(n.last_heartbeat*1000).toLocaleString():t('relay.never'))+'</td></tr>'+
+    '<tr><th>'+t('relay.sessions')+'</th><td>'+n.sessions+'</td></tr>'+
+    '<tr><th>'+t('relay.throughput')+'</th><td>'+n.total_kbps+' kb/s</td></tr>'+
+    '<tr><th>'+t('relay.key_done')+'</th><td>'+(n.key_delivered?'<span class="ok">'+t('relay.key_done')+'</span>':'<span class="muted">'+t('relay.key_pending')+'</span>')+'</td></tr>'+
+    '<tr><th>'+t('relay.cfg_ver')+'</th><td>'+n.applied_version+' / '+n.config_version+'</td></tr>'+
+    '<tr><th>'+t('relay.pending_cmd')+'</th><td>'+esc(n.pending_command||'-')+'</td></tr></table>'+
+    '<h2 style="margin-top:20px">'+t('relay.cfg_title')+'</h2>'+
+    '<p class="muted">'+t('relay.port_change_note')+'</p><div class="err" id="relay-cfg-err"></div><div class="ok" id="relay-cfg-ok"></div>'+
+    '<label>'+t('relay.port')+'</label><input id="rcfg-port" type="number" value="'+(cfg.port||21117)+'">'+
+    '<label>'+t('relay.limit_speed')+'</label><input id="rcfg-ls" type="number" step="any" min="0" value="'+lim(cfg.limit_speed)+'" placeholder="'+t('relay.default_hint')+'">'+
+    '<label>'+t('relay.limit_total')+'</label><input id="rcfg-tb" type="number" step="any" min="0" value="'+lim(cfg.total_bandwidth)+'" placeholder="'+t('relay.default_hint')+'">'+
+    '<label>'+t('relay.limit_single')+'</label><input id="rcfg-sb" type="number" step="any" min="0" value="'+lim(cfg.single_bandwidth)+'" placeholder="'+t('relay.default_hint')+'">'+
+    '<p><button id="rcfg-push" onclick="relayPushCfg('+n.id+')">'+t('relay.push')+'</button> '+
+    '<button class="ghost" onclick="relayRestart('+n.id+')">'+t('relay.restart')+'</button> '+
+    '<button class="danger" onclick="relayDelete('+n.id+')">'+t('relay.delete')+'</button></p>';
+  $('relay-detail-card').style.display='';
+  $('relay-detail-card').scrollIntoView({behavior:'smooth'});
+}
+function backRelay(){ RELAY_DETAIL_ID=null; RELAY_DETAIL_NAME=''; $('relay-detail-card').style.display='none'; }
+async function relayPushCfg(id){
+  const btn=$('rcfg-push'); if(btn.disabled)return; btn.disabled=true;
+  const num=v=>{const s=String(v).trim(); if(!s)return null; const n=parseFloat(s); return isNaN(n)?null:n;};
+  try{
+    const j=await api('/api/admin/relays/'+id+'/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:parseInt($('rcfg-port').value,10),limit_speed:num($('rcfg-ls').value),total_bandwidth:num($('rcfg-tb').value),single_bandwidth:num($('rcfg-sb').value)})});
+    if(j.ok){$('relay-cfg-err').textContent='';$('relay-cfg-ok').textContent=t('relay.push_ok');showRelay(id);}else{$('relay-cfg-ok').textContent='';$('relay-cfg-err').textContent=j.error||t('relay.push_fail');}
+  }catch(e){ if(e.message!=='unauth')$('relay-cfg-err').textContent=t('app.network_err'); }
+  btn.disabled=false;
+}
+async function relayRestart(id){
+  if(!confirm(t('relay.restart_confirm')))return;
+  const j=await api('/api/admin/relays/'+id+'/restart',{method:'POST'});
+  if(j.ok){alert(t('relay.restart_ok'));showRelay(id);}else alert(j.error||t('app.op_failed'));
+}
+async function relayDelete(id){
+  if(!confirm(t('relay.delete_confirm').replace('{n}',RELAY_DETAIL_NAME)))return;
+  const j=await api('/api/admin/relays/'+id,{method:'DELETE'});
+  if(j.ok){backRelay();loadDevices();}else alert(j.error||t('app.op_failed'));
 }
 let USERS=[];
 async function loadUsers(){

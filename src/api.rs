@@ -14,6 +14,10 @@
 //! Started from main.rs on `--api-listen` (default 0.0.0.0:21114).
 
 use crate::api_pages;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use axum::{
     body::Body,
     extract::{ConnectInfo, Extension, Form, Path, Query},
@@ -23,7 +27,9 @@ use axum::{
     Router,
 };
 use hbb_common::{anyhow, log, tokio, ResultType};
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     ConnectOptions as _, Row, SqlitePool,
@@ -56,6 +62,14 @@ pub struct ApiState {
     /// they are computed per request from the current github_mirror
     /// setting, so an admin's mirror change takes effect immediately.
     dl_cache: std::sync::Mutex<Option<(std::time::Instant, String, Vec<ClientDownload>)>>,
+    /// Outstanding relay registration challenges: nonce_hex ->
+    /// (token_id, expires_at_unix). A challenge is consumed on its
+    /// first verification attempt and expires after 5 minutes.
+    reg_challenges: std::sync::Mutex<HashMap<String, (String, i64)>>,
+    /// Recently seen relay heartbeat nonces for replay rejection:
+    /// (node_id, nonce_hex) -> seen_at_unix. Entries older than 10
+    /// minutes are pruned on each heartbeat.
+    hb_replay: std::sync::Mutex<HashMap<(i64, String), i64>>,
 }
 
 /// Progress state of the background official-client template download.
@@ -75,7 +89,7 @@ pub struct TplJob {
 /// NOTE: this deliberately does NOT live in version.rs — build.rs
 /// regenerates that file on every build (see hbb_common::gen_version)
 /// and would wipe a hand-written constant.
-const PRO_VERSION: &str = "35";
+const PRO_VERSION: &str = "36";
 
 /// Progress state of the background one-click server update download.
 #[derive(Default)]
@@ -361,6 +375,8 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "create table if not exists gen_clients(id integer primary key autoincrement, filename text not null, token text not null, label text not null default '', created_by text not null, created_at integer not null)",
         "create table if not exists ab_store(username text primary key, data text not null)",
         "create table if not exists captcha_codes(id text primary key, code_hash text not null, expires_at integer not null)",
+        "create table if not exists relay_reg_tokens(token_id text primary key, link_key text not null, label text not null default '', created_by text not null, created_at integer not null, expires_at integer not null, used_at integer, used_by integer)",
+        "create table if not exists relay_nodes(id integer primary key autoincrement, name text not null, address text not null default '', last_ip text not null default '', link_key text not null, key_delivered integer not null default 0, registered_at integer not null, last_heartbeat integer not null default 0, agent_version text not null default '', hbbr_version text not null default '', hbbr_running integer not null default 0, hbbr_started_at integer not null default 0, listen_port integer not null default 0, sessions integer not null default 0, total_kbps integer not null default 0, config_json text not null default '{}', config_version integer not null default 1, applied_version integer not null default 0, pending_command text not null default '', created_by text not null default '')",
     ];
     for s in stmts {
         sqlx::query(s)
@@ -1749,7 +1765,25 @@ async fn devices_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMa
             })
         })
         .collect();
-    jresp(StatusCode::OK, json!({ "ok": true, "now": now(), "devices": devices }))
+    // Relay nodes (admin only) ride along so the device list can
+    // show them with a relay badge. The shape matches relays_list
+    // items; link keys are never included.
+    let t = now();
+    let relays: Vec<Value> = if u.is_admin {
+        match sqlx::query("select * from relay_nodes order by id desc")
+            .fetch_all(&st.pool)
+            .await
+        {
+            Ok(rs) => rs.iter().map(|r| relay_node_summary(r, t)).collect(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    jresp(
+        StatusCode::OK,
+        json!({ "ok": true, "now": t, "devices": devices, "relays": relays }),
+    )
 }
 
 async fn tokens_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMap) -> Response {
@@ -3723,6 +3757,905 @@ async fn console_home(
     }
 }
 
+// ------------------------------ relay nodes ------------------------------
+// Managed relay nodes (v36): a relay host runs a small resident agent
+// (relay-agent, Go) that registers with a one-time link, heartbeats
+// every 20 s, and applies configuration pushed from the console.
+// hbbr itself never talks to hbbs, so the agent is the management
+// channel. Registration manages nodes; it does NOT add them to the
+// relay-selection list (--relay-servers stays the only source of
+// rotation — see DEPLOY.md).
+//
+// Trust model (deliberate, see DEPLOY.md): the registration link
+// carries a random 32-byte symmetric key (the "link key"). The key
+// itself NEVER crosses the wire: registration proves possession with
+// an HMAC over a server-issued challenge, heartbeats are
+// encrypt-then-MAC (AES-256-GCM + HMAC-SHA256, per-message nonce,
+// timestamp + nonce replay protection), and the server keypair +
+// all pushed config travel only inside AEAD bundles sealed with the
+// link key. This defeats passive eavesdropping on plain HTTP; an
+// active MITM can only deny service or corrupt messages (both are
+// detected: AEAD authentication fails and the agent refuses to
+// apply). The link itself is the credential: one-time, 24 h expiry,
+// shown once — whoever holds an unused link can register a node and
+// receive the server keypair. TLS on the API listener closes even
+// the residual tampering window.
+
+const RELAY_CHALLENGE_TTL_SECS: i64 = 300;
+const RELAY_HEARTBEAT_TS_WINDOW_SECS: i64 = 300;
+const RELAY_HEARTBEAT_REPLAY_TTL_SECS: i64 = 600;
+const RELAY_ONLINE_THRESHOLD_SECS: i64 = 90;
+const RELAY_REG_TOKEN_DEFAULT_TTL_HOURS: i64 = 24;
+const RELAY_REG_TOKEN_MAX_TTL_HOURS: i64 = 168;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char).to_digit(16)?;
+        let lo = (b[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// Public identifier of a registration grant: the first 16 hex chars
+/// of SHA-256(token). The token itself is never sent; the agent
+/// derives this from the link, the server from the stored grant.
+fn relay_token_id(token: &str) -> String {
+    sha256_hex(token.as_bytes()).chars().take(16).collect()
+}
+
+fn relay_hmac_hex(key: &[u8], msg: &str) -> Option<String> {
+    // Fully qualified: KeyInit (aes-gcm) and Mac both define
+    // new_from_slice for Hmac.
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).ok()?;
+    mac.update(msg.as_bytes());
+    Some(hex_encode(&mac.finalize().into_bytes()))
+}
+
+/// Constant-time HMAC verification (via the hmac crate's verify).
+fn relay_hmac_verify(key: &[u8], msg: &str, sig_hex: &str) -> bool {
+    let sig = match hex_decode(sig_hex) {
+        Some(s) => s,
+        None => return false,
+    };
+    match <Hmac<Sha256> as Mac>::new_from_slice(key) {
+        Ok(mut mac) => {
+            mac.update(msg.as_bytes());
+            mac.verify_slice(&sig).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Seal with AES-256-GCM under the link key; returns
+/// (nonce_hex, ciphertext_hex). One fresh random nonce per message.
+fn relay_seal(key: &[u8], plaintext: &[u8]) -> Option<(String, String)> {
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    let nonce_bytes: [u8; 12] =
+        sodiumoxide::randombytes::randombytes(12).try_into().ok()?;
+    let nonce = Nonce::from(nonce_bytes);
+    let ct = cipher.encrypt(&nonce, plaintext).ok()?;
+    Some((hex_encode(&nonce_bytes), hex_encode(&ct)))
+}
+
+fn relay_open(key: &[u8], nonce_hex: &str, data_hex: &str) -> Option<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    let nonce_bytes: [u8; 12] = hex_decode(nonce_hex)?.try_into().ok()?;
+    let data = hex_decode(data_hex)?;
+    let nonce = Nonce::from(nonce_bytes);
+    cipher.decrypt(&nonce, data.as_ref()).ok()
+}
+
+/// Exact message the agent signs for registration (challenge-
+/// response). Byte-identical construction on both sides; keep in
+/// sync with relay-agent (Go).
+fn relay_register_proof_msg(
+    token_id: &str,
+    nonce: &str,
+    name: &str,
+    agent_version: &str,
+    address: &str,
+) -> String {
+    format!("relay-register-v1\n{token_id}\n{nonce}\n{name}\n{agent_version}\n{address}")
+}
+
+/// Exact message the agent signs for each heartbeat (over the
+/// encrypted bundle: encrypt-then-MAC). Keep in sync with
+/// relay-agent (Go).
+fn relay_heartbeat_sig_msg(
+    node_id: i64,
+    ts: i64,
+    nonce: &str,
+    bundle_nonce: &str,
+    bundle_data: &str,
+) -> String {
+    format!("relay-heartbeat-v1\n{node_id}\n{ts}\n{nonce}\n{bundle_nonce}\n{bundle_data}")
+}
+
+/// Default relay config: stock hbbr port, no explicit limits (null =
+/// hbbr built-in defaults: 32 / 1024 / 128 Mb/s).
+fn relay_default_config() -> Value {
+    json!({"port": 21117, "limit_speed": null, "total_bandwidth": null, "single_bandwidth": null})
+}
+
+/// Validate + normalize an admin-submitted relay config. Limits are
+/// Mb/s; null (or missing) means "hbbr default".
+fn parse_relay_config(v: &Value) -> Result<Value, String> {
+    let port = v
+        .get("port")
+        .and_then(|x| x.as_i64())
+        .ok_or_else(|| "端口必须是 1-65535 的整数".to_string())?;
+    if !(1..=65535).contains(&port) {
+        return Err("端口必须是 1-65535 的整数".into());
+    }
+    let limit = |key: &str| -> Result<Value, String> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(Value::Null),
+            Some(x) => {
+                // 0 is not a usable value: hbbr ignores 0 on both the
+                // console and the env var (keeps the current value),
+                // so it would only produce a verify mismatch. Use
+                // null (empty) for "hbbr default".
+                let n = x
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n > 0.0)
+                    .ok_or_else(|| format!("{key} 必须大于 0 的数字，留空表示默认值"))?;
+                Ok(json!(n))
+            }
+        }
+    };
+    let limit_speed = limit("limit_speed")?;
+    let total_bandwidth = limit("total_bandwidth")?;
+    let single_bandwidth = limit("single_bandwidth")?;
+    Ok(json!({
+        "port": port,
+        "limit_speed": limit_speed,
+        "total_bandwidth": total_bandwidth,
+        "single_bandwidth": single_bandwidth,
+    }))
+}
+
+/// The server keypair as file contents (private, public), for
+/// encrypted distribution to a registering relay. Normal case: the
+/// id_ed25519 files in the server directory. Fallback: the server
+/// was started with -k <base64 private key> and has no files — the
+/// override itself is the private key, and the public key is its
+/// second half. A public-key-only override has no private key to
+/// distribute and fails here.
+async fn server_keypair(st: &ApiState) -> Result<(String, String), String> {
+    if let (Ok(sk), Ok(pk)) = (
+        tokio::fs::read_to_string("id_ed25519").await,
+        tokio::fs::read_to_string("id_ed25519.pub").await,
+    ) {
+        let sk = sk.trim().to_string();
+        let pk = pk.trim().to_string();
+        if !sk.is_empty() && !pk.is_empty() {
+            if let Ok(raw) = base64::decode(&sk) {
+                if raw.len() == 64 {
+                    return Ok((sk, pk));
+                }
+            }
+        }
+    }
+    let ov = st.key_override.trim();
+    if !ov.is_empty() && ov != "-" {
+        if let Ok(raw) = base64::decode(ov) {
+            if raw.len() == 64 {
+                let pk = base64::encode_config(&raw[32..], base64::STANDARD);
+                return Ok((ov.to_string(), pk));
+            }
+        }
+    }
+    Err("服务器密钥文件不存在，无法下发密钥（请确认服务端目录下有 id_ed25519 文件）".into())
+}
+
+fn relay_node_summary(r: &sqlx::sqlite::SqliteRow, now_ts: i64) -> Value {
+    let last_hb = r.try_get::<i64, _>("last_heartbeat").unwrap_or(0);
+    json!({
+        "id": r.try_get::<i64, _>("id").unwrap_or(0),
+        "name": r.try_get::<String, _>("name").unwrap_or_default(),
+        "address": r.try_get::<String, _>("address").unwrap_or_default(),
+        "last_ip": r.try_get::<String, _>("last_ip").unwrap_or_default(),
+        "key_delivered": r.try_get::<i64, _>("key_delivered").unwrap_or(0) != 0,
+        "registered_at": r.try_get::<i64, _>("registered_at").unwrap_or(0),
+        "last_heartbeat": last_hb,
+        "online": last_hb > 0 && now_ts - last_hb < RELAY_ONLINE_THRESHOLD_SECS,
+        "agent_version": r.try_get::<String, _>("agent_version").unwrap_or_default(),
+        "hbbr_version": r.try_get::<String, _>("hbbr_version").unwrap_or_default(),
+        "hbbr_running": r.try_get::<i64, _>("hbbr_running").unwrap_or(0) != 0,
+        "hbbr_started_at": r.try_get::<i64, _>("hbbr_started_at").unwrap_or(0),
+        "listen_port": r.try_get::<i64, _>("listen_port").unwrap_or(0),
+        "sessions": r.try_get::<i64, _>("sessions").unwrap_or(0),
+        "total_kbps": r.try_get::<i64, _>("total_kbps").unwrap_or(0),
+        "config_version": r.try_get::<i64, _>("config_version").unwrap_or(1),
+        "applied_version": r.try_get::<i64, _>("applied_version").unwrap_or(0),
+        "pending_command": r.try_get::<String, _>("pending_command").unwrap_or_default(),
+    })
+}
+
+/// Generic registration failure: deliberately does not distinguish
+/// unknown / used / expired, so a bad link gives no oracle.
+fn relay_reg_invalid() -> Response {
+    jresp(
+        StatusCode::OK,
+        json!({ "ok": false, "error": "注册链接无效、已使用或已过期" }),
+    )
+}
+
+/// Step 1 of registration: issue a one-time challenge nonce for a
+/// registration grant. The nonce is consumed on first verification.
+async fn relay_challenge(
+    Extension(st): Extension<Arc<ApiState>>,
+    body: String,
+) -> Response {
+    let v = parse_body(&body);
+    let token_id = sfield(&v, "token_id");
+    if token_id.len() != 16 || !token_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return relay_reg_invalid();
+    }
+    let t = now();
+    if let Ok(mut m) = st.reg_challenges.lock() {
+        m.retain(|_, (_, exp)| *exp > t);
+        if m.len() >= 4096 {
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": "服务繁忙，请稍后重试" }),
+            );
+        }
+    }
+    let row = sqlx::query(
+        "select used_at, expires_at from relay_reg_tokens where token_id=?",
+    )
+    .bind(&token_id)
+    .fetch_optional(&st.pool)
+    .await;
+    let (used_at, expires_at) = match row {
+        Ok(Some(r)) => (
+            r.try_get::<Option<i64>, _>("used_at").ok().flatten(),
+            r.try_get::<i64, _>("expires_at").unwrap_or(0),
+        ),
+        _ => return relay_reg_invalid(),
+    };
+    if used_at.is_some() || expires_at <= t {
+        return relay_reg_invalid();
+    }
+    let nonce = hex_encode(&sodiumoxide::randombytes::randombytes(16));
+    if let Ok(mut m) = st.reg_challenges.lock() {
+        m.insert(nonce.clone(), (token_id, t + RELAY_CHALLENGE_TTL_SECS));
+    }
+    jresp(StatusCode::OK, json!({ "ok": true, "nonce": nonce }))
+}
+
+/// Step 2 of registration: verify the HMAC proof, create the node,
+/// and return the server keypair + initial config sealed in an AEAD
+/// bundle. The token and the link key never appear on the wire.
+async fn relay_register(
+    Extension(st): Extension<Arc<ApiState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    body: String,
+) -> Response {
+    let v = parse_body(&body);
+    let token_id = sfield(&v, "token_id");
+    let nonce = sfield(&v, "nonce");
+    let proof = sfield(&v, "proof");
+    let name = sfield(&v, "name");
+    let agent_version = sfield(&v, "agent_version");
+    let address = sfield(&v, "address");
+    // 1. Consume the challenge (one attempt per nonce, whatever the
+    // outcome — a retry must fetch a fresh challenge).
+    let t = now();
+    let challenge_ok = match st.reg_challenges.lock() {
+        Ok(mut m) => {
+            m.retain(|_, (_, exp)| *exp > t);
+            match m.remove(&nonce) {
+                Some((tid, _)) => tid == token_id,
+                None => false,
+            }
+        }
+        Err(_) => false,
+    };
+    if !challenge_ok {
+        return jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "质询已过期或无效，请重新获取" }),
+        );
+    }
+    // 2. Look up the grant.
+    let row = sqlx::query(
+        "select link_key, used_at, expires_at, created_by from relay_reg_tokens where token_id=?",
+    )
+    .bind(&token_id)
+    .fetch_optional(&st.pool)
+    .await;
+    let (link_key_hex, used_at, expires_at, created_by) = match row {
+        Ok(Some(r)) => (
+            r.try_get::<String, _>("link_key").unwrap_or_default(),
+            r.try_get::<Option<i64>, _>("used_at").ok().flatten(),
+            r.try_get::<i64, _>("expires_at").unwrap_or(0),
+            r.try_get::<String, _>("created_by").unwrap_or_default(),
+        ),
+        _ => return relay_reg_invalid(),
+    };
+    if used_at.is_some() || expires_at <= t {
+        return relay_reg_invalid();
+    }
+    // 3. Verify possession of the link key.
+    let link_key = match hex_decode(&link_key_hex) {
+        Some(b) if b.len() == 32 => b,
+        _ => {
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": "注册链接已损坏，请重新生成" }),
+            )
+        }
+    };
+    let msg = relay_register_proof_msg(&token_id, &nonce, &name, &agent_version, &address);
+    if !relay_hmac_verify(&link_key, &msg, &proof) {
+        return jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "注册验证失败" }),
+        );
+    }
+    // 4. Server keypair for the bundle.
+    let (private_key, public_key) = match server_keypair(&st).await {
+        Ok(k) => k,
+        Err(e) => return jresp(StatusCode::OK, json!({ "ok": false, "error": e })),
+    };
+    // 5. Create the node (name defaults to relay-<id> when empty).
+    let name = name.trim().chars().take(64).collect::<String>();
+    let address = address.trim().chars().take(128).collect::<String>();
+    let agent_version = agent_version.chars().take(32).collect::<String>();
+    let last_ip = addr.ip().to_string();
+    let config = relay_default_config();
+    let ins = sqlx::query(
+        "insert into relay_nodes(name, address, last_ip, link_key, key_delivered, registered_at, agent_version, config_json, config_version, created_by) values(?, ?, ?, ?, 1, ?, ?, ?, 1, ?) returning id",
+    )
+    .bind(if name.is_empty() { "relay" } else { &name })
+    .bind(&address)
+    .bind(&last_ip)
+    .bind(&link_key_hex)
+    .bind(t)
+    .bind(&agent_version)
+    .bind(config.to_string())
+    .bind(&created_by)
+    .fetch_one(&st.pool)
+    .await;
+    let node_id = match ins {
+        Ok(r) => r.try_get::<i64, _>("id").unwrap_or(0),
+        Err(e) => {
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": format!("创建节点失败：{e}") }),
+            )
+        }
+    };
+    if node_id <= 0 {
+        return jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "创建节点失败" }),
+        );
+    }
+    if name.is_empty() {
+        let _ = sqlx::query("update relay_nodes set name=? where id=?")
+            .bind(format!("relay-{node_id}"))
+            .bind(node_id)
+            .execute(&st.pool)
+            .await;
+    }
+    // 6. Seal the bundle BEFORE consuming the grant: if sealing ever
+    // fails, the node row is dropped and the link stays usable.
+    let bundle_plain = json!({
+        "node_id": node_id,
+        "private_key": private_key,
+        "public_key": public_key,
+        "config": config,
+        "config_version": 1,
+    });
+    let sealed = relay_seal(&link_key, bundle_plain.to_string().as_bytes());
+    let (bn, bd) = match sealed {
+        Some(x) => x,
+        None => {
+            let _ = sqlx::query("delete from relay_nodes where id=?")
+                .bind(node_id)
+                .execute(&st.pool)
+                .await;
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": "密钥加密失败，请重试" }),
+            );
+        }
+    };
+    // 7. Consume the grant.
+    let _ = sqlx::query("update relay_reg_tokens set used_at=?, used_by=? where token_id=?")
+        .bind(t)
+        .bind(node_id)
+        .bind(&token_id)
+        .execute(&st.pool)
+        .await;
+    jresp(
+        StatusCode::OK,
+        json!({ "ok": true, "bundle": { "nonce": bn, "data": bd } }),
+    )
+}
+
+/// Agent heartbeat: verify the HMAC signature over the encrypted
+/// bundle (encrypt-then-MAC), decrypt the status, update the node,
+/// and return any pending config/command sealed in a fresh bundle.
+/// `revoked: true` tells the agent its node was deleted: stop
+/// heartbeating, keep hbbr running.
+async fn relay_heartbeat(
+    Extension(st): Extension<Arc<ApiState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    body: String,
+) -> Response {
+    let v = parse_body(&body);
+    let node_id = v.get("node_id").and_then(|x| x.as_i64()).unwrap_or(0);
+    let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
+    let nonce = sfield(&v, "nonce");
+    let sig = sfield(&v, "sig");
+    let (b_nonce, b_data) = match v.get("bundle") {
+        Some(b) => (sfield(b, "nonce"), sfield(b, "data")),
+        None => (String::new(), String::new()),
+    };
+    if node_id <= 0
+        || ts <= 0
+        || nonce.is_empty()
+        || sig.is_empty()
+        || b_nonce.is_empty()
+        || b_data.is_empty()
+    {
+        return jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "请求不完整", "revoked": false }),
+        );
+    }
+    let row = sqlx::query(
+        "select link_key, config_json, config_version, pending_command from relay_nodes where id=?",
+    )
+    .bind(node_id)
+    .fetch_optional(&st.pool)
+    .await;
+    let (link_key_hex, config_json, config_version, pending_command) = match row {
+        Ok(Some(r)) => (
+            r.try_get::<String, _>("link_key").unwrap_or_default(),
+            r.try_get::<String, _>("config_json").unwrap_or_default(),
+            r.try_get::<i64, _>("config_version").unwrap_or(1),
+            r.try_get::<String, _>("pending_command").unwrap_or_default(),
+        ),
+        _ => {
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": "节点不存在或已被删除", "revoked": true }),
+            )
+        }
+    };
+    let link_key = match hex_decode(&link_key_hex) {
+        Some(b) if b.len() == 32 => b,
+        _ => {
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": "节点密钥已损坏", "revoked": true }),
+            )
+        }
+    };
+    let t = now();
+    if (t - ts).abs() > RELAY_HEARTBEAT_TS_WINDOW_SECS {
+        return jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "时间戳过期，请校准中继机器时间", "revoked": false }),
+        );
+    }
+    let replayed = match st.hb_replay.lock() {
+        Ok(mut m) => {
+            m.retain(|_, seen| t - *seen < RELAY_HEARTBEAT_REPLAY_TTL_SECS);
+            if m.contains_key(&(node_id, nonce.clone())) {
+                true
+            } else {
+                m.insert((node_id, nonce.clone()), t);
+                false
+            }
+        }
+        Err(_) => false,
+    };
+    if replayed {
+        return jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "重放请求被拒绝", "revoked": false }),
+        );
+    }
+    let msg = relay_heartbeat_sig_msg(node_id, ts, &nonce, &b_nonce, &b_data);
+    if !relay_hmac_verify(&link_key, &msg, &sig) {
+        return jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "签名校验失败", "revoked": false }),
+        );
+    }
+    let plain = match relay_open(&link_key, &b_nonce, &b_data) {
+        Some(p) => p,
+        None => {
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": "数据解密失败", "revoked": false }),
+            )
+        }
+    };
+    let pv: Value = match serde_json::from_slice(&plain) {
+        Ok(p) => p,
+        Err(_) => {
+            return jresp(
+                StatusCode::OK,
+                json!({ "ok": false, "error": "数据格式错误", "revoked": false }),
+            )
+        }
+    };
+    let applied_version = pv.get("applied_version").and_then(|x| x.as_i64()).unwrap_or(0);
+    let command_ack = sfield(&pv, "command_ack");
+    let status = pv.get("status").cloned().unwrap_or(json!({}));
+    let hbbr_running = status
+        .get("hbbr_running")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let hbbr_started_at = status
+        .get("hbbr_started_at")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let hbbr_version = sfield(&status, "hbbr_version")
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let agent_version = sfield(&status, "agent_version")
+        .chars()
+        .take(32)
+        .collect::<String>();
+    let listen_port = status.get("listen_port").and_then(|x| x.as_i64()).unwrap_or(0);
+    let sessions = status.get("sessions").and_then(|x| x.as_i64()).unwrap_or(0);
+    let total_kbps = status.get("total_kbps").and_then(|x| x.as_i64()).unwrap_or(0);
+    let new_pending = if !command_ack.is_empty() && command_ack == pending_command {
+        String::new()
+    } else {
+        pending_command.clone()
+    };
+    let last_ip = addr.ip().to_string();
+    let _ = sqlx::query(
+        "update relay_nodes set last_heartbeat=?, last_ip=?, agent_version=?, hbbr_version=?, hbbr_running=?, hbbr_started_at=?, listen_port=?, sessions=?, total_kbps=?, applied_version=?, pending_command=? where id=?",
+    )
+    .bind(t)
+    .bind(&last_ip)
+    .bind(&agent_version)
+    .bind(&hbbr_version)
+    .bind(if hbbr_running { 1 } else { 0 })
+    .bind(hbbr_started_at)
+    .bind(listen_port)
+    .bind(sessions)
+    .bind(total_kbps)
+    .bind(applied_version)
+    .bind(&new_pending)
+    .bind(node_id)
+    .execute(&st.pool)
+    .await;
+    let need_config = applied_version < config_version;
+    let need_command = !new_pending.is_empty();
+    if !need_config && !need_command {
+        return jresp(StatusCode::OK, json!({ "ok": true, "bundle": null }));
+    }
+    let cfg = if need_config {
+        serde_json::from_str::<Value>(&config_json).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let resp_plain = json!({
+        "config": cfg,
+        "config_version": config_version,
+        "command": if need_command { json!(new_pending) } else { Value::Null },
+    });
+    match relay_seal(&link_key, resp_plain.to_string().as_bytes()) {
+        Some((rn, rd)) => jresp(
+            StatusCode::OK,
+            json!({ "ok": true, "bundle": { "nonce": rn, "data": rd } }),
+        ),
+        None => jresp(
+            StatusCode::OK,
+            json!({ "ok": false, "error": "配置加密失败", "revoked": false }),
+        ),
+    }
+}
+
+/// Browser page for a registration link: shows whether the link is
+/// still valid and the exact command to run on the relay host. The
+/// token/key are never logged; the page reads them from the URL the
+/// admin already holds.
+async fn relay_register_page(
+    Extension(st): Extension<Arc<ApiState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let token = q.get("token").cloned().unwrap_or_default();
+    let status = if token.is_empty() {
+        "missing"
+    } else {
+        let tid = relay_token_id(&token);
+        match sqlx::query("select used_at, expires_at from relay_reg_tokens where token_id=?")
+            .bind(&tid)
+            .fetch_optional(&st.pool)
+            .await
+        {
+            Ok(Some(r)) => {
+                let used = r.try_get::<Option<i64>, _>("used_at").ok().flatten();
+                let exp = r.try_get::<i64, _>("expires_at").unwrap_or(0);
+                if used.is_some() {
+                    "used"
+                } else if exp <= now() {
+                    "expired"
+                } else {
+                    "valid"
+                }
+            }
+            _ => "unknown",
+        }
+    };
+    Html(crate::api_pages::relay_register_page_html(status)).into_response()
+}
+
+async fn relay_admin(
+    st: &ApiState,
+    headers: &HeaderMap,
+) -> Result<AuthUser, Response> {
+    let u = match resolve_user(st, headers).await {
+        Some(u) => u,
+        None => return Err(unauthorized()),
+    };
+    if !u.is_admin {
+        return Err(forbidden());
+    }
+    Ok(u)
+}
+
+/// Generate a registration link (admin only). The link carries a
+/// fresh one-time token AND a fresh 32-byte link key; both are shown
+/// exactly once, in this response. The token hash is never stored —
+/// only its public token_id — because the token itself is never sent
+/// back to the server.
+async fn relays_reg_token_create(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let u = match relay_admin(&st, &headers).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let v = parse_body(&body);
+    let label = sfield(&v, "label").chars().take(64).collect::<String>();
+    let hours = v
+        .get("expires_hours")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(RELAY_REG_TOKEN_DEFAULT_TTL_HOURS)
+        .clamp(1, RELAY_REG_TOKEN_MAX_TTL_HOURS);
+    let (_, api, _, _, _) = match client_config(&st).await {
+        Ok(c) => c,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e),
+    };
+    let token = format!("rrt_{}", rand_hex(32));
+    let link_key = rand_hex(32);
+    let token_id = relay_token_id(&token);
+    let t = now();
+    let expires_at = t + hours * 3600;
+    if let Err(e) = sqlx::query(
+        "insert into relay_reg_tokens(token_id, link_key, label, created_by, created_at, expires_at) values(?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&token_id)
+    .bind(&link_key)
+    .bind(&label)
+    .bind(&u.username)
+    .bind(t)
+    .bind(expires_at)
+    .execute(&st.pool)
+    .await
+    {
+        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+    let link = format!("{api}/relay/register?token={token}&key={link_key}");
+    jresp(
+        StatusCode::OK,
+        json!({ "ok": true, "link": link, "token_id": token_id, "expires_at": expires_at }),
+    )
+}
+
+/// Outstanding registration links (admin only). Link keys are NEVER
+/// returned — a link is shown once, at creation.
+async fn relays_reg_tokens_list(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    let rows = sqlx::query(
+        "select token_id, label, created_by, created_at, expires_at, used_at, used_by from relay_reg_tokens order by created_at desc",
+    )
+    .fetch_all(&st.pool)
+    .await;
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let tokens: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "token_id": r.try_get::<String, _>("token_id").unwrap_or_default(),
+                "label": r.try_get::<String, _>("label").unwrap_or_default(),
+                "created_by": r.try_get::<String, _>("created_by").unwrap_or_default(),
+                "created_at": r.try_get::<i64, _>("created_at").unwrap_or(0),
+                "expires_at": r.try_get::<i64, _>("expires_at").unwrap_or(0),
+                "used_at": r.try_get::<Option<i64>, _>("used_at").ok().flatten(),
+                "used_by": r.try_get::<Option<i64>, _>("used_by").ok().flatten(),
+            })
+        })
+        .collect();
+    jresp(StatusCode::OK, json!({ "ok": true, "tokens": tokens }))
+}
+
+/// Revoke an unused registration link (admin only).
+async fn relays_reg_token_revoke(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(token_id): Path<String>,
+) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    match sqlx::query("delete from relay_reg_tokens where token_id=?")
+        .bind(&token_id)
+        .execute(&st.pool)
+        .await
+    {
+        Ok(res) if res.rows_affected() > 0 => jresp(StatusCode::OK, json!({ "ok": true })),
+        Ok(_) => err_resp(StatusCode::NOT_FOUND, "注册链接不存在"),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn relays_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMap) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    let rows = sqlx::query("select * from relay_nodes order by id desc")
+        .fetch_all(&st.pool)
+        .await;
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let t = now();
+    let nodes: Vec<Value> = rows.iter().map(|r| relay_node_summary(r, t)).collect();
+    jresp(StatusCode::OK, json!({ "ok": true, "now": t, "nodes": nodes }))
+}
+
+async fn relays_detail(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    let row = sqlx::query("select * from relay_nodes where id=?")
+        .bind(id)
+        .fetch_optional(&st.pool)
+        .await;
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return err_resp(StatusCode::NOT_FOUND, "中继节点不存在"),
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let mut node = relay_node_summary(&row, now());
+    let cfg = row
+        .try_get::<String, _>("config_json")
+        .unwrap_or_default();
+    node["config"] = serde_json::from_str::<Value>(&cfg).unwrap_or(Value::Null);
+    node["created_by"] = json!(row.try_get::<String, _>("created_by").unwrap_or_default());
+    jresp(StatusCode::OK, json!({ "ok": true, "node": node }))
+}
+
+/// Delete a relay node (admin only). The node credential dies with
+/// the row: the agent's next heartbeat fails lookup and it stops
+/// heartbeating (hbbr itself keeps running — the admin stops it on
+/// the relay host if the node is really gone).
+async fn relays_delete(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    match sqlx::query("delete from relay_nodes where id=?")
+        .bind(id)
+        .execute(&st.pool)
+        .await
+    {
+        Ok(res) if res.rows_affected() > 0 => jresp(StatusCode::OK, json!({ "ok": true })),
+        Ok(_) => err_resp(StatusCode::NOT_FOUND, "中继节点不存在"),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Push a config to a relay node (admin only). The config is stored
+/// and delivered inside the next heartbeat response bundle; the
+/// agent applies it (port change restarts hbbr, limits apply live).
+async fn relays_config(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: String,
+) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    let v = parse_body(&body);
+    let cfg = match parse_relay_config(&v) {
+        Ok(c) => c,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e),
+    };
+    let row = sqlx::query("select config_version from relay_nodes where id=?")
+        .bind(id)
+        .fetch_optional(&st.pool)
+        .await;
+    let cur = match row {
+        Ok(Some(r)) => r.try_get::<i64, _>("config_version").unwrap_or(1),
+        Ok(None) => return err_resp(StatusCode::NOT_FOUND, "中继节点不存在"),
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    match sqlx::query("update relay_nodes set config_json=?, config_version=? where id=?")
+        .bind(cfg.to_string())
+        .bind(cur + 1)
+        .bind(id)
+        .execute(&st.pool)
+        .await
+    {
+        Ok(_) => jresp(
+            StatusCode::OK,
+            json!({ "ok": true, "config_version": cur + 1 }),
+        ),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Queue a remote hbbr restart for a relay node (admin only). The
+/// command rides the next heartbeat response; the agent restarts
+/// hbbr and acks, which clears the queue. Active relayed sessions
+/// on that node drop when hbbr restarts.
+async fn relays_restart(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    match sqlx::query("update relay_nodes set pending_command='restart' where id=?")
+        .bind(id)
+        .execute(&st.pool)
+        .await
+    {
+        Ok(res) if res.rows_affected() > 0 => jresp(StatusCode::OK, json!({ "ok": true })),
+        Ok(_) => err_resp(StatusCode::NOT_FOUND, "中继节点不存在"),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// Which plane a router serves. With `--console-listen` set, the API
 /// listener serves only the client-facing endpoints (Public) and the
 /// web console moves to its own address (Console), so the management
@@ -3762,7 +4695,12 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/peers", get(client_peers))
             .route("/api/currentUser", post(current_user))
             .route("/api/ab", get(ab_get).post(ab_post))
-            .route("/dl/:token/:filename", get(download));
+            .route("/dl/:token/:filename", get(download))
+            // relay agent endpoints (no session auth; HMAC + AEAD)
+            .route("/api/relay/challenge", post(relay_challenge))
+            .route("/api/relay/register", post(relay_register))
+            .route("/api/relay/heartbeat", post(relay_heartbeat))
+            .route("/relay/register", get(relay_register_page));
     }
     if part != RouterPart::Public {
         // web console (management plane)
@@ -3792,7 +4730,15 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/admin/update/restart", post(update_restart))
             .route("/api/admin/gen-client", post(gen_client))
             .route("/api/admin/gen-clients", get(gen_list))
-            .route("/api/admin/gen-clients/:id", delete(gen_delete));
+            .route("/api/admin/gen-clients/:id", delete(gen_delete))
+            // relay node management (admin only)
+            .route("/api/admin/relays/reg-token", post(relays_reg_token_create))
+            .route("/api/admin/relays/reg-tokens", get(relays_reg_tokens_list))
+            .route("/api/admin/relays/reg-tokens/:id", delete(relays_reg_token_revoke))
+            .route("/api/admin/relays", get(relays_list))
+            .route("/api/admin/relays/:id", get(relays_detail).delete(relays_delete))
+            .route("/api/admin/relays/:id/config", post(relays_config))
+            .route("/api/admin/relays/:id/restart", post(relays_restart));
     }
     r.layer(Extension(state))
 }
@@ -4007,6 +4953,8 @@ pub fn run(
             upd_job: std::sync::Mutex::new(UpdJob::default()),
             guard: std::sync::Mutex::new(AuthGuard::default()),
             dl_cache: std::sync::Mutex::new(None),
+            reg_challenges: std::sync::Mutex::new(HashMap::new()),
+            hb_replay: std::sync::Mutex::new(HashMap::new()),
         });
         let tls = if tls_cert.is_empty() && tls_key.is_empty() {
             None
@@ -4398,7 +5346,7 @@ mod tests {
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
         assert_eq!(parse_pro_tag("v32 "), Some(32));
-        assert_eq!(current_pro_num(), 35);
+        assert_eq!(current_pro_num(), 36);
     }
 
     #[test]
@@ -4711,6 +5659,137 @@ mod tests {
         let old = std::time::Instant::now()
             - std::time::Duration::from_secs(2 * 3600);
         assert!(!client_downloads_cache_fresh(old));
+    }
+
+    // ---- relay nodes (v36) ----
+
+    #[test]
+    fn relay_token_id_known_vector() {
+        // sha256("abc") is a published vector, not our own output:
+        // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(relay_token_id("abc"), "ba7816bf8f01cfea");
+        assert_eq!(relay_token_id("rrt_example").len(), 16);
+    }
+
+    #[test]
+    fn relay_proof_msg_exact() {
+        assert_eq!(
+            relay_register_proof_msg("tok123", "n0nce", "relay-1", "1.0.0", "1.2.3.4"),
+            "relay-register-v1\ntok123\nn0nce\nrelay-1\n1.0.0\n1.2.3.4"
+        );
+        // Empty fields still produce the separators (no trailing \n).
+        assert_eq!(
+            relay_register_proof_msg("t", "n", "", "", ""),
+            "relay-register-v1\nt\nn\n\n\n"
+        );
+    }
+
+    #[test]
+    fn relay_heartbeat_sig_msg_exact() {
+        assert_eq!(
+            relay_heartbeat_sig_msg(12, 1792000000, "ab12", "cd34", "ef56"),
+            "relay-heartbeat-v1\n12\n1792000000\nab12\ncd34\nef56"
+        );
+    }
+
+    #[test]
+    fn relay_hmac_known_vector_and_tamper() {
+        // Published HMAC-SHA256 vector (Wikipedia "HMAC" article).
+        let sig = relay_hmac_hex(
+            b"key",
+            "The quick brown fox jumps over the lazy dog",
+        )
+        .unwrap();
+        assert_eq!(
+            sig,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+        assert!(relay_hmac_verify(
+            b"key",
+            "The quick brown fox jumps over the lazy dog",
+            &sig
+        ));
+        // Tampered message, wrong key, and malformed hex all fail.
+        assert!(!relay_hmac_verify(
+            b"key",
+            "The quick brown fox jumps over the lazy dog.",
+            &sig
+        ));
+        assert!(!relay_hmac_verify(
+            b"other",
+            "The quick brown fox jumps over the lazy dog",
+            &sig
+        ));
+        assert!(!relay_hmac_verify(
+            b"key",
+            "The quick brown fox jumps over the lazy dog",
+            "zz"
+        ));
+    }
+
+    #[test]
+    fn relay_aead_roundtrip_and_tamper() {
+        let key = [7u8; 32];
+        let plain = b"{\"node_id\": 12, \"secret\": true}";
+        let (nonce, data) = relay_seal(&key, plain).unwrap();
+        assert_eq!(nonce.len(), 24);
+        assert_eq!(relay_open(&key, &nonce, &data).unwrap(), plain);
+        // Tampered ciphertext fails authentication.
+        let mut bad = data.clone();
+        bad.replace_range(0..2, if &data[0..2] == "00" { "ff" } else { "00" });
+        assert!(relay_open(&key, &nonce, &bad).is_none());
+        // Wrong key fails.
+        assert!(relay_open(&[8u8; 32], &nonce, &data).is_none());
+        // Short keys cannot seal or open.
+        assert!(relay_seal(&[1u8; 16], plain).is_none());
+        assert!(relay_open(&[1u8; 16], &nonce, &data).is_none());
+        // Two seals of the same plaintext differ (fresh nonce).
+        let (n2, d2) = relay_seal(&key, plain).unwrap();
+        assert_ne!((nonce, data), (n2, d2));
+    }
+
+    #[test]
+    fn relay_hex_roundtrip() {
+        assert_eq!(hex_encode(&[0u8, 171, 255]), "00abff");
+        assert_eq!(hex_decode("00abff").unwrap(), vec![0u8, 171, 255]);
+        assert_eq!(hex_decode("00ABFF").unwrap(), vec![0u8, 171, 255]);
+        assert!(hex_decode("abc").is_none());
+        assert!(hex_decode("zz").is_none());
+        assert!(hex_decode("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn relay_config_parse() {
+        let cfg = parse_relay_config(&json!({"port": 21117})).unwrap();
+        assert_eq!(cfg["port"], 21117);
+        assert!(cfg["limit_speed"].is_null());
+        assert!(cfg["total_bandwidth"].is_null());
+        assert!(cfg["single_bandwidth"].is_null());
+        let cfg = parse_relay_config(
+            &json!({"port": 22000, "limit_speed": 16.5, "total_bandwidth": 512, "single_bandwidth": null}),
+        )
+        .unwrap();
+        assert_eq!(cfg["port"], 22000);
+        assert_eq!(cfg["limit_speed"], 16.5);
+        assert_eq!(cfg["total_bandwidth"], 512.0);
+        assert!(cfg["single_bandwidth"].is_null());
+        assert!(parse_relay_config(&json!({"port": 0})).is_err());
+        assert!(parse_relay_config(&json!({"port": 65536})).is_err());
+        assert!(parse_relay_config(&json!({})).is_err());
+        assert!(parse_relay_config(&json!({"port": "21117"})).is_err());
+        assert!(parse_relay_config(&json!({"port": 21117, "limit_speed": -1})).is_err());
+        // 0 is rejected: hbbr ignores it, so it cannot mean anything.
+        assert!(parse_relay_config(&json!({"port": 21117, "limit_speed": 0})).is_err());
+        assert!(parse_relay_config(&json!({"port": 21117, "limit_speed": "fast"})).is_err());
+    }
+
+    #[test]
+    fn relay_default_config_values() {
+        let cfg = relay_default_config();
+        assert_eq!(cfg["port"], 21117);
+        assert!(cfg["limit_speed"].is_null());
+        assert!(cfg["total_bandwidth"].is_null());
+        assert!(cfg["single_bandwidth"].is_null());
     }
 
 }

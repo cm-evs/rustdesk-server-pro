@@ -1,5 +1,7 @@
 # rustdesk-server-pro（自建二开版）
 
+[English](README-en.md) | 中文
+
 基于官方开源 [rustdesk-server](https://github.com/rustdesk/rustdesk-server) 二次开发的自建远程桌面服务端：在官方 hbbs / hbbr 之上增加账号系统与 Web 管理控制台，官方 RustDesk 客户端无需任何修改即可使用。
 
 > 本项目是独立的二次开发分支，与官方付费版 RustDesk Server Pro 无关。许可证为 AGPL-3.0，与上游一致。
@@ -18,6 +20,7 @@
 - **安全加固**：登录防爆破锁定（账号 + IP 两级）、开放注册开关、管理面与客户端接口分开监听（`--console-listen`）、可选 HTTPS（`--tls-cert` / `--tls-key`）
 - **心跳策略下发**：向客户端下发「隐藏服务器设置」，可选下发「允许远程修改配置」
 - **多中继就近选路**：可选配 MaxMind 城市级地理库（`geoip-city.mmdb`），按连接两端地理距离之和选择最近的中继；无库或查不到坐标时自动回退官方轮询
+- **中继节点管理**：中继机器上跑常驻代理 relay-agent，控制台生成一次性注册链接完成注册；服务端加密下发密钥对与配置（端口、限速、重启），设备列表展示中继节点状态（在线/离线、会话数、吞吐），点节点名查看详情
 - **Windows 服务支持**：`winservice/` 提供服务宿主 rdsvc.exe 与管理脚本，可将 hbbs / hbbr 注册为开机自启的 Windows 服务
 - **运行文件归位**：服务端运行时产生的文件（数据库、日志、密钥等）全部落在服务端程序所在目录
 
