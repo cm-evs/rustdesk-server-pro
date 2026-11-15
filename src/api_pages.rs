@@ -121,6 +121,8 @@ const I18N={zh:{
 'set.allowreg_note':'关闭后，只有管理员登录状态下打开注册页才能新建账号。公网部署建议关闭。',
 'set.allowrc':'允许远程修改配置（通过心跳下发到所有客户端）',
 'set.allowrc_note':'开启后，控制端可以操作被控端的 RustDesk 客户端界面与设置（包括改密码、改配置），不用再逐台到被控端本地勾选。仅在自有设备上开启；已在本机手动改过这一项的客户端以本机设置为准。',
+'set.mustlogin':'必须登录（所有客户端必须登录后才能连接）',
+'set.mustlogin_note':'开启后，未登录的客户端（没有账号登录或登录已失效）无法发起任何连接，包括直连与中继；纯 ID+Key（无账号）部署请勿开启。',
 'set.save':'保存设置','set.saved':'已保存','set.load_fail':'加载设置失败，请刷新重试',
 'set.load_fail2':'加载设置失败：','set.ports_title':'监听端口（当前生效值）',
 'set.ports_loading':'读取中…',
@@ -232,6 +234,8 @@ const I18N={zh:{
 'set.allowreg_note':'When off, new accounts can only be created by an admin opening the registration page while signed in. Turn it off for public deployments.',
 'set.allowrc':'Allow remote configuration changes (pushed to all clients via heartbeat)',
 'set.allowrc_note':'When on, controllers can operate the controlled side’s RustDesk client UI and settings (including changing passwords and configuration) without enabling it locally on each machine. Only enable this on your own devices; clients where this was set manually keep their local setting.',
+'set.mustlogin':'Require login (all clients must log in before connecting)',
+'set.mustlogin_note':'When on, clients that are not logged in (no account login, or login no longer valid) cannot start any connection, direct or relayed. Do not enable this on ID+key-only deployments without accounts.',
 'set.save':'Save Settings','set.saved':'Saved','set.load_fail':'Failed to load settings. Refresh and retry.',
 'set.load_fail2':'Failed to load settings: ','set.ports_title':'Listening Ports (current values)',
 'set.ports_loading':'Loading…',
@@ -506,6 +510,8 @@ const CONSOLE_BODY: &str = r#"
 <p class="muted" data-i18n="set.allowreg_note">关闭后，只有管理员登录状态下打开注册页才能新建账号。公网部署建议关闭。</p>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-allowrc" style="width:auto;margin:0"> <span data-i18n="set.allowrc">允许远程修改配置（通过心跳下发到所有客户端）</span></label>
 <p class="muted" data-i18n="set.allowrc_note">开启后，控制端可以操作被控端的 RustDesk 客户端界面与设置（包括改密码、改配置），不用再逐台到被控端本地勾选。仅在自有设备上开启；已在本机手动改过这一项的客户端以本机设置为准。</p>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-mustlogin" style="width:auto;margin:0"> <span data-i18n="set.mustlogin">必须登录（所有客户端必须登录后才能连接）</span></label>
+<p class="muted" data-i18n="set.mustlogin_note">开启后，未登录的客户端（没有账号登录或登录已失效）无法发起任何连接，包括直连与中继；纯 ID+Key（无账号）部署请勿开启。</p>
 <button id="set-save" data-i18n="set.save">保存设置</button></div>
 <div class="card"><h2 data-i18n="set.ports_title">监听端口（当前生效值）</h2>
 <p class="muted" id="ports-line" data-i18n="set.ports_loading">读取中…</p>
@@ -690,6 +696,7 @@ async function loadSettings(){
   $('set-hide').checked=!!j.settings.hide_server_settings;
   $('set-allowreg').checked=j.settings.allow_register!==false;
   $('set-allowrc').checked=!!j.settings.allow_remote_config;
+  $('set-mustlogin').checked=!!j.settings.must_login;
   if(j.ports){let pl=t('set.ports_rendezvous')+j.ports.rendezvous+t('set.ports_nat')+j.ports.nat_test+t('set.ports_ws')+j.ports.ws_rendezvous+t('set.ports_relay')+j.ports.relay+t('set.ports_ws')+j.ports.ws_relay+t('set.ports_api')+j.ports.api; if(j.ports.console){pl+=t('set.ports_console')+j.ports.console_listen;}else{pl+=t('set.ports_same');} if(j.ports.tls){pl+=t('set.ports_tls');} $('ports-line').textContent=pl;}
   $('tpl-status').textContent=j.template_ready?(t('set.tpl_ready')+(j.template_version||'')):t('set.tpl_not_dl');
   pollTpl();
@@ -699,7 +706,7 @@ $('set-save').onclick=async()=>{
   const btn=$('set-save'); if(btn.disabled)return; btn.disabled=true;
   $('set-ok').textContent=''; $('set-err').textContent='';
   try{
-    const j=await api('/api/admin/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({public_host:$('set-host').value,api_url_override:$('set-api').value,github_mirror:$('set-mirror').value,hide_server_settings:$('set-hide').checked,allow_register:$('set-allowreg').checked,allow_remote_config:$('set-allowrc').checked})});
+    const j=await api('/api/admin/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({public_host:$('set-host').value,api_url_override:$('set-api').value,github_mirror:$('set-mirror').value,hide_server_settings:$('set-hide').checked,allow_register:$('set-allowreg').checked,allow_remote_config:$('set-allowrc').checked,must_login:$('set-mustlogin').checked})});
     if(j.ok){$('set-ok').textContent=t('set.saved');}else{$('set-err').textContent=j.error||t('app.failed');}
   }catch(e){ if(e.message!=='unauth')$('set-err').textContent=t('app.network_err'); }
   btn.disabled=false;

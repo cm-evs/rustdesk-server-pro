@@ -606,6 +606,28 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    // Must-login: refuse relay requests from unlogged-in
+                    // controllers. The peer honors a forwarded
+                    // RequestRelay without any prior punch-hole, so
+                    // leaving this open would bypass the punch-hole
+                    // gate. The controller's request carries its login
+                    // token; refuse_reason is shown verbatim by the
+                    // client, like other_failure on punch-hole.
+                    let (must_login, controller_device) = Self::login_context(&rf.token).await;
+                    if Self::must_login_refused(must_login, &controller_device) {
+                        log::info!(
+                            "Refusing unauthenticated relay request from {} for peer {} (must-login enabled)",
+                            addr, rf.id
+                        );
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            uuid: rf.uuid.clone(),
+                            refuse_reason: Self::MUST_LOGIN_REJECT.to_owned(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
+                    }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -788,36 +810,64 @@ impl RendezvousServer {
         Ok(())
     }
 
-    #[inline]
-    /// Device id a login token was issued for, from the account API
-    /// database. Any failure (no API database, locked, unknown token)
-    /// yields None so the caller can fail open.
-    async fn device_for_token(token: &str) -> Option<String> {
-        if token.is_empty() {
-            return None;
-        }
+    /// Message shown verbatim by the client when must-login refuses a
+    /// connection. Same bilingual shape as the self-connection refusal.
+    const MUST_LOGIN_REJECT: &'static str =
+        "未登录，无法连接 / The connection is not allowed. You have not logged in.";
+
+    /// Pure must-login decision: refuse only when the switch is on and
+    /// the controller's token resolved to no device.
+    fn must_login_refused(must_login: bool, controller_device: &Option<String>) -> bool {
+        must_login && controller_device.is_none()
+    }
+
+    /// (must-login enabled, device the login token was issued for) from
+    /// the account API database. One read-only connection answers both
+    /// questions. Any failure (no API database, locked, unknown token)
+    /// yields (false, None): must-login stays off and the request
+    /// proceeds as before (fail open).
+    async fn login_context(token: &str) -> (bool, Option<String>) {
         let path = std::env::var("API_DB_PATH").unwrap_or_else(|_| "api_v1.sqlite3".to_owned());
-        if !std::path::Path::new(&path).exists() {
-            return None;
+        Self::login_context_at(token, &path).await
+    }
+
+    async fn login_context_at(token: &str, path: &str) -> (bool, Option<String>) {
+        if !std::path::Path::new(path).exists() {
+            return (false, None);
         }
         let mut opts = SqliteConnectOptions::new()
-            .filename(&path)
+            .filename(path)
             .read_only(true);
         opts.log_statements(log::LevelFilter::Off);
-        let pool = SqlitePoolOptions::new()
+        let pool = match SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
             .await
-            .ok()?;
-        let row = sqlx::query("select device_id from client_tokens where token = ?")
-            .bind(token)
+        {
+            Ok(p) => p,
+            Err(_) => return (false, None),
+        };
+        let must_login = sqlx::query("select value from settings where key = 'must_login'")
             .fetch_optional(&pool)
             .await
-            .ok()?;
-        let row = row?;
-        let device_id = row.try_get::<String, _>("device_id").ok();
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_get::<String, _>("value").ok())
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let device_id = if token.is_empty() {
+            None
+        } else {
+            sqlx::query("select device_id from client_tokens where token = ?")
+                .bind(token)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.try_get::<String, _>("device_id").ok())
+        };
         pool.close().await;
-        device_id
+        (must_login, device_id)
     }
 
     async fn handle_punch_hole_request(
@@ -838,6 +888,11 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         let id = ph.id;
+        // Login context: whether must-login is on, and which device the
+        // controller's token was issued for (None when the token is
+        // empty or unknown). One read-only database connection answers
+        // both questions for the two checks below.
+        let (must_login, controller_device) = Self::login_context(&ph.token).await;
         // Refuse self-connection: the controller's login token resolves
         // to the device it was issued for. If that is the target, the
         // controller is asking to control itself. other_failure is
@@ -845,18 +900,32 @@ impl RendezvousServer {
         // error instead of the peer's accept/password dialog. A missing
         // or unknown token (logged-out client, lookup failure) fails
         // open: the request proceeds as before.
-        if !ph.token.is_empty() {
-            if let Some(device_id) = Self::device_for_token(&ph.token).await {
-                if device_id == id {
-                    log::info!("Refusing self-connection request from {} for peer {}", addr, id);
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_punch_hole_response(PunchHoleResponse {
-                        other_failure: "不能连接本机 / Cannot connect to yourself".to_owned(),
-                        ..Default::default()
-                    });
-                    return Ok((msg_out, None));
-                }
+        if let Some(device_id) = &controller_device {
+            if device_id == &id {
+                log::info!("Refusing self-connection request from {} for peer {}", addr, id);
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: "不能连接本机 / Cannot connect to yourself".to_owned(),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
             }
+        }
+        // Must-login: when enabled, refuse controllers that are not
+        // logged in (empty token or token not found in client_tokens).
+        // TCP, UDP and WebSocket punch-hole requests all go through
+        // this handler, so no transport bypasses the check.
+        if Self::must_login_refused(must_login, &controller_device) {
+            log::info!(
+                "Refusing unauthenticated punch-hole request from {} for peer {} (must-login enabled)",
+                addr, id
+            );
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: Self::MUST_LOGIN_REJECT.to_owned(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
         }
         // punch hole request from A, relay to B,
         // check if in same intranet first,
@@ -1645,6 +1714,111 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    #[test]
+    fn must_login_refused_matrix() {
+        // switch off: empty/unknown/valid tokens all pass (fail open)
+        assert!(!RendezvousServer::must_login_refused(false, &None));
+        assert!(!RendezvousServer::must_login_refused(
+            false,
+            &Some("111222333".to_owned())
+        ));
+        // switch on: empty/unknown refused, valid passes
+        assert!(RendezvousServer::must_login_refused(true, &None));
+        assert!(!RendezvousServer::must_login_refused(
+            true,
+            &Some("111222333".to_owned())
+        ));
+    }
+
+    /// Scratch API database for login_context tests: settings table
+    /// with an optional must_login row, client_tokens table with the
+    /// given (token, device_id) rows. Each test uses its own file so
+    /// parallel tests never share state.
+    async fn make_login_db(tag: &str, must_login: Option<&str>, tokens: &[(&str, &str)]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "hbbs_must_login_{}_{}.sqlite3",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        opts.log_statements(log::LevelFilter::Off);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query("create table settings(key text primary key, value text not null)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("create table client_tokens(token text primary key, username text not null, device_id text not null default '', uuid text not null default '', created_at integer not null)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        if let Some(v) = must_login {
+            sqlx::query("insert into settings(key, value) values('must_login', ?)")
+                .bind(v)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (token, device) in tokens {
+            sqlx::query("insert into client_tokens(token, username, device_id, uuid, created_at) values(?, 'alice', ?, '', 0)")
+                .bind(token)
+                .bind(device)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+        path.to_string_lossy().into_owned()
+    }
+
+    #[hbb_common::tokio::test]
+    async fn login_context_missing_db_fails_open() {
+        let (must_login, device) = RendezvousServer::login_context_at(
+            "tok1",
+            "/nonexistent-dir-xyz/no-such-db.sqlite3",
+        )
+        .await;
+        assert!(!must_login);
+        assert!(device.is_none());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn login_context_switch_on_resolves_token() {
+        let path = make_login_db("on", Some("1"), &[("tok1", "111222333")]).await;
+        let (must_login, device) = RendezvousServer::login_context_at("tok1", &path).await;
+        assert!(must_login);
+        assert_eq!(device.as_deref(), Some("111222333"));
+        // unknown token: switch still on, no device
+        let (must_login, device) = RendezvousServer::login_context_at("nope", &path).await;
+        assert!(must_login);
+        assert!(device.is_none());
+        // empty token: same
+        let (must_login, device) = RendezvousServer::login_context_at("", &path).await;
+        assert!(must_login);
+        assert!(device.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn login_context_switch_off_or_absent() {
+        let path = make_login_db("off", Some("0"), &[("tok1", "111222333")]).await;
+        let (must_login, device) = RendezvousServer::login_context_at("tok1", &path).await;
+        assert!(!must_login);
+        assert_eq!(device.as_deref(), Some("111222333"));
+        let _ = std::fs::remove_file(&path);
+        let path = make_login_db("absent", None, &[("tok1", "111222333")]).await;
+        let (must_login, device) = RendezvousServer::login_context_at("tok1", &path).await;
+        assert!(!must_login);
+        assert_eq!(device.as_deref(), Some("111222333"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[hbb_common::tokio::test]

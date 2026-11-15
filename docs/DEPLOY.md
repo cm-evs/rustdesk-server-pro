@@ -401,6 +401,13 @@ cd rustdesk-server-pro-linux-*
 - 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
 - 验证：cargo test 63/63（debug 与 release；无新增服务端逻辑，单测只改版本号断言）；浏览器端到端 43/43（debug 与 release，Playwright 真实浏览器：默认中文、切换英文后各页文案与动态表格均变英文、刷新后保持英文、切回中文正常；镜像复选框默认未勾选且链接为直链、勾选后变镜像、iOS 不变、取消切回、刷新后保持勾选状态）；下载端到端 50/50 ×2、客户端配置端到端 38/38 ×2；全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、就近选路 12/12 ×2），debug 与 release 均通过。本版改动为全平台统一逻辑，无新增 Windows/release 专属分支；语言切换与复选框在真实浏览器上的表现已由 Playwright 套件覆盖，无新增真机确认项。
 
+## v35：必须登录开关（控制台复选框）
+
+- 功能（2026-11-15，GitHub issue #3）：服务器设置页新增「必须登录」复选框（英文界面 \"Require login\"），默认关闭。开启后，所有客户端必须登录后才能发起连接：控制端的登录 token 为空或在 `client_tokens` 表里查不到时，打洞阶段直接拒绝，客户端显示「未登录，无法连接 / The connection is not allowed. You have not logged in.」；已登录客户端的合法 token 正常放行。开关存在 settings 表（键 `must_login`），改动即时生效，不用重启。`client_tokens` 表没有过期字段，token 只在登出或删号时删除，所以「过期」等同于「查不到」，拒绝条件写「空 token / 查不到」即可覆盖。
+- 无绕过：拒绝分支放在 `handle_punch_hole_request`（自连检查之后），TCP、UDP 与 WebSocket 打洞都走同一个处理，没有哪条路能绕过；同时堵上了中继请求的口子——被控端收到转发的 `RequestRelay` 就会去中继配对（不要求先有打洞），所以 `RequestRelay` 也按同一规则检查 token，未登录时回 `RelayResponse{refuse_reason}` 拒绝，不转发给被控端。hbbr 不用改：中继配对只在被控端收到 hbbs 转发的打洞/中继请求后才发生，打洞阶段拦住就覆盖了常规中继流程。开关与 v23 防爆破锁定正交，可叠加生效。
+- 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
+- 验证：新增 4 个单元测试（拒绝决策矩阵：开关开/关 × token 空/查不到/有效；登录上下文：缺数据库时 fail open、开关开时解析 token、开关关或缺失时不启用），cargo test 67/67（debug 与 release）；新增必须登录端到端 21/21（debug 与 release：真实 PunchHoleRequest / RequestRelay 协议消息驱动 TCP 21116 与 WebSocket 21118，覆盖开关关时空/未知 token 放行、开关开时空/未知 token 被拒、合法 token 放行、自连仍先被拒、中继请求同规则、WS 同规则、开关关后立即恢复）；全量回归（专项 69/69 ×2、控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、就近选路 12/12 ×2、下载 50/50 ×2、配置 38/38 ×2、语言切换 43/43 ×2），debug 与 release 均通过。本版改动为全平台统一逻辑，无新增 Windows/release 专属分支；UDP 打洞与 TCP/WS 共用同一处理（源码核实），沙箱拦 UDP 故未在端到端里直接驱动。无新增真机确认项。
+
 ## API 调用说明
 
 服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/client-downloads`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。

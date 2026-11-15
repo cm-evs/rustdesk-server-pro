@@ -75,7 +75,7 @@ pub struct TplJob {
 /// NOTE: this deliberately does NOT live in version.rs — build.rs
 /// regenerates that file on every build (see hbb_common::gen_version)
 /// and would wipe a hand-written constant.
-const PRO_VERSION: &str = "34";
+const PRO_VERSION: &str = "35";
 
 /// Progress state of the background one-click server update download.
 #[derive(Default)]
@@ -1851,6 +1851,7 @@ async fn settings_get(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMa
                 "hide_server_settings": get_setting(&st.pool, "hide_server_settings").await != "0",
                 "allow_register": get_setting(&st.pool, "allow_register").await != "0",
                 "allow_remote_config": get_setting(&st.pool, "allow_remote_config").await == "1",
+                "must_login": get_setting(&st.pool, "must_login").await == "1",
             },
             "template_ready": tpl_ready,
             "template_version": get_setting(&st.pool, "tpl_version").await,
@@ -1925,6 +1926,22 @@ async fn settings_post(
         let _ = set_setting(&st.pool, "strategy_ts", &now().to_string()).await;
     }
     if let Err(e) = set_setting(&st.pool, "allow_remote_config", new_rc).await {
+        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e);
+    }
+    // No strategy_ts bump: must-login is enforced server-side at
+    // punch-hole time and read live from the settings table, not
+    // pushed to clients via heartbeat.
+    let must_login = v
+        .get("must_login")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    if let Err(e) = set_setting(
+        &st.pool,
+        "must_login",
+        if must_login { "1" } else { "0" },
+    )
+    .await
+    {
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
     jresp(StatusCode::OK, json!({ "ok": true }))
@@ -4381,7 +4398,7 @@ mod tests {
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
         assert_eq!(parse_pro_tag("v32 "), Some(32));
-        assert_eq!(current_pro_num(), 34);
+        assert_eq!(current_pro_num(), 35);
     }
 
     #[test]
