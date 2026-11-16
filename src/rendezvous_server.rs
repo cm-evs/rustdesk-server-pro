@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     ConnectOptions, Row,
@@ -54,9 +54,17 @@ enum Data {
 const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
-enum Sink {
+enum SinkType {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
+}
+// The negotiated stream key, shared with the connection's read loop: the
+// loop decrypts with it, send_to_sink encrypts with it. A sink parked in
+// tcp_punch keeps its key, so a later PunchHole/RelayResponse goes out
+// encrypted on the same connection.
+struct Sink {
+    tx: SinkType,
+    key: Arc<Mutex<Option<Encrypt>>>,
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -140,6 +148,14 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    // Ephemeral X25519 keypair for the secure_tcp key exchange (KX v0),
+    // generated fresh at each startup: the public key is authenticated to
+    // every client by the persistent Ed25519 server key (see
+    // key_exchange_phase1), so it needs no file of its own, and a restart
+    // bounds how long a compromised keypair stays useful. The KX
+    // implementation is ported from sctgdesk-server (AGPL-3.0).
+    secure_tcp_pk_b: box_::PublicKey,
+    secure_tcp_sk_b: box_::SecretKey,
 }
 
 #[derive(Clone)]
@@ -198,6 +214,8 @@ impl RendezvousServer {
                     .unwrap_or_default(),
             )
         };
+        // Fresh X25519 keypair for this process; see Inner::secure_tcp_pk_b.
+        let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
@@ -212,6 +230,8 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                secure_tcp_pk_b,
+                secure_tcp_sk_b,
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -694,6 +714,36 @@ impl RendezvousServer {
                     });
                     Self::send_to_sink(sink, msg_out).await;
                 }
+                Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                    // Phase 2 of the secure_tcp key exchange (KX v0): the
+                    // client sealed a fresh symmetric key to our X25519
+                    // public key. Open it and arm the stream; from here on
+                    // this connection is encrypted in both directions.
+                    // WebSocket clients never run the exchange (their
+                    // secure_tcp skips WS), so one here is a protocol
+                    // violation: close the connection.
+                    if ws {
+                        log::warn!("KeyExchange over WebSocket from {addr}: closing");
+                        return false;
+                    }
+                    if ex.keys.len() != 2 {
+                        log::error!("Handshake failed: invalid key exchange message from {addr}");
+                        return false;
+                    }
+                    match Encrypt::decode(&ex.keys[1], &ex.keys[0], &self.inner.secure_tcp_sk_b) {
+                        Ok(key) => {
+                            if let Some(sink) = sink.as_mut() {
+                                sink.key.lock().await.replace(Encrypt::new(key));
+                            }
+                            log::debug!("KeyExchange symmetric key set for {addr} (KX v0)");
+                            return true;
+                        }
+                        Err(err) => {
+                            log::error!("Handshake failed for {addr}: {err}");
+                            return false;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1051,12 +1101,15 @@ impl RendezvousServer {
     #[inline]
     async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
         if let Some(sink) = sink.as_mut() {
-            if let Ok(bytes) = msg.write_to_bytes() {
-                match sink {
-                    Sink::TcpStream(s) => {
+            if let Ok(mut bytes) = msg.write_to_bytes() {
+                if let Some(enc) = sink.key.lock().await.as_mut() {
+                    bytes = enc.enc(&bytes);
+                }
+                match &mut sink.tx {
+                    SinkType::TcpStream(s) => {
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
-                    Sink::Ws(ws) => {
+                    SinkType::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(Bytes::from(bytes))).await);
                     }
                 }
@@ -1428,7 +1481,10 @@ impl RendezvousServer {
             )
             .await??;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
+            sink = Some(Sink {
+                tx: SinkType::Ws(a),
+                key: Arc::new(Mutex::new(None)),
+            });
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
                     if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
@@ -1439,28 +1495,38 @@ impl RendezvousServer {
         } else {
             let mut framed = Framed::new(stream, BytesCodec::new());
             framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
-            let (mut a, mut b) = framed.split();
-            // Greeting for clients >= 1.5.0 with a configured server key and a
-            // login token: their rendezvous handshake (secure_tcp) waits for
-            // the server to speak first and fails with "deadline has elapsed"
-            // if the server stays silent, because this server predates the
-            // key-exchange feature and never initiates one. A parseable
-            // non-KeyExchange first message makes the client proceed
-            // unencrypted, the documented fallback for pre-exchange servers;
-            // the peer session itself stays end-to-end encrypted via the peer
-            // key exchange. WebSocket clients skip secure_tcp, so no greeting
-            // there. An empty message is enough: the codec delivers zero-length
-            // frames and the client discards the message after one read.
-            allow_err!(
-                a.send(Bytes::from(
-                    RendezvousMessage::new()
-                        .write_to_bytes()
-                        .unwrap_or_default()
-                ))
-                .await
-            );
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let (a, mut b) = framed.split();
+            // The stream key is shared between the sink (send_to_sink
+            // encrypts with it) and this read loop (decrypts with it); the
+            // KeyExchange branch in handle_tcp arms it once the client
+            // answers phase 1.
+            let enc = Arc::new(Mutex::new(None));
+            sink = Some(Sink {
+                tx: SinkType::TcpStream(a),
+                key: enc.clone(),
+            });
+            // Phase 1 of the secure_tcp key exchange: clients that speak it
+            // encrypt from here on. Without a signing key there is nothing
+            // to sign phase 1 with, so fall back to the empty greeting: a
+            // parseable non-KeyExchange first message makes clients
+            // >= 1.5.0 proceed unencrypted, the documented fallback for
+            // pre-exchange servers. WebSocket clients skip secure_tcp, so no
+            // greeting there.
+            if self.inner.sk.is_some() {
+                self.key_exchange_phase1(addr, &mut sink).await;
+            } else {
+                Self::send_to_sink(&mut sink, RendezvousMessage::new()).await;
+            }
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                {
+                    let mut enc_lock = enc.lock().await;
+                    if let Some(enc) = enc_lock.as_mut() {
+                        if enc.dec(&mut bytes).is_err() {
+                            log::warn!("Decryption error from {addr}");
+                            break;
+                        }
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1471,6 +1537,32 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// Phase 1 of the secure_tcp key exchange (KX v0, ported from
+    /// sctgdesk-server, AGPL-3.0): send our X25519 public key signed with
+    /// the persistent Ed25519 server key. The client verifies the
+    /// signature against its configured rendezvous key, seals a fresh
+    /// symmetric key to the X25519 key and answers with a KeyExchange
+    /// message (phase 2, handled in handle_tcp). No version field: our
+    /// proto predates it, so clients read version 0 and run KX v0, which
+    /// uses one symmetric key for both directions. A genuine Curve25519
+    /// public key always has its top bit clear, so v1-capable clients do
+    /// not demand signed parameters from us.
+    async fn key_exchange_phase1(&mut self, addr: SocketAddr, sink: &mut Option<Sink>) {
+        let Some(sk) = &self.inner.sk else {
+            return;
+        };
+        log::debug!(
+            "KeyExchange phase 1: send our pk to {addr} in a message signed with our server key"
+        );
+        let mut msg_out = RendezvousMessage::new();
+        let sm = sign::sign(&self.inner.secure_tcp_pk_b.0, sk);
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![Bytes::from(sm)],
+            ..Default::default()
+        });
+        Self::send_to_sink(sink, msg_out).await;
     }
 
     #[inline]
@@ -1841,5 +1933,89 @@ mod tests {
             assert_eq!(lock.front().unwrap().to_id, format!("peer{}", max % 31));
             assert_eq!(lock.back().unwrap().to_id, format!("peer{}", (max * 2 - 1) % 31));
         }
+    }
+}
+
+#[cfg(test)]
+mod key_exchange_tests {
+    use super::*;
+    use sodiumoxide::crypto::secretbox;
+
+    /// Same construction as the client's `create_symmetric_key_msg` (rustdesk `src/common.rs`).
+    fn client_seal(server_pk: [u8; 32]) -> ([u8; 32], Vec<u8>, secretbox::Key) {
+        let their_pk_b = box_::PublicKey(server_pk);
+        let (our_pk_b, our_sk_b) = box_::gen_keypair();
+        let key = secretbox::gen_key();
+        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+        let sealed = box_::seal(&key.0, &nonce, &their_pk_b, &our_sk_b);
+        (our_pk_b.0, sealed, key)
+    }
+
+    #[test]
+    fn server_recovers_the_key_sealed_by_the_client() {
+        let (server_pk, server_sk) = box_::gen_keypair();
+        let (client_pk, sealed, key) = client_seal(server_pk.0);
+        let opened = Encrypt::decode(&sealed, &client_pk, &server_sk).unwrap();
+        assert_eq!(opened.0, key.0);
+    }
+
+    #[test]
+    fn corrupted_box_is_rejected_without_panicking() {
+        let (server_pk, server_sk) = box_::gen_keypair();
+        let (client_pk, mut sealed, _) = client_seal(server_pk.0);
+        sealed[0] ^= 0xff;
+        assert!(Encrypt::decode(&sealed, &client_pk, &server_sk).is_err());
+    }
+
+    #[test]
+    fn box_from_another_peer_key_is_rejected() {
+        let (server_pk, server_sk) = box_::gen_keypair();
+        let (_, sealed, _) = client_seal(server_pk.0);
+        let (other_pk, _) = box_::gen_keypair();
+        assert!(Encrypt::decode(&sealed, &other_pk.0, &server_sk).is_err());
+    }
+
+    #[test]
+    fn phase1_message_is_signed_by_the_server_key() {
+        let (server_sign_pk, server_sign_sk) = sign::gen_keypair();
+        let (kx_pk, _) = box_::gen_keypair();
+        let signed = sign::sign(&kx_pk.0, &server_sign_sk);
+        // what the client does: verify with the server's public key, recover the X25519 key
+        assert_eq!(
+            sign::verify(&signed, &server_sign_pk).unwrap(),
+            kx_pk.0.to_vec()
+        );
+        let (wrong_pk, _) = sign::gen_keypair();
+        assert!(sign::verify(&signed, &wrong_pk).is_err());
+    }
+
+    #[test]
+    fn generated_server_key_advertises_kx_v0() {
+        // A genuine Curve25519 public key always has its top bit clear, so
+        // v1-capable clients do not demand signed parameters from us.
+        for _ in 0..32 {
+            let (pk, _) = box_::gen_keypair();
+            assert_eq!(pk.0[31] & 0x80, 0);
+        }
+    }
+
+    #[test]
+    fn version_0_streams_interoperate_between_client_and_server() {
+        let (server_pk, server_sk) = box_::gen_keypair();
+        let (client_pk, sealed, key) = client_seal(server_pk.0);
+        let server_key = Encrypt::decode(&sealed, &client_pk, &server_sk).unwrap();
+        assert_eq!(server_key.0, key.0);
+        let mut client = Encrypt::new(key);
+        let mut server = Encrypt::new(server_key);
+        let mut up = BytesMut::from(&client.enc(b"hello server")[..]);
+        server.dec(&mut up).unwrap();
+        assert_eq!(&up[..], b"hello server");
+        let mut down = BytesMut::from(&server.enc(b"hello client")[..]);
+        client.dec(&mut down).unwrap();
+        assert_eq!(&down[..], b"hello client");
+        // a second message each way: the sequence counters advance together
+        let mut up2 = BytesMut::from(&client.enc(b"second")[..]);
+        server.dec(&mut up2).unwrap();
+        assert_eq!(&up2[..], b"second");
     }
 }
