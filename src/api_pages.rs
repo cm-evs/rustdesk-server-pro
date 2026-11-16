@@ -75,7 +75,7 @@ const I18N={zh:{
 'dev.title':'设备','dev.refresh':'刷新','dev.updated':'更新于 ',
 'dev.empty':'暂无设备。设备在客户端登录账号后会出现在这里。','dev.id':'设备 ID',
 'dev.status':'状态','dev.hostname':'主机名','dev.os':'系统','dev.owner':'所属用户',
-'dev.version':'版本','dev.last_seen':'最近在线','dev.online':'● 在线','dev.offline':'● 离线',
+'dev.version':'版本','dev.last_seen':'最近在线','dev.last_relay':'最近使用的中继','dev.online':'● 在线','dev.offline':'● 离线',
 'dev.unbound':'未绑定',
 'usr.title':'用户管理','usr.username':'用户名','usr.role':'角色','usr.status':'状态',
 'usr.created':'注册时间','usr.actions':'操作','usr.admin':'管理员','usr.regular':'普通',
@@ -220,7 +220,7 @@ const I18N={zh:{
 'dev.title':'Devices','dev.refresh':'Refresh','dev.updated':'Updated at ',
 'dev.empty':'No devices yet. Devices appear here after signing in with an account in the client.',
 'dev.id':'Device ID','dev.status':'Status','dev.hostname':'Hostname','dev.os':'OS',
-'dev.owner':'Owner','dev.version':'Version','dev.last_seen':'Last seen','dev.online':'● Online',
+'dev.owner':'Owner','dev.version':'Version','dev.last_seen':'Last seen','dev.last_relay':'Last relay used','dev.online':'● Online',
 'dev.offline':'● Offline','dev.unbound':'Unbound',
 'usr.title':'User Management','usr.username':'Username','usr.role':'Role','usr.status':'Status',
 'usr.created':'Registered','usr.actions':'Actions','usr.admin':'Admin','usr.regular':'Regular',
@@ -691,6 +691,8 @@ async function init(){
   $('who').textContent=ME.username+(ME.is_admin?t('app.who_admin'):'');
   if(!ME.is_admin){document.querySelectorAll('.adminonly').forEach(e=>e.style.display='none');}
   loadOverview(); loadDevices();
+  window.addEventListener('hashchange',routeFromHash);
+  routeFromHash();
 }
 window.__onLangChange=()=>{
   if(ME)$('who').textContent=ME.username+(ME.is_admin?t('app.who_admin'):'');
@@ -701,12 +703,43 @@ window.__onLangChange=()=>{
   if(s==='genclient'){loadGen();loadCfg();loadDl();} if(s==='settings')loadSettings();
   if(RELAY_DETAIL_ID)showRelay(RELAY_DETAIL_ID);
 };
+// v38: hash routing — the console section lives in the URL (#/devices,
+// #/devices/relay-3), so a refresh or browser back/forward restores the
+// same view instead of always landing on overview.
+const SECTIONS=['overview','devices','users','tokens','genclient','settings'];
+function sectionAllowed(s){
+  if(SECTIONS.indexOf(s)<0)return false;
+  if(s==='users'||s==='settings')return !!(ME&&ME.is_admin);
+  return true;
+}
+function parseHash(){
+  const m=(location.hash||'').match(/^#\/([a-z]+)(?:\/relay-(\d+))?$/);
+  if(!m||!sectionAllowed(m[1]))return {s:'overview',relay:null};
+  return {s:m[1],relay:(m[1]==='devices'&&m[2])?parseInt(m[2],10):null};
+}
+function showSection(s,relay){
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+  const btn=document.querySelector('nav button[data-s="'+s+'"]');
+  if(btn)btn.classList.add('active');
+  document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));
+  $('s-'+s).classList.add('active');
+  if(s==='overview')loadOverview();
+  if(s==='devices'){
+    if(relay){ loadDevices().then(()=>{ const r=parseHash(); if(r.s==='devices'&&r.relay===relay&&RELAY_DETAIL_ID!==relay)showRelay(relay); }); }
+    else{ closeRelayDetail(); loadDevices(); }
+  }else closeRelayDetail();
+  if(s==='users')loadUsers(); if(s==='tokens')loadTokens();
+  if(s==='genclient'){loadGen();loadCfg();loadDl();} if(s==='settings')loadSettings();
+}
+function routeFromHash(){
+  const r=parseHash();
+  const want=r.relay?'#/devices/relay-'+r.relay:'#/'+r.s;
+  if(location.hash&&location.hash!==want)history.replaceState(null,'',want);
+  showSection(r.s,r.relay);
+}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');
-  document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));$('s-'+b.dataset.s).classList.add('active');
-  if(b.dataset.s==='overview')loadOverview(); if(b.dataset.s==='devices')loadDevices();
-  if(b.dataset.s==='users')loadUsers(); if(b.dataset.s==='tokens')loadTokens();
-  if(b.dataset.s==='genclient'){loadGen();loadCfg();loadDl();} if(b.dataset.s==='settings')loadSettings();
+  const h='#/'+b.dataset.s;
+  if(location.hash===h)routeFromHash(); else location.hash=h;
 });
 $('dev-refresh').onclick=()=>loadDevices();
 $('logout').onclick=async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(e){} location.href='/console/login';};
@@ -723,8 +756,8 @@ async function loadDevices(){
   if(!j.ok){ loadFail($('dev-list'),'loadDevices',j.error); return; }
   $('dev-updated').textContent=t('dev.updated')+new Date().toLocaleTimeString();
   if(!j.devices.length){$('dev-list').innerHTML='<p class="muted">'+t('dev.empty')+'</p>';}
-  else{$('dev-list').innerHTML='<table><tr><th>'+t('dev.id')+'</th><th>'+t('dev.status')+'</th><th>'+t('dev.hostname')+'</th><th>'+t('dev.os')+'</th><th>'+t('dev.owner')+'</th><th>'+t('dev.version')+'</th><th>'+t('dev.last_seen')+'</th></tr>'+
-    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">'+t('dev.online')+'</span>':'<span class="muted">'+t('dev.offline')+'</span>'}</td><td>${esc(d.hostname||'')}</td><td>${esc(d.os||'')}</td><td>${d.username?esc(d.username):'<span class=muted>'+t('dev.unbound')+'</span>'}</td><td>${esc(d.version||'')}</td><td>${new Date(d.last_seen*1000).toLocaleString()}</td></tr>`).join('')+'</table>';}
+  else{$('dev-list').innerHTML='<table><tr><th>'+t('dev.id')+'</th><th>'+t('dev.status')+'</th><th>'+t('dev.hostname')+'</th><th>'+t('dev.os')+'</th><th>'+t('dev.owner')+'</th><th>'+t('dev.version')+'</th><th>'+t('dev.last_seen')+'</th><th>'+t('dev.last_relay')+'</th></tr>'+
+    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">'+t('dev.online')+'</span>':'<span class="muted">'+t('dev.offline')+'</span>'}</td><td>${esc(d.hostname||'')}</td><td>${esc(d.os||'')}</td><td>${d.username?esc(d.username):'<span class=muted>'+t('dev.unbound')+'</span>'}</td><td>${esc(d.version||'')}</td><td>${new Date(d.last_seen*1000).toLocaleString()}</td><td>${esc(d.last_relay||'-')}</td></tr>`).join('')+'</table>';}
   renderRelays(j.relays||[]);
   if(ME&&ME.is_admin)loadRelayLinks();
 }
@@ -768,8 +801,12 @@ let RELAY_DETAIL_ID=null;
 let RELAY_DETAIL_NAME='';
 async function showRelay(id){
   let j; try{ j=await api('/api/admin/relays/'+id); }catch(e){ if(e.message!=='unauth')alert(t('relay.load_fail')); return; }
-  if(!j.ok){ alert(j.error||t('relay.load_fail')); return; }
+  if(!j.ok){ alert(j.error||t('relay.load_fail')); if(location.hash==='#/devices/relay-'+id)location.hash='#/devices'; return; }
+  const active=document.querySelector('nav button.active');
+  if(!active||active.dataset.s!=='devices')return;
   RELAY_DETAIL_ID=id;
+  const h='#/devices/relay-'+id;
+  if(location.hash!==h)location.hash=h;
   RELAY_DETAIL_NAME=j.node.name||'';
   const n=j.node, cfg=n.config||{};
   const lim=v=>(v==null?'':v);
@@ -800,7 +837,8 @@ async function showRelay(id){
   $('relay-detail-card').style.display='';
   $('relay-detail-card').scrollIntoView({behavior:'smooth'});
 }
-function backRelay(){ RELAY_DETAIL_ID=null; RELAY_DETAIL_NAME=''; $('relay-detail-card').style.display='none'; }
+function closeRelayDetail(){ RELAY_DETAIL_ID=null; RELAY_DETAIL_NAME=''; $('relay-detail-card').style.display='none'; }
+function backRelay(){ closeRelayDetail(); if(location.hash!== '#/devices')location.hash='#/devices'; }
 async function relayPushCfg(id){
   const btn=$('rcfg-push'); if(btn.disabled)return; btn.disabled=true;
   const num=v=>{const s=String(v).trim(); if(!s)return null; const n=parseFloat(s); return isNaN(n)?null:n;};

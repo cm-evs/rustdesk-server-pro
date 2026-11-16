@@ -370,7 +370,7 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "create table if not exists client_tokens(token text primary key, username text not null, device_id text not null default '', uuid text not null default '', created_at integer not null)",
         "create table if not exists oidc_codes(code text primary key, device_id text not null, uuid text not null, username text, created_at integer not null)",
         "create table if not exists api_tokens(id integer primary key autoincrement, username text not null, name text not null, token_hash text not null, created_at integer not null, last_used_at integer)",
-        "create table if not exists devices(device_id text not null, uuid text not null, username text, hostname text not null default '', os text not null default '', os_username text not null default '', version text not null default '', last_seen integer not null, sysinfo text not null default '', primary key(device_id, uuid))",
+        "create table if not exists devices(device_id text not null, uuid text not null, username text, hostname text not null default '', os text not null default '', os_username text not null default '', version text not null default '', last_seen integer not null, sysinfo text not null default '', last_relay text not null default '', last_relay_at integer not null default 0, primary key(device_id, uuid))",
         "create table if not exists settings(key text primary key, value text not null)",
         "create table if not exists gen_clients(id integer primary key autoincrement, filename text not null, token text not null, label text not null default '', created_by text not null, created_at integer not null)",
         "create table if not exists ab_store(username text primary key, data text not null)",
@@ -383,6 +383,23 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
             .execute(&pool)
             .await
             .map_err(|e| e.to_string())?;
+    }
+    // v38: the relay a device's most recent relayed session actually
+    // used (recorded from RelayResponse / RequestRelay; empty until
+    // the device has had a relayed session). ALTER TABLE fails with
+    // "duplicate column name" on databases that already have the
+    // columns; that error is expected and ignored, any other error
+    // fails startup so a broken migration is never silent.
+    for s in [
+        "alter table devices add column last_relay text not null default ''",
+        "alter table devices add column last_relay_at integer not null default 0",
+    ] {
+        if let Err(e) = sqlx::query(s).execute(&pool).await {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(msg);
+            }
+        }
     }
     Ok(pool)
 }
@@ -1735,13 +1752,13 @@ async fn devices_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMa
     };
     let rows = if u.is_admin {
         sqlx::query(
-            "select device_id, uuid, username, hostname, os, version, last_seen from devices order by last_seen desc",
+            "select device_id, uuid, username, hostname, os, version, last_seen, last_relay, last_relay_at from devices order by last_seen desc",
         )
         .fetch_all(&st.pool)
         .await
     } else {
         sqlx::query(
-            "select device_id, uuid, username, hostname, os, version, last_seen from devices where username=? order by last_seen desc",
+            "select device_id, uuid, username, hostname, os, version, last_seen, last_relay, last_relay_at from devices where username=? order by last_seen desc",
         )
         .bind(&u.username)
         .fetch_all(&st.pool)
@@ -1762,6 +1779,8 @@ async fn devices_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMa
                 "os": r.try_get::<String, _>("os").unwrap_or_default(),
                 "version": r.try_get::<String, _>("version").unwrap_or_default(),
                 "last_seen": r.try_get::<i64, _>("last_seen").unwrap_or(0),
+                "last_relay": r.try_get::<String, _>("last_relay").unwrap_or_default(),
+                "last_relay_at": r.try_get::<i64, _>("last_relay_at").unwrap_or(0),
             })
         })
         .collect();

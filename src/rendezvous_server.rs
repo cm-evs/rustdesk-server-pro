@@ -648,12 +648,31 @@ impl RendezvousServer {
                         allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                         return true;
                     }
+                    // The relay this session will use, recorded against
+                    // both peers: rf.id is the controlled peer (B); the
+                    // controller (A) is its login token's device when
+                    // logged in, else the unique peer registered from
+                    // its address. Only when B is online (the request
+                    // is actually forwarded). B's RelayResponse in
+                    // this flow carries no relay_server — B only
+                    // acknowledges — so the RelayResponse branch cannot
+                    // record it.
+                    let peer_b = rf.id.clone();
+                    let relay_used = rf.relay_server.clone();
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        if !relay_used.is_empty() {
+                            let peer_a = match controller_device {
+                                Some(d) => Some(d),
+                                None => self.pm.get_id_by_ip(addr.ip()).await,
+                            };
+                            Self::record_last_relay(&peer_b, peer_a.as_deref(), &relay_used)
+                                .await;
+                        }
                     }
                     return true;
                 }
@@ -667,9 +686,18 @@ impl RendezvousServer {
                     }
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
-                    let id = rr.id();
-                    if !id.is_empty() {
-                        let pk = self.get_pk(&rr.version, id.to_owned()).await;
+                    // The relay this session actually used, recorded
+                    // against both peers. rr.id is the controlled peer
+                    // (B); the controller (A) is identified by its
+                    // address, which B echoed back — only when exactly
+                    // one online peer registered from that IP. The value
+                    // recorded is the relay B resolved, before the LAN
+                    // rewrite below (the rewrite only changes the
+                    // address form of the same relay for A).
+                    let peer_b = rr.id().to_owned();
+                    let relay_used = rr.relay_server.clone();
+                    if !peer_b.is_empty() {
+                        let pk = self.get_pk(&rr.version, peer_b.clone()).await;
                         rr.set_pk(pk);
                     }
                     let mut msg_out = RendezvousMessage::new();
@@ -682,6 +710,10 @@ impl RendezvousServer {
                         }
                     }
                     msg_out.set_relay_response(rr);
+                    if !relay_used.is_empty() && !peer_b.is_empty() {
+                        let peer_a = self.pm.get_id_by_ip(addr_b.ip()).await;
+                        Self::record_last_relay(&peer_b, peer_a.as_deref(), &relay_used).await;
+                    }
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
@@ -918,6 +950,58 @@ impl RendezvousServer {
         };
         pool.close().await;
         (must_login, device_id)
+    }
+
+    /// Record the relay a session actually used against the device rows
+    /// of both peers (devices.last_relay / last_relay_at). `peer_b` is
+    /// the controlled peer's id; `peer_a` is the controller's id when
+    /// known (login token, or the unique peer registered from its IP).
+    /// A device with no devices row (never heartbeated) is simply not
+    /// updated — no upsert. Best-effort: any failure only logs, never
+    /// breaking the relay flow.
+    async fn record_last_relay(peer_b: &str, peer_a: Option<&str>, relay: &str) {
+        let path = std::env::var("API_DB_PATH").unwrap_or_else(|_| "api_v1.sqlite3".to_owned());
+        Self::record_last_relay_at(peer_b, peer_a, relay, &path).await
+    }
+
+    async fn record_last_relay_at(peer_b: &str, peer_a: Option<&str>, relay: &str, path: &str) {
+        if relay.is_empty() || peer_b.is_empty() || !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut opts = SqliteConnectOptions::new().filename(path);
+        opts.log_statements(log::LevelFilter::Off);
+        let pool = match SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("record_last_relay: cannot open {path}: {e}");
+                return;
+            }
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for id in std::iter::once(peer_b).chain(peer_a) {
+            if id.is_empty() {
+                continue;
+            }
+            if let Err(e) = sqlx::query(
+                "update devices set last_relay=?, last_relay_at=? where device_id=?",
+            )
+            .bind(relay)
+            .bind(ts)
+            .bind(id)
+            .execute(&pool)
+            .await
+            {
+                log::warn!("record_last_relay: update for {id} failed: {e}");
+            }
+        }
+        pool.close().await;
     }
 
     async fn handle_punch_hole_request(
@@ -1911,6 +1995,104 @@ mod tests {
         assert!(!must_login);
         assert_eq!(device.as_deref(), Some("111222333"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scratch API database for record_last_relay tests: devices table
+    /// with the given device ids, all with empty last_relay.
+    async fn make_relay_db(tag: &str, devices: &[&str]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "hbbs_last_relay_{}_{}.sqlite3",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        opts.log_statements(log::LevelFilter::Off);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query("create table devices(device_id text not null, uuid text not null, last_relay text not null default '', last_relay_at integer not null default 0, primary key(device_id, uuid))")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for d in devices {
+            sqlx::query("insert into devices(device_id, uuid) values(?, 'u1')")
+                .bind(d)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+        path.to_string_lossy().into_owned()
+    }
+
+    /// (last_relay, last_relay_at) for a device, or None when the device
+    /// has no row at all.
+    async fn last_relay_of(path: &str, device: &str) -> Option<(String, i64)> {
+        let mut opts = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true);
+        opts.log_statements(log::LevelFilter::Off);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        let row = sqlx::query("select last_relay, last_relay_at from devices where device_id=?")
+            .bind(device)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        row.map(|r| {
+            (
+                r.try_get::<String, _>("last_relay").unwrap_or_default(),
+                r.try_get::<i64, _>("last_relay_at").unwrap_or(0),
+            )
+        })
+    }
+
+    #[hbb_common::tokio::test]
+    async fn record_last_relay_updates_both_ends() {
+        let path = make_relay_db("both", &["111222333", "999888777"]).await;
+        RendezvousServer::record_last_relay_at(
+            "999888777",
+            Some("111222333"),
+            "sramd2.668687.xyz",
+            &path,
+        )
+        .await;
+        let (relay_b, at_b) = last_relay_of(&path, "999888777").await.unwrap();
+        let (relay_a, at_a) = last_relay_of(&path, "111222333").await.unwrap();
+        assert_eq!(relay_b, "sramd2.668687.xyz");
+        assert_eq!(relay_a, "sramd2.668687.xyz");
+        assert!(at_b > 0 && at_a > 0);
+        // unknown device: no row is created, no error
+        RendezvousServer::record_last_relay_at("000000000", None, "x.example", &path).await;
+        assert_eq!(last_relay_of(&path, "000000000").await, None);
+        // empty relay: no-op, the recorded value survives
+        RendezvousServer::record_last_relay_at("999888777", None, "", &path).await;
+        assert_eq!(
+            last_relay_of(&path, "999888777").await.unwrap().0,
+            "sramd2.668687.xyz"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn record_last_relay_missing_db_fails_open() {
+        // must not panic when the API database does not exist (yet)
+        RendezvousServer::record_last_relay_at(
+            "999888777",
+            Some("111222333"),
+            "relay.example",
+            "/nonexistent-dir-xyz/no-such-db.sqlite3",
+        )
+        .await;
     }
 
     #[hbb_common::tokio::test]

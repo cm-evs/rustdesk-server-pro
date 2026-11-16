@@ -5,10 +5,16 @@ use hbb_common::{
     log,
     rendezvous_proto::*,
     tokio::sync::{Mutex, RwLock},
-    ResultType,
+    try_into_v4, ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
-use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
 type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
 type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
@@ -174,5 +180,123 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    /// The id of the single in-memory peer registered from `ip`, if
+    /// exactly one matches. Zero or several matches yield None: several
+    /// devices behind one NAT share an address, and guessing would
+    /// misattribute a session to the wrong device. Peers with no real
+    /// address yet (reconstructed from the database, port 0) never
+    /// match. Used to credit the controller side of a relayed session,
+    /// whose id never appears in rendezvous messages (only its address
+    /// does).
+    pub(crate) async fn get_id_by_ip(&self, ip: IpAddr) -> Option<String> {
+        let ip = try_into_v4(SocketAddr::new(ip, 0)).ip();
+        let map = self.map.read().await;
+        let mut found: Option<String> = None;
+        for (id, peer) in map.iter() {
+            let addr = peer.read().await.socket_addr;
+            if addr.port() != 0 && try_into_v4(addr).ip() == ip {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(id.clone());
+            }
+        }
+        found
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+
+    fn peer_with_addr(addr: &str) -> LockPeer {
+        let mut p = Peer::default();
+        p.socket_addr = addr.parse().unwrap();
+        Arc::new(RwLock::new(p))
+    }
+
+    /// PeerMap with the given (id, socket_addr) entries; the database
+    /// is a scratch file, only there because the struct needs one.
+    /// Returns the map and the scratch path (remove it when done).
+    async fn peer_map(tag: &str, entries: &[(&str, &str)]) -> (PeerMap, String) {
+        let path = std::env::temp_dir().join(format!(
+            "hbbs_peer_map_{}_{}.sqlite3",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = database::Database::new(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let map = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut w = map.write().await;
+            for (id, addr) in entries {
+                w.insert(id.to_string(), peer_with_addr(addr));
+            }
+        }
+        (
+            PeerMap { map, db },
+            path.to_string_lossy().into_owned(),
+        )
+    }
+
+    #[hbb_common::tokio::test]
+    async fn get_id_by_ip_unique_match() {
+        let (pm, path) = peer_map(
+            "unique",
+            &[
+                ("111222333", "1.2.3.4:12345"),
+                ("999888777", "[::ffff:5.6.7.8]:23456"),
+            ],
+        )
+        .await;
+        // plain match, and an IPv6-mapped registration matches a v4 lookup
+        assert_eq!(
+            pm.get_id_by_ip("1.2.3.4".parse().unwrap()).await.as_deref(),
+            Some("111222333")
+        );
+        assert_eq!(
+            pm.get_id_by_ip("5.6.7.8".parse().unwrap()).await.as_deref(),
+            Some("999888777")
+        );
+        // no peer from this address
+        assert_eq!(pm.get_id_by_ip("9.9.9.9".parse().unwrap()).await, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn get_id_by_ip_ambiguous_is_none() {
+        // two devices behind one NAT share the address: refuse to guess
+        let (pm, path) = peer_map(
+            "ambiguous",
+            &[("111222333", "1.2.3.4:12345"), ("999888777", "1.2.3.4:23456")],
+        )
+        .await;
+        assert_eq!(pm.get_id_by_ip("1.2.3.4".parse().unwrap()).await, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn get_id_by_ip_ignores_port_zero() {
+        // a database-reconstructed peer (0.0.0.0:0) must not shadow a
+        // real peer, and must not match a 0.0.0.0 lookup either
+        let (pm, path) = peer_map(
+            "portzero",
+            &[("111222333", "0.0.0.0:0"), ("999888777", "1.2.3.4:12345")],
+        )
+        .await;
+        assert_eq!(
+            pm.get_id_by_ip("1.2.3.4".parse().unwrap()).await.as_deref(),
+            Some("999888777")
+        );
+        assert_eq!(
+            pm.get_id_by_ip("0.0.0.0".parse().unwrap()).await,
+            None
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

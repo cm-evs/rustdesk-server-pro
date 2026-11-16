@@ -23,6 +23,31 @@ A self-hosted remote desktop server based on the official open-source [rustdesk-
 - **Relay node management**: a resident agent (relay-agent) runs on each relay host; the console generates a one-time registration link to enroll it; the server pushes the keypair and config (port, speed limits, restart) over encrypted channels, and the device list shows relay node status (online/offline, sessions, throughput) — click a node name for details
 - **Windows service support**: `winservice/` provides the rdsvc.exe service host and management scripts to register hbbs / hbbr as auto-start Windows services
 - **Runtime files stay put**: everything the server produces at runtime (databases, logs, keys, etc.) lands in the server program's own directory
+- **Template download**: hbbs has a built-in downloader with mirror fallback that fetches the latest official client as the generation template
+- **ARM64 support**: aarch64 glibc and musl static packages; the musl build runs on OpenWrt soft-routers
+- **Online one-click update**: check GitHub Releases from the console, read the full changelog, download and stage, auto-replace on restart
+- **Other-platform download links**: official macOS / Linux / Android / iOS download links, plus a mirror-acceleration checkbox
+- **One-click copy config**: generates a config string in the same format as the official Pro console's — paste it into the official client to import
+- **Console Chinese/English switch**: Chinese by default; the choice is remembered
+- **Require-login switch**: when on, clients that have not logged in cannot establish connections — TCP, UDP, and WebSocket are all blocked
+- **Main-deployment relay key validation**: the main deployment's hbbr runs with `-k -`, so clients with a mismatched key are refused on relay
+- **KX encryption on the 21116 control channel**: secure_tcp KX v0 encrypts login traffic; old clients can still connect in plaintext
+- **Console URL state**: the current section is written to the address bar hash, so a refresh no longer returns to the overview
+
+## Version changelog
+
+- **Before v28**: the foundations — account system, web console, client generation, security hardening, and more
+- **v28**: fixed the device database escaping its directory on Windows + service.bat menu
+- **v29**: merged upstream relay UUID validation hardening
+- **v30**: merged upstream hardening (message size limits, etc.); added ARM64 Linux packages (glibc / musl)
+- **v31**: fixed "File name too long" for generated clients with long domains
+- **v32**: online one-click update + API usage docs
+- **v33**: other-platform official download links + one-click copy config
+- **v34**: console Chinese/English switch + English deployment guide + download mirror checkbox
+- **v35**: require-login switch
+- **v36**: relay node management (registration + config push + status)
+- **v37**: main-deployment relay key validation (hbbr with `-k -`)
+- **v38**: KX encryption on the 21116 control channel (secure_tcp KX v0) + console URL state (hash routing; refresh no longer returns to the overview) + "Last relay used" column in the device list
 
 ## Quick start
 
