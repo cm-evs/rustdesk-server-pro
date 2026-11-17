@@ -89,7 +89,7 @@ pub struct TplJob {
 /// NOTE: this deliberately does NOT live in version.rs — build.rs
 /// regenerates that file on every build (see hbb_common::gen_version)
 /// and would wipe a hand-written constant.
-const PRO_VERSION: &str = "38";
+const PRO_VERSION: &str = "39";
 
 /// Progress state of the background one-click server update download.
 #[derive(Default)]
@@ -1743,6 +1743,42 @@ async fn admin_user_password(
         Ok(_) => err_resp(StatusCode::NOT_FOUND, "用户不存在"),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// Admin creates a user from user management (issue #6). With
+/// registration closed, the register page is the only creation path
+/// and it signs the admin out (it issues a session for the new user),
+/// so admins get a dedicated endpoint instead. Deliberately issues
+/// NO session for the new user: the admin stays logged in.
+async fn admin_create_user(
+    Extension(st): Extension<Arc<ApiState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    if !u.is_admin {
+        return forbidden();
+    }
+    let v = parse_body(&body);
+    let username = sfield(&v, "username");
+    let password = sfield(&v, "password");
+    // create_user validates the username (3-32 chars, [A-Za-z0-9_-.])
+    // and the password (>= 6 chars) and reports duplicates.
+    if let Err(e) = create_user(&st.pool, &username, &password).await {
+        return err_resp(StatusCode::BAD_REQUEST, &e);
+    }
+    auth_log(
+        "user-created",
+        "admin",
+        &username,
+        &addr.ip().to_string(),
+        &format!("by={}", u.username),
+    );
+    jresp(StatusCode::OK, json!({ "ok": true }))
 }
 
 async fn devices_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMap) -> Response {
@@ -4734,7 +4770,7 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/client-config", get(client_config_view))
             .route("/api/client-downloads", get(client_downloads))
             .route("/api/admin/overview", get(overview))
-            .route("/api/admin/users", get(admin_users))
+            .route("/api/admin/users", get(admin_users).post(admin_create_user))
             .route("/api/admin/users/:name/password", post(admin_user_password))
             .route("/api/admin/users/:name/:action", post(admin_user_action))
             .route("/api/devices", get(devices_list))
@@ -5365,7 +5401,7 @@ mod tests {
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
         assert_eq!(parse_pro_tag("v32 "), Some(32));
-        assert_eq!(current_pro_num(), 38);
+        assert_eq!(current_pro_num(), 39);
     }
 
     #[test]
@@ -5809,6 +5845,260 @@ mod tests {
         assert!(cfg["limit_speed"].is_null());
         assert!(cfg["total_bandwidth"].is_null());
         assert!(cfg["single_bandwidth"].is_null());
+    }
+
+    // ---- v39: admin create-user (issue #6) ----
+
+    /// Test ApiState backed by a throwaway temp-file DB (an in-memory
+    /// pool would split across connections: init_db allows 8).
+    async fn v39_test_state(tag: &str) -> (Arc<ApiState>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("rdp-v39-test-{tag}.sqlite3"));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(path.to_str().unwrap_or(""))
+            .await
+            .expect("init test db");
+        let dir = std::env::temp_dir();
+        let st = Arc::new(ApiState {
+            pool,
+            clients_dir: dir.join("v39-clients"),
+            templates_dir: dir.join("v39-templates"),
+            exe_dir: dir.clone(),
+            peer_db_path: "db_v2.sqlite3".to_string(),
+            key_override: String::new(),
+            tpl_job: std::sync::Mutex::new(TplJob::default()),
+            upd_job: std::sync::Mutex::new(UpdJob::default()),
+            guard: std::sync::Mutex::new(AuthGuard::default()),
+            dl_cache: std::sync::Mutex::new(None),
+            reg_challenges: std::sync::Mutex::new(HashMap::new()),
+            hb_replay: std::sync::Mutex::new(HashMap::new()),
+        });
+        (st, path)
+    }
+
+    fn v39_sid_headers(sid: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Ok(v) = format!("rdp_sid={sid}").parse::<header::HeaderValue>() {
+            h.insert(header::COOKIE, v);
+        }
+        h
+    }
+
+    fn v39_block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(f)
+    }
+
+    async fn v39_count(pool: &SqlitePool, sql: &str, username: &str) -> i64 {
+        sqlx::query(sql)
+            .bind(username)
+            .fetch_one(pool)
+            .await
+            .expect("count query")
+            .try_get("c")
+            .unwrap_or(-1)
+    }
+
+    async fn v39_call_create(st: &Arc<ApiState>, headers: HeaderMap, body: &str) -> StatusCode {
+        admin_create_user(
+            Extension(st.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))),
+            headers,
+            body.to_string(),
+        )
+        .await
+        .status()
+    }
+
+    #[test]
+    fn admin_create_user_admin_ok_and_no_session() {
+        v39_block(async {
+            let (st, path) = v39_test_state("ok").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            let sid = new_web_session(&st, "admin").await.expect("admin session");
+            let headers = v39_sid_headers(&sid);
+            let status = v39_call_create(
+                &st,
+                headers.clone(),
+                "{\"username\":\"bob\",\"password\":\"secret123\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            // The user exists and can log in...
+            assert_eq!(
+                v39_count(
+                    &st.pool,
+                    "select count(*) as c from users where username=?",
+                    "bob"
+                )
+                .await,
+                1
+            );
+            assert!(matches!(
+                verify_user(&st.pool, "bob", "secret123").await,
+                Ok(Some(_))
+            ));
+            // ...but no web session was issued for the new user...
+            assert_eq!(
+                v39_count(
+                    &st.pool,
+                    "select count(*) as c from web_sessions where username=?",
+                    "bob"
+                )
+                .await,
+                0
+            );
+            // ...and the admin's own session still resolves.
+            let u = resolve_user(&st, &headers).await;
+            assert!(u.is_some());
+            assert_eq!(u.map(|x| x.username).unwrap_or_default(), "admin");
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn admin_create_user_forbids_non_admin() {
+        v39_block(async {
+            let (st, path) = v39_test_state("nonadmin").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "alice", "alice123")
+                .await
+                .expect("create alice");
+            let sid = new_web_session(&st, "alice").await.expect("alice session");
+            let status = v39_call_create(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"username\":\"bob\",\"password\":\"secret123\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(
+                v39_count(
+                    &st.pool,
+                    "select count(*) as c from users where username=?",
+                    "bob"
+                )
+                .await,
+                0
+            );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn admin_create_user_requires_login() {
+        v39_block(async {
+            let (st, path) = v39_test_state("nologin").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            let status = v39_call_create(
+                &st,
+                HeaderMap::new(),
+                "{\"username\":\"bob\",\"password\":\"secret123\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn admin_create_user_rejects_duplicate() {
+        v39_block(async {
+            let (st, path) = v39_test_state("dup").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "bob", "secret123")
+                .await
+                .expect("create bob");
+            let sid = new_web_session(&st, "admin").await.expect("admin session");
+            let status = v39_call_create(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"username\":\"bob\",\"password\":\"otherpass\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn admin_create_user_rejects_short_password() {
+        v39_block(async {
+            let (st, path) = v39_test_state("shortpw").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            let sid = new_web_session(&st, "admin").await.expect("admin session");
+            let status = v39_call_create(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"username\":\"bob\",\"password\":\"12345\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                v39_count(
+                    &st.pool,
+                    "select count(*) as c from users where username=?",
+                    "bob"
+                )
+                .await,
+                0
+            );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn admin_create_user_rejects_bad_username() {
+        v39_block(async {
+            let (st, path) = v39_test_state("badname").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            let sid = new_web_session(&st, "admin").await.expect("admin session");
+            let headers = v39_sid_headers(&sid);
+            // Too short.
+            assert_eq!(
+                v39_call_create(
+                    &st,
+                    headers.clone(),
+                    "{\"username\":\"ab\",\"password\":\"secret123\"}",
+                )
+                .await,
+                StatusCode::BAD_REQUEST
+            );
+            // Illegal characters (space and '!').
+            assert_eq!(
+                v39_call_create(
+                    &st,
+                    headers.clone(),
+                    "{\"username\":\"bad name!\",\"password\":\"secret123\"}",
+                )
+                .await,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                v39_count(
+                    &st.pool,
+                    "select count(*) as c from users where username=?",
+                    "ab"
+                )
+                .await,
+                0
+            );
+            let _ = std::fs::remove_file(&path);
+        });
     }
 
 }

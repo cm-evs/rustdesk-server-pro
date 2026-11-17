@@ -441,6 +441,15 @@ cd rustdesk-server-pro-linux-*
 - 验证：新增 11 个单元测试（KX 6 个：客户端密封的密钥服务端可解开、篡改/错对端密钥被拒、phase 1 签名验签与错公钥拒绝、生成的 X25519 公钥最高位恒清、v0 双向流互通与序号推进；中继记录 2 个：两端更新/无行不补/缺库放行；地址唯一匹配 3 个：唯一命中/多设备不猜/零端口忽略），cargo test 86/86（debug 与 release；lib 71 + hbbr 14 + 集成 1）；新增 KX 端到端 25/25（debug 与 release 各两遍：Python 客户端按 1.5.0 客户端的 key_exchange 实现——phase 1 形状与签名验签、加密往返、线上传的是密文（原始帧与明文编码不同且解析不出对应消息）、篡改/畸形/错密钥握手均被断开、老客户端明文路径仍通、加密通道上的必须登录拒绝与放行、WS 不变且 WS 上的 KeyExchange 被断开、重启后换新临时密钥对仍能握手）；新增 hash 路由端到端 38/38（debug 与 release 各两遍：点区写 hash、刷新保持、前进/后退生效、中继详情深链恢复、非法 hash 与非管理员回退概览、最近中继列中英文表头与有值/无值渲染）；新增最近中继端到端 25/25（debug 与 release 各两遍：真实 RelayResponse/RequestRelay 协议消息驱动——被控端与控制端（登录 token）两端记录、新会话覆盖旧值、空值/无名设备不记录不补行、旧数据库启动自动加列且重启无碍）；全量回归 52 次运行全绿（控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/rendezvous_server.rs、src/peer.rs、src/api.rs（全平台统一逻辑）与控制台前端 src/api_pages.rs，无新增 Windows/release 专属分支；hbbr 不动。
 - 真机确认项：真实客户端（1.5.3）连上后，客户端日志里有 "Connection secured" 即表示加密通道已建立；服务端侧的 "KeyExchange symmetric key set" 是 debug 级日志，默认 info 级别下不显示，需 RUST_LOG=debug 才可见。另请确认老版本客户端仍能正常连接登录。最近使用的中继列：真实中继会话后，控制台设备列表对应设备行显示实际走的中继；同一公网 IP 下有多台设备时，控制端一侧可能无值（不猜，属预期行为）。
 
+## v39：用户管理里管理员直接建号（Fixes #6）
+
+- 背景（2026-11-17，GitHub issue #6）：关闭注册（allow_register=0）后管理员建号是死循环——「注册」按钮只在登录页，须退出登录才看得到，退出后注册又被拒绝；用新标签页直接打开注册 URL 能建号，但建号成功后服务端给新用户签发会话，把管理员的登录态顶掉。控制台用户管理也没有建号入口。本版补上管理员建号入口。
+- 新增接口（控制台管理面，管理员专用）：`POST /api/admin/users`，请求体 `{"username": "...", "password": "..."}`。用户名规则与注册一致（3–32 位字母、数字、`_-.)；密码至少 6 位（与重置密码规则一致）；用户名已存在返回 400。成功只返回 `{"ok": true}`，不给新用户签发会话——管理员保持登录。非管理员调用返回 403，未登录返回 401。管理面拆分后只能走 console 地址，API 地址上是 404。每次建号记一条 `[auth] user-created ... by=<管理员>` 审计日志（logs/hbbs.log）。
+- 控制台：用户管理区新增「新建用户」表单（用户名 + 密码 + 新建按钮），在用户列表上方；建号成功后刷新列表、清空表单并显示「用户已创建」；失败（重名、密码太短、用户名不合法）在表单下方内联显示错误，不弹窗。中英文字段齐全（随控制台语言切换）。
+- 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。
+- 验证：新增 6 个单元测试（管理员建号成功且不签发会话、管理员会话仍有效；非管理员 403；未登录 401；重名、密码太短、用户名不合法均 400），cargo test 92/92（debug 与 release；lib 77 + hbbr 14 + 集成 1）；新增用户管理端到端 33/33（debug 与 release 各两遍：管理员建号、新用户网页/客户端登录、管理员会话存活、403/401 与校验错误、注册关闭场景下建号、旧注册路径仍顶掉会话的对照、管理面拆分下仅 console 地址可用、审计日志 `[auth] user-created`）；新增控制台界面端到端 19/19（debug 与 release 各两遍：真实 Chromium——表单渲染、填表建号、成功提示与列表刷新、表单清空、重名/短密码内联错误、中英文切换）；全量回归 60 次运行全绿（控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 19/19 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs 与控制台前端 src/api_pages.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动。
+- 真机确认项：控制台用户管理建一个新账号，新账号能登录，管理员登录态不被顶掉。
+
 ## API 调用说明
 
 服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/client-downloads`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。
@@ -677,7 +686,7 @@ curl -s -X POST http://203.0.113.10:21114/api/admin/update/restart \
 # {"ok":true}，服务端约 0.5 秒后退出，由启动器换上新版并拉起
 ```
 
-**其他管理接口**（控制台页面内部使用）：`GET /api/admin/overview`（概览统计）、`GET /api/admin/users` 与 `POST /api/admin/users/:name/password`、`POST /api/admin/users/:name/:action`（用户管理）、`GET/POST /api/admin/settings`（服务器设置）、`POST /api/admin/template/download` 与 `GET /api/admin/template/status`（模板下载）。这几个接口的字段以控制台页面的实际调用为准，不再逐一列出。
+**其他管理接口**（控制台页面内部使用）：`GET /api/admin/overview`（概览统计）、`GET /api/admin/users` 与 `POST /api/admin/users`（新建用户）、`POST /api/admin/users/:name/password`、`POST /api/admin/users/:name/:action`（用户管理）、`GET/POST /api/admin/settings`（服务器设置）、`POST /api/admin/template/download` 与 `GET /api/admin/template/status`（模板下载）。这几个接口的字段以控制台页面的实际调用为准，不再逐一列出。
 
 ## 日志
 

@@ -83,6 +83,7 @@ const I18N={zh:{
 'usr.unadmin':'取消管理员','usr.make_admin':'设管理员','usr.reset_pwd':'重置密码',
 'usr.delete_confirm':'删除用户 {n}？该账号将无法登录，其设备变为未绑定，名下 API Token 同时吊销；删除不可恢复。',
 'usr.pwd_prompt':'为 {n} 设置新密码（至少 6 位）','usr.pwd_reset':'已重置',
+'usr.create':'新建用户','usr.password':'密码','usr.new_name_ph':'用户名（3-32 位字母、数字、_-.)','usr.new_pass_ph':'密码（至少 6 位）','usr.created_ok':'用户已创建',
 'tok.title':'API Token（供第三方系统集成）','tok.desc1':'请求带',
 'tok.desc2':'即可调用管理接口。Token 只在创建时显示一次。','tok.name':'名称',
 'tok.name_ph':'如：内部系统','tok.create':'创建 Token','tok.created':'创建时间',
@@ -228,6 +229,7 @@ const I18N={zh:{
 'usr.unadmin':'Remove admin','usr.make_admin':'Make admin','usr.reset_pwd':'Reset password',
 'usr.delete_confirm':'Delete user {n}? The account will no longer be able to sign in, its devices will become unbound, and its API tokens will be revoked. This cannot be undone.',
 'usr.pwd_prompt':'Set a new password for {n} (at least 6 characters)','usr.pwd_reset':'Password reset',
+'usr.create':'Create user','usr.password':'Password','usr.new_name_ph':'Username (3-32 letters, digits, _-.)','usr.new_pass_ph':'Password (at least 6 characters)','usr.created_ok':'User created',
 'tok.title':'API Tokens (for third-party integrations)','tok.desc1':'Send requests with',
 'tok.desc2':'to call the management APIs. A token is shown only once, when created.',
 'tok.name':'Name','tok.name_ph':'e.g. internal system','tok.create':'Create Token',
@@ -599,7 +601,12 @@ const CONSOLE_BODY: &str = r#"
 </section>
 
 <section id="s-users">
-<div class="card"><h2 data-i18n="usr.title">用户管理</h2><div id="user-list" data-i18n="app.loading">加载中…</div></div>
+<div class="card"><h2 data-i18n="usr.title">用户管理</h2>
+<div class="err" id="usr-new-err"></div><div class="ok" id="usr-new-ok"></div>
+<label data-i18n="usr.username">用户名</label><input id="usr-new-name" placeholder="用户名（3-32 位字母、数字、_-.)" data-i18n-ph="usr.new_name_ph">
+<label data-i18n="usr.password">密码</label><input id="usr-new-pass" type="password" placeholder="密码（至少 6 位）" data-i18n-ph="usr.new_pass_ph">
+<button id="usr-new-btn" data-i18n="usr.create">新建用户</button>
+<div id="user-list" style="margin-top:12px" data-i18n="app.loading">加载中…</div></div>
 </section>
 
 <section id="s-tokens">
@@ -879,6 +886,15 @@ async function upwd(name){
   const j=await api('/api/admin/users/'+encodeURIComponent(name)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
   alert(j.ok?t('usr.pwd_reset'):(j.error||t('app.failed')));
 }
+$('usr-new-btn').onclick=async()=>{
+  const btn=$('usr-new-btn'); if(btn.disabled)return; btn.disabled=true;
+  $('usr-new-err').textContent='';$('usr-new-ok').textContent='';
+  try{
+    const j=await api('/api/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('usr-new-name').value,password:$('usr-new-pass').value})});
+    if(j.ok){$('usr-new-name').value='';$('usr-new-pass').value='';$('usr-new-ok').textContent=t('usr.created_ok');loadUsers();}else{$('usr-new-err').textContent=j.error||t('app.failed');}
+  }catch(e){ if(e.message!=='unauth')$('usr-new-err').textContent=t('app.network_err'); }
+  btn.disabled=false;
+};
 let TOKENS=[];
 async function loadTokens(){
   let j; try{ j=await api('/api/tokens'); }catch(e){ if(e.message!=='unauth')loadFail($('tok-list'),'loadTokens'); return; }

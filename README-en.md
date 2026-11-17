@@ -48,6 +48,7 @@ A self-hosted remote desktop server based on the official open-source [rustdesk-
 - **v36**: relay node management (registration + config push + status)
 - **v37**: main-deployment relay key validation (hbbr with `-k -`)
 - **v38**: KX encryption on the 21116 control channel (secure_tcp KX v0) + console URL state (hash routing; refresh no longer returns to the overview) + "Last relay used" column in the device list
+- **v39**: admins create users directly in user management (works with registration closed; creating a user does not sign the admin out)
 
 ## Quick start
 
