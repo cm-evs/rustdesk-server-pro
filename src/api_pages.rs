@@ -54,7 +54,7 @@ const I18N={zh:{
 'app.po':'（','app.pc':'）',
 'app.unknown_err':'未知错误','app.network_err':'网络错误，请重试','app.op_failed':'操作失败',
 'app.failed':'失败','app.copy':'复制','app.copied':'已复制','app.copy_failed':'复制失败',
-'app.download':'下载','app.delete':'删除',
+'app.download':'下载','app.delete':'删除','app.cancel':'取消',
 'app.load_fail_refresh':'加载失败，请检查网络后刷新页面','app.who_admin':'（管理员）',
 'auth.username':'用户名','auth.password':'密码','auth.password_min':'密码（至少 6 位）',
 'auth.captcha':'验证码','auth.cap_img_ph':'输入图片中的字符','auth.cap_text_ph':'输入计算结果',
@@ -87,7 +87,7 @@ const I18N={zh:{
 'usr.unadmin':'取消管理员','usr.make_admin':'设管理员','usr.reset_pwd':'重置密码',
 'usr.delete_confirm':'删除用户 {n}？该账号将无法登录，其设备变为未绑定，名下 API Token 同时吊销；删除不可恢复。',
 'usr.pwd_prompt':'为 {n} 设置新密码（至少 6 位）','usr.pwd_reset':'已重置',
-'usr.create':'新建用户','usr.password':'密码','usr.new_name_ph':'用户名（3-32 位字母、数字、_-.)','usr.new_pass_ph':'密码（至少 6 位）','usr.created_ok':'用户已创建',
+'usr.create':'新建用户','usr.create_submit':'创建','usr.password':'密码','usr.new_name_ph':'用户名（3-32 位字母、数字、_-.)','usr.new_pass_ph':'密码（至少 6 位）','usr.created_ok':'用户已创建',
 'tok.title':'API Token（供第三方系统集成）','tok.desc1':'请求带',
 'tok.desc2':'即可调用管理接口。Token 只在创建时显示一次。','tok.name':'名称',
 'tok.name_ph':'如：内部系统','tok.create':'创建 Token','tok.created':'创建时间',
@@ -210,7 +210,7 @@ const I18N={zh:{
 'app.po':'(','app.pc':')',
 'app.unknown_err':'Unknown error','app.network_err':'Network error, please retry',
 'app.op_failed':'Operation failed','app.failed':'Failed','app.copy':'Copy','app.copied':'Copied',
-'app.copy_failed':'Copy failed','app.download':'Download','app.delete':'Delete','app.load_fail_refresh':'Failed to load. Check your network and refresh the page.',
+'app.copy_failed':'Copy failed','app.download':'Download','app.delete':'Delete','app.cancel':'Cancel','app.load_fail_refresh':'Failed to load. Check your network and refresh the page.',
 'app.who_admin':' (admin)',
 'auth.username':'Username','auth.password':'Password','auth.password_min':'Password (at least 6 characters)',
 'auth.captcha':'Captcha','auth.cap_img_ph':'Enter the characters in the image',
@@ -244,7 +244,7 @@ const I18N={zh:{
 'usr.unadmin':'Remove admin','usr.make_admin':'Make admin','usr.reset_pwd':'Reset password',
 'usr.delete_confirm':'Delete user {n}? The account will no longer be able to sign in, its devices will become unbound, and its API tokens will be revoked. This cannot be undone.',
 'usr.pwd_prompt':'Set a new password for {n} (at least 6 characters)','usr.pwd_reset':'Password reset',
-'usr.create':'Create user','usr.password':'Password','usr.new_name_ph':'Username (3-32 letters, digits, _-.)','usr.new_pass_ph':'Password (at least 6 characters)','usr.created_ok':'User created',
+'usr.create':'Create user','usr.create_submit':'Create','usr.password':'Password','usr.new_name_ph':'Username (3-32 letters, digits, _-.)','usr.new_pass_ph':'Password (at least 6 characters)','usr.created_ok':'User created',
 'tok.title':'API Tokens (for third-party integrations)','tok.desc1':'Send requests with',
 'tok.desc2':'to call the management APIs. A token is shown only once, when created.',
 'tok.name':'Name','tok.name_ph':'e.g. internal system','tok.create':'Create Token',
@@ -589,7 +589,7 @@ const CONSOLE_BODY: &str = r#"
 <label data-i18n="pwd.old">旧密码</label><input id="pwd-old" type="password" placeholder="当前使用的密码" data-i18n-ph="pwd.old_ph">
 <label data-i18n="pwd.new">新密码</label><input id="pwd-new" type="password" placeholder="新密码（至少 6 位）" data-i18n-ph="pwd.new_ph">
 <label data-i18n="pwd.confirm">确认新密码</label><input id="pwd-confirm" type="password" placeholder="再次输入新密码" data-i18n-ph="pwd.confirm_ph">
-<button id="pwd-submit" data-i18n="pwd.submit">确认修改</button></div>
+<button id="pwd-submit" data-i18n="pwd.submit">确认修改</button> <button class="ghost" id="pwd-cancel" data-i18n="app.cancel">取消</button></div>
 <nav>
 <button data-s="overview" class="active" data-i18n="nav.overview">概览</button>
 <button data-s="devices" data-i18n="nav.devices">设备</button>
@@ -641,10 +641,13 @@ const CONSOLE_BODY: &str = r#"
 
 <section id="s-users">
 <div class="card"><h2 data-i18n="usr.title">用户管理</h2>
+<p><button id="usr-new-toggle" data-i18n="usr.create">新建用户</button></p>
+<div id="usr-new-form" style="display:none">
 <div class="err" id="usr-new-err"></div><div class="ok" id="usr-new-ok"></div>
 <label data-i18n="usr.username">用户名</label><input id="usr-new-name" placeholder="用户名（3-32 位字母、数字、_-.)" data-i18n-ph="usr.new_name_ph">
 <label data-i18n="usr.password">密码</label><input id="usr-new-pass" type="password" placeholder="密码（至少 6 位）" data-i18n-ph="usr.new_pass_ph">
-<button id="usr-new-btn" data-i18n="usr.create">新建用户</button>
+<button id="usr-new-btn" data-i18n="usr.create_submit">创建</button> <button class="ghost" id="usr-new-cancel" data-i18n="app.cancel">取消</button>
+</div>
 <div id="user-list" style="margin-top:12px" data-i18n="app.loading">加载中…</div></div>
 </section>
 
@@ -809,6 +812,11 @@ $('pwd-submit').onclick=async()=>{
     if(j.ok){$('pwd-old').value='';$('pwd-new').value='';$('pwd-confirm').value='';$('pwd-ok').textContent=t('pwd.ok');}else{$('pwd-err').textContent=j.error||t('app.failed');}
   }catch(e){ if(e.message!=='unauth')$('pwd-err').textContent=t('app.network_err'); }
   btn.disabled=false;
+};
+$('pwd-cancel').onclick=()=>{
+  $('pwd-old').value='';$('pwd-new').value='';$('pwd-confirm').value='';
+  $('pwd-err').textContent='';$('pwd-ok').textContent='';
+  $('pwd-card').style.display='none';
 };
 
 async function loadOverview(){
@@ -982,6 +990,17 @@ async function upwd(name){
   const j=await api('/api/admin/users/'+encodeURIComponent(name)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
   alert(j.ok?t('usr.pwd_reset'):(j.error||t('app.failed')));
 }
+$('usr-new-toggle').onclick=()=>{
+  const f=$('usr-new-form');
+  const show=f.style.display==='none';
+  f.style.display=show?'':'none';
+  if(show)$('usr-new-name').focus();
+};
+$('usr-new-cancel').onclick=()=>{
+  $('usr-new-name').value='';$('usr-new-pass').value='';
+  $('usr-new-err').textContent='';$('usr-new-ok').textContent='';
+  $('usr-new-form').style.display='none';
+};
 $('usr-new-btn').onclick=async()=>{
   const btn=$('usr-new-btn'); if(btn.disabled)return; btn.disabled=true;
   $('usr-new-err').textContent='';$('usr-new-ok').textContent='';
