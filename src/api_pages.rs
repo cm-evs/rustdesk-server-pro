@@ -146,7 +146,7 @@ const I18N={zh:{
 'set.tpl_ready':'已就绪：','set.tpl_not_dl':'未下载（生成客户端前需要先下载）',
 'set.tpl_downloading':'正在下载官方客户端模板','set.tpl_speed':' · 速度 ',
 'set.tpl_source':' · 来源：','set.tpl_done':'下载完成','set.tpl_failed':'下载失败：',
-'set.tpl_start_failed':'启动下载失败：','set.tpl_downloading2':'正在下载…',
+'set.tpl_start_failed':'启动下载失败：','set.tpl_downloading2':'正在下载…','set.tpl_uptodate':'已是最新版本（{v}），无需下载',
 'set.upd_title':'服务端版本更新','set.upd_loading':'读取中…','set.upd_check':'检测更新',
 'set.upd_desc':'更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。',
 'set.upd_load_fail':'版本信息加载失败，请刷新重试','set.upd_load_fail2':'版本信息加载失败：',
@@ -304,7 +304,7 @@ const I18N={zh:{
 'set.tpl_ready':'Ready: ','set.tpl_not_dl':'Not downloaded (download it before generating clients)',
 'set.tpl_downloading':'Downloading the official client template','set.tpl_speed':' · Speed ',
 'set.tpl_source':' · Source: ','set.tpl_done':'Download complete','set.tpl_failed':'Download failed: ',
-'set.tpl_start_failed':'Failed to start download: ','set.tpl_downloading2':'Downloading…',
+'set.tpl_start_failed':'Failed to start download: ','set.tpl_downloading2':'Downloading…','set.tpl_uptodate':'Already the latest version ({v}), no download needed',
 'set.upd_title':'Server Update','set.upd_loading':'Loading…','set.upd_check':'Check for Updates',
 'set.upd_desc':'Update packages come from this project’s GitHub Releases and are selected automatically for the current platform. GitHub acceleration uses the “GitHub mirror prefix” setting above, or the built-in mirror chain when unset. After downloading, the new files are staged; clicking “Restart Now” lets the launcher (rdsvc / start.sh / start.ps1 / systemd) replace them during restart. If you run hbbs directly (no launcher), rename hbbs.new / hbbr.new over the original files manually before starting.',
 'set.upd_load_fail':'Failed to load version info. Refresh and retry.','set.upd_load_fail2':'Failed to load version info: ',
@@ -1132,6 +1132,10 @@ async function pollTpl(){
       $('tpl-bar').style.width='100%';
       $('tpl-detail').textContent=t('set.tpl_done');
       $('tpl-status').textContent=t('set.tpl_ready')+(j.template_version||j.version||'');
+    }else if(j.state==='up-to-date'){
+      $('tpl-prog').style.display='none';
+      $('tpl-detail').textContent='';
+      $('tpl-status').textContent=t('set.tpl_uptodate').replace('{v}',j.version||j.template_version||'');
     }else if(j.state==='error'){
       $('tpl-status').textContent=t('set.tpl_failed')+(j.error||t('app.unknown_err'));
       $('tpl-detail').textContent='';

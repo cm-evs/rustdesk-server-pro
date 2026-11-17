@@ -3180,7 +3180,9 @@ fn set_job(st: &ApiState, f: impl FnOnce(&mut TplJob)) {
 
 /// Background template download with GitHub mirror failover. Runs on a
 /// plain thread; progress is read from the .part file size by the status
-/// endpoint, and the winning source is recorded in the job state.
+/// endpoint, and the winning source is recorded in the job state. Skips
+/// the download when the local template already matches the resolved
+/// version (phase "up-to-date").
 fn run_template_job(st: Arc<ApiState>, version_req: String) {
     let dest = tpl_final_path(&st);
     let part = tpl_part_path(&st);
@@ -3216,6 +3218,27 @@ fn run_template_job(st: Arc<ApiState>, version_req: String) {
         j.version = version.clone();
         j.total = total;
     });
+    // Skip the download when the local template already matches the
+    // resolved version (previously every click re-downloaded). A
+    // missing tpl_version (e.g. a manually placed template) or a
+    // missing file falls through to the download below.
+    if dest.exists() {
+        let local = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(get_setting(&st.pool, "tpl_version")),
+            Err(_) => String::new(),
+        };
+        if !local.is_empty() && local.trim().trim_start_matches('v') == version.as_str() {
+            set_job(&st, |j| {
+                j.running = false;
+                j.phase = "up-to-date".into();
+                j.error = String::new();
+            });
+            return;
+        }
+    }
     let direct =
         format!("https://github.com/rustdesk/rustdesk/releases/download/{version}/rustdesk-{version}-x86_64.exe");
     let candidates = github_candidates(&custom, &direct);
