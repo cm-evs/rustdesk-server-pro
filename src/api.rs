@@ -89,7 +89,7 @@ pub struct TplJob {
 /// NOTE: this deliberately does NOT live in version.rs — build.rs
 /// regenerates that file on every build (see hbb_common::gen_version)
 /// and would wipe a hand-written constant.
-const PRO_VERSION: &str = "41";
+const PRO_VERSION: &str = "42";
 
 /// Progress state of the background one-click server update download.
 #[derive(Default)]
@@ -6192,7 +6192,7 @@ mod tests {
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
         assert_eq!(parse_pro_tag("v32 "), Some(32));
-        assert_eq!(current_pro_num(), 41);
+        assert_eq!(current_pro_num(), 42);
     }
 
     #[test]
