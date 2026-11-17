@@ -467,7 +467,7 @@ cd rustdesk-server-pro-linux-*
 ## v40.1（预览版）：地址簿自动加入已绑定设备（Fixes #8）
 
 - 背景（2026-11-17，GitHub issue #8）：两点建议。(1) 地址簿字段与 lejianwen/sctgdesk 对齐（forceAlwaysRelay、rdpPort/rdpUsername/loginName、same_server、password 等字段）。(2) 已绑定到账号的设备自动进入该账号的地址簿（建议用「登录设备」分组）。
-- 字段对齐说明：服务端 `ab_store` 只存客户端 `data` 字符串原样（不透明 blob，从不解析 peer 字段），所以客户端已有的全部 peer 字段本来就原样往返，存储层无需改动。本版用端到端测试验证：15 个字段的 peer 投稿再取回，字节完全一致。
+- 字段对齐说明：服务端 `ab_store` 只存客户端 `data` 字符串原样（不透明 blob，不解析 peer 字段），所以客户端已有的全部 peer 字段本来就原样往返，存储层无需改动。本版用端到端测试验证：15 个字段的 peer 投稿再取回，字节完全一致。
 - 新增：`GET /api/ab` 合并已绑定设备。服务端取回调用者已存的地址簿后，把绑定到该账号的设备（devices 表，username == 调用者）追加进 peers：id 取设备 ID，username/hostname/platform 取心跳上报的系统信息（platform 由 os 映射：Windows/Linux/Mac OS/Android/iOS，未知 os 原样保留），tags 为 `["登录设备"]`，forceAlwaysRelay 为 `"false"`，hash/password/rdpPort/rdpUsername/loginName 为空，same_server 为 null；tags 列表补上「登录设备」。用户已有同 ID 的条目时保留用户自己的条目原样（不加标签，不改字段，不产生重复）。
 - 新增：无已存地址簿时合成返回。调用者从未投稿过地址簿但有已绑定设备时，返回合成的 `{"tags": ["登录设备"], "peers": [...]}`；既无地址簿又无已绑定设备时仍返回字面 `null`（旧契约不变）。
 - 新增：`POST /api/ab` 上传时剥离服务端管理的条目。投稿的 peers 中带「登录设备」标签的条目在入库前剔除（下次 GET 时按实时绑定状态重新加入，解绑后自动消失）；其余条目原样入库。投稿数据不是合法 JSON 时原样入库（容错，不破坏旧客户端）。「登录设备」标签由服务端管理：用户手动给某条目打上该标签，下次同步时会被剥离。
