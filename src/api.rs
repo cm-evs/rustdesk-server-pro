@@ -89,7 +89,7 @@ pub struct TplJob {
 /// NOTE: this deliberately does NOT live in version.rs — build.rs
 /// regenerates that file on every build (see hbb_common::gen_version)
 /// and would wipe a hand-written constant.
-const PRO_VERSION: &str = "39";
+const PRO_VERSION: &str = "40";
 
 /// Progress state of the background one-click server update download.
 #[derive(Default)]
@@ -377,6 +377,15 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "create table if not exists captcha_codes(id text primary key, code_hash text not null, expires_at integer not null)",
         "create table if not exists relay_reg_tokens(token_id text primary key, link_key text not null, label text not null default '', created_by text not null, created_at integer not null, expires_at integer not null, used_at integer, used_by integer)",
         "create table if not exists relay_nodes(id integer primary key autoincrement, name text not null, address text not null default '', last_ip text not null default '', link_key text not null, key_delivered integer not null default 0, registered_at integer not null, last_heartbeat integer not null default 0, agent_version text not null default '', hbbr_version text not null default '', hbbr_running integer not null default 0, hbbr_started_at integer not null default 0, listen_port integer not null default 0, sessions integer not null default 0, total_kbps integer not null default 0, config_json text not null default '{}', config_version integer not null default 1, applied_version integer not null default 0, pending_command text not null default '', created_by text not null default '')",
+        // v40: connection-audit records posted by the controlled side
+        // (POST /api/audit/conn). nonce is UNIQUE: the client retries
+        // a post for up to 120 s, and the insert is insert-or-ignore,
+        // so a retry never stores a second row. Deliberate deviation
+        // from the official server's 5-minute nonce window: permanent
+        // dedup is a superset and needs no background expiry.
+        "create table if not exists audit_conn(id integer primary key autoincrement, nonce text not null unique, device_id text not null, device_uuid text not null default '', conn_id integer not null, session_id text not null default '', action text not null, ip text not null default '', peer_id text not null default '', peer_name text not null default '', conn_type text not null default '', primary_auth integer, two_factor integer, conn_audit_ref text not null default '', raw text not null default '', received_at integer not null)",
+        "create index if not exists idx_audit_conn_session on audit_conn(device_id, conn_id, received_at)",
+        "create index if not exists idx_audit_conn_received on audit_conn(received_at)",
     ];
     for s in stmts {
         sqlx::query(s)
@@ -1838,6 +1847,461 @@ async fn devices_list(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMa
     jresp(
         StatusCode::OK,
         json!({ "ok": true, "now": t, "devices": devices, "relays": relays }),
+    )
+}
+
+// ------------------------------ connection audit (v40) ------------------------------
+//
+// The controlled side of the official client (1.5.x) posts one audit
+// record per connection event to POST {api}/api/audit/conn:
+//   "new"  — on_open, {ip, action: "new"} (ip = the socket peer: the
+//            relay for a relayed session, the controller when direct)
+//   (auth) — after login, {peer: [controller id, name], type,
+//            primary_auth?, two_factor?} (no action field)
+//   "close"— connection loop exit, {action: "close"}
+// Every record also carries id (controlled device), uuid (base64),
+// conn_id, session_id and a fresh nonce (unique per record).
+// See client src/server/connection.rs post_conn_audit /
+// post_audit_async and src/common.rs get_audit_server.
+//
+// Response contract (from post_audit_async): success is HTTP 200 with
+// an EMPTY body; a handler failure is 200 with {"error": ...} (the
+// client retries); any other 4xx is a deterministic rejection (the
+// record is dropped, no retry). Only /conn is implemented in v40;
+// /file and /alarm keep 404ing (future work).
+
+/// A JSON field that may arrive as a string or a number (device IDs
+/// and peer IDs are numbers in some client paths), normalized to a
+/// string. Anything else yields "".
+fn jstr(v: &Value, key: &str) -> String {
+    match v.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn jstr_val(x: &Value) -> String {
+    match x {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Parse an IP literal, mapping IPv4-mapped IPv6 (::ffff:1.2.3.4) to
+/// plain IPv4 so relay comparison works across address families.
+fn norm_ip(s: &str) -> Option<std::net::IpAddr> {
+    let ip: std::net::IpAddr = s.trim().parse().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    })
+}
+
+/// Resolve the --relay-servers list (comma-separated hosts, each a
+/// bare host, host:port or [ipv6]:port) to the set of IPs hbbr listens
+/// on. Domains resolve via ToSocketAddrs like test_if_valid_server;
+/// all resolved addresses are collected. Empty when the list is empty
+/// or nothing resolves.
+fn resolve_relay_ips(servers: &str) -> std::collections::HashSet<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    let mut out = std::collections::HashSet::new();
+    for entry in servers.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // Strip brackets and any :port suffix to get the bare host.
+        let host = if let Some(rest) = entry.strip_prefix('[') {
+            match rest.split_once(']') {
+                Some((h, _)) => h.to_string(),
+                None => rest.to_string(),
+            }
+        } else if entry.matches(':').count() == 1 {
+            entry
+                .split_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| entry.to_string())
+        } else {
+            entry.to_string()
+        };
+        if host.is_empty() {
+            continue;
+        }
+        if let Some(ip) = norm_ip(&host) {
+            out.insert(ip);
+            continue;
+        }
+        if let Ok(addrs) = format!("{host}:0").to_socket_addrs() {
+            for a in addrs {
+                if let Some(ip) = norm_ip(&a.ip().to_string()) {
+                    out.insert(ip);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cached relay IPs: (fetched_at, Some(set)) when the --relay-servers
+/// list resolved to at least one IP, None when the list is empty or
+/// nothing resolved (relay detection then reports unknown instead of
+/// guessing). Refreshed at most every 5 minutes; a re-pointed relay
+/// domain takes up to that long to show up.
+static RELAY_IPS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, Option<std::collections::HashSet<std::net::IpAddr>>)>>,
+> = std::sync::OnceLock::new();
+
+fn relay_ips_cached() -> Option<std::collections::HashSet<std::net::IpAddr>> {
+    let cache = RELAY_IPS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some((at, ips)) = guard.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(300) {
+            return ips.clone();
+        }
+    }
+    let set = resolve_relay_ips(&crate::common::get_arg("relay-servers"));
+    let out = if set.is_empty() { None } else { Some(set) };
+    *guard = Some((std::time::Instant::now(), out.clone()));
+    out
+}
+
+/// Relay or direct, from the 'new' event's IP: for a relayed session
+/// the controlled side's socket peer is hbbr, so the IP is a relay
+/// address; for a direct session it is the controller's IP. None when
+/// the IP is unparsable/empty or the relay list is undetermined — the
+/// console shows '—' rather than guessing.
+fn relayed_for_ip(
+    ip: &str,
+    relay_ips: &Option<std::collections::HashSet<std::net::IpAddr>>,
+) -> Option<bool> {
+    let ips = relay_ips.as_ref()?;
+    let addr = norm_ip(ip)?;
+    Some(ips.contains(&addr))
+}
+
+/// One assembled connection session: a (device_id, conn_id) group of
+/// audit_conn events. conn_id is the correlator across new/auth/close
+/// (session_id is empty on the "new" event, which is posted in
+/// on_open before the login message arrives). Note: conn_id restarts
+/// when the controlled client restarts, so two sessions far apart in
+/// time could in theory share a key; the raw table keeps the truth.
+struct AuditSessionRow {
+    device_id: String,
+    controlled_hostname: String,
+    controlled_username: Option<String>,
+    conn_id: i64,
+    started_at: i64,
+    ended_at: Option<i64>,
+    controller_ip: String,
+    controller_id: String,
+    controller_name: String,
+    controller_username: Option<String>,
+    relayed: Option<bool>,
+    conn_type: String,
+}
+
+struct AuditSessionAcc {
+    started_new: Option<i64>,
+    first: i64,
+    ended: Option<i64>,
+    ip: String,
+    peer_id: String,
+    peer_name: String,
+    conn_type: String,
+}
+
+/// Assemble sessions from audit_conn rows (newest first, capped at
+/// 20000 events so an unbounded table cannot blow up the console
+/// request). `since` filters by server receipt time (None = all).
+async fn audit_session_rows(
+    pool: &SqlitePool,
+    since: Option<i64>,
+) -> Result<Vec<AuditSessionRow>, String> {
+    let rows = sqlx::query(
+        "select device_id, conn_id, action, ip, peer_id, peer_name, conn_type, received_at \
+         from audit_conn where received_at >= ? order by received_at desc limit 20000",
+    )
+    .bind(since.unwrap_or(0))
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut groups: HashMap<(String, i64), AuditSessionAcc> = HashMap::new();
+    for r in &rows {
+        let device_id = r.try_get::<String, _>("device_id").unwrap_or_default();
+        let conn_id = r.try_get::<i64, _>("conn_id").unwrap_or(0);
+        let action = r.try_get::<String, _>("action").unwrap_or_default();
+        let at = r.try_get::<i64, _>("received_at").unwrap_or(0);
+        let acc = groups
+            .entry((device_id, conn_id))
+            .or_insert_with(|| AuditSessionAcc {
+                started_new: None,
+                first: at,
+                ended: None,
+                ip: String::new(),
+                peer_id: String::new(),
+                peer_name: String::new(),
+                conn_type: String::new(),
+            });
+        if at < acc.first {
+            acc.first = at;
+        }
+        match action.as_str() {
+            "new" => {
+                if acc.started_new.is_none_or(|s| at < s) {
+                    acc.started_new = Some(at);
+                    acc.ip = r.try_get::<String, _>("ip").unwrap_or_default();
+                }
+            }
+            "close" => {
+                if acc.ended.is_none_or(|e| at > e) {
+                    acc.ended = Some(at);
+                }
+            }
+            _ => {
+                // Auth event (or a future action): peer info.
+                if acc.peer_id.is_empty() {
+                    acc.peer_id = r.try_get::<String, _>("peer_id").unwrap_or_default();
+                    acc.peer_name = r.try_get::<String, _>("peer_name").unwrap_or_default();
+                    acc.conn_type = r.try_get::<String, _>("conn_type").unwrap_or_default();
+                }
+            }
+        }
+    }
+    // Device info for both ends (most recently seen row wins when a
+    // device_id has several uuid rows, e.g. after a reinstall).
+    let dev_rows = sqlx::query(
+        "select device_id, username, hostname from devices order by last_seen desc",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut devs: HashMap<String, (Option<String>, String)> = HashMap::new();
+    for r in &dev_rows {
+        let id = r.try_get::<String, _>("device_id").unwrap_or_default();
+        if id.is_empty() || devs.contains_key(&id) {
+            continue;
+        }
+        let username = r.try_get::<Option<String>, _>("username").ok().flatten();
+        let hostname = r.try_get::<String, _>("hostname").unwrap_or_default();
+        devs.insert(id, (username, hostname));
+    }
+    let relay_ips = relay_ips_cached();
+    let mut out: Vec<AuditSessionRow> = groups
+        .into_iter()
+        .map(|((device_id, conn_id), acc)| {
+            let started_at = acc.started_new.unwrap_or(acc.first);
+            let (controlled_username, controlled_hostname) = devs
+                .get(&device_id)
+                .cloned()
+                .unwrap_or((None, String::new()));
+            let controller_username = if acc.peer_id.is_empty() {
+                None
+            } else {
+                devs.get(&acc.peer_id)
+                    .and_then(|(u, _)| u.clone())
+            };
+            AuditSessionRow {
+                relayed: relayed_for_ip(&acc.ip, &relay_ips),
+                device_id,
+                controlled_hostname,
+                controlled_username,
+                conn_id,
+                started_at,
+                ended_at: acc.ended,
+                controller_ip: acc.ip,
+                controller_id: acc.peer_id,
+                controller_name: acc.peer_name,
+                controller_username,
+                conn_type: acc.conn_type,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| a.device_id.cmp(&b.device_id))
+            .then_with(|| a.conn_id.cmp(&b.conn_id))
+    });
+    Ok(out)
+}
+
+fn audit_session_json(r: &AuditSessionRow) -> Value {
+    json!({
+        "device_id": r.device_id,
+        "controlled_hostname": r.controlled_hostname,
+        "controlled_username": r.controlled_username,
+        "conn_id": r.conn_id,
+        "started_at": r.started_at,
+        "ended_at": r.ended_at,
+        "duration_sec": r.ended_at.map(|e| e - r.started_at),
+        "controller_ip": r.controller_ip,
+        "controller_id": r.controller_id,
+        "controller_name": r.controller_name,
+        "controller_username": r.controller_username,
+        "relayed": r.relayed,
+        "conn_type": r.conn_type,
+    })
+}
+
+async fn audit_conn_post(Extension(st): Extension<Arc<ApiState>>, body: String) -> Response {
+    let v = parse_body(&body);
+    if !v.is_object() {
+        return err_resp(StatusCode::BAD_REQUEST, "bad json");
+    }
+    let device_id = jstr(&v, "id");
+    let uuid = sfield(&v, "uuid");
+    let nonce = sfield(&v, "nonce");
+    if device_id.is_empty() || nonce.is_empty() {
+        return err_resp(StatusCode::BAD_REQUEST, "missing id or nonce");
+    }
+    // Authenticate by the heartbeat-bound (id, uuid) pair: the audit
+    // uuid is the same base64(hbb_common::get_uuid()) the heartbeat
+    // sends, so the devices table matches it directly. A device whose
+    // first heartbeat has not landed yet has its first session's
+    // records dropped (403) — accepted, documented in DEPLOY.md.
+    let known = sqlx::query("select 1 as c from devices where device_id=? and uuid=? limit 1")
+        .bind(&device_id)
+        .bind(&uuid)
+        .fetch_optional(&st.pool)
+        .await;
+    match known {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return err_resp(StatusCode::FORBIDDEN, "unknown device or uuid mismatch");
+        }
+        Err(e) => return client_err(&e.to_string()),
+    }
+    let action_raw = sfield(&v, "action");
+    let peer = v.get("peer");
+    let action = if !action_raw.is_empty() {
+        action_raw
+    } else if peer.is_some() {
+        "auth".to_string()
+    } else {
+        return err_resp(StatusCode::BAD_REQUEST, "missing action");
+    };
+    let (peer_id, peer_name) = match peer {
+        Some(Value::Array(a)) => (
+            a.first().map(jstr_val).unwrap_or_default(),
+            a.get(1).map(jstr_val).unwrap_or_default(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let res = sqlx::query(
+        "insert or ignore into audit_conn(nonce, device_id, device_uuid, conn_id, session_id, action, ip, peer_id, peer_name, conn_type, primary_auth, two_factor, conn_audit_ref, raw, received_at) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&nonce)
+    .bind(&device_id)
+    .bind(&uuid)
+    .bind(v.get("conn_id").and_then(|x| x.as_i64()).unwrap_or(0))
+    .bind(jstr(&v, "session_id"))
+    .bind(&action)
+    .bind(jstr(&v, "ip"))
+    .bind(&peer_id)
+    .bind(&peer_name)
+    .bind(v.get("type").map(jstr_val).unwrap_or_default())
+    .bind(v.get("primary_auth").and_then(|x| x.as_i64()))
+    .bind(v.get("two_factor").and_then(|x| x.as_i64()))
+    .bind(jstr(&v, "conn_audit_ref"))
+    .bind(body.clone())
+    .bind(now())
+    .execute(&st.pool)
+    .await;
+    match res {
+        // Inserted or duplicate nonce (insert-or-ignore): both are
+        // success, and the body MUST stay empty per the client
+        // contract — any 2xx body is parsed as an error.
+        Ok(_) => (StatusCode::OK, "").into_response(),
+        Err(e) => client_err(&e.to_string()),
+    }
+}
+
+async fn audit_sessions(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    let days: i64 = q
+        .get("days")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let days = if days < 0 { 30 } else { days };
+    let page: i64 = q
+        .get("page")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let per_page: i64 = q
+        .get("per_page")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let needle = q
+        .get("q")
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    let since = if days == 0 {
+        None
+    } else {
+        Some(now() - days * 86400)
+    };
+    let rows = match audit_session_rows(&st.pool, since).await {
+        Ok(r) => r,
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let rows: Vec<AuditSessionRow> = rows
+        .into_iter()
+        .filter(|r| {
+            if !u.is_admin {
+                let ctrl = r.controller_username.as_deref() == Some(u.username.as_str());
+                let cont = r.controlled_username.as_deref() == Some(u.username.as_str());
+                if !ctrl && !cont {
+                    return false;
+                }
+            }
+            if !needle.is_empty() {
+                let hay = format!(
+                    "{} {} {} {} {} {} {}",
+                    r.device_id,
+                    r.controlled_hostname,
+                    r.controller_id,
+                    r.controller_name,
+                    r.controller_ip,
+                    r.controller_username.as_deref().unwrap_or(""),
+                    r.controlled_username.as_deref().unwrap_or("")
+                )
+                .to_lowercase();
+                if !hay.contains(&needle) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    let total = rows.len();
+    let start = (page.saturating_sub(1).saturating_mul(per_page)) as usize;
+    let sessions: Vec<Value> = rows
+        .iter()
+        .skip(start)
+        .take(per_page as usize)
+        .map(audit_session_json)
+        .collect();
+    jresp(
+        StatusCode::OK,
+        json!({"ok": true, "sessions": sessions, "total": total, "page": page, "per_page": per_page}),
     )
 }
 
@@ -4751,6 +5215,8 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/currentUser", post(current_user))
             .route("/api/ab", get(ab_get).post(ab_post))
             .route("/dl/:token/:filename", get(download))
+            // connection audit records posted by the controlled side
+            .route("/api/audit/conn", post(audit_conn_post))
             // relay agent endpoints (no session auth; HMAC + AEAD)
             .route("/api/relay/challenge", post(relay_challenge))
             .route("/api/relay/register", post(relay_register))
@@ -4774,6 +5240,7 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/admin/users/:name/password", post(admin_user_password))
             .route("/api/admin/users/:name/:action", post(admin_user_action))
             .route("/api/devices", get(devices_list))
+            .route("/api/audit/sessions", get(audit_sessions))
             .route("/api/tokens", get(tokens_list).post(tokens_create))
             .route("/api/tokens/:id", delete(tokens_delete))
             .route("/api/admin/settings", get(settings_get).post(settings_post))
@@ -5401,7 +5868,7 @@ mod tests {
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
         assert_eq!(parse_pro_tag("v32 "), Some(32));
-        assert_eq!(current_pro_num(), 39);
+        assert_eq!(current_pro_num(), 40);
     }
 
     #[test]
@@ -6097,6 +6564,280 @@ mod tests {
                 .await,
                 0
             );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    // ---- v40: connection audit log (issue #7) ----
+
+    async fn v40_post(st: &Arc<ApiState>, body: &str) -> (StatusCode, Vec<u8>) {
+        let resp = audit_conn_post(Extension(st.clone()), body.to_string()).await;
+        let status = resp.status();
+        let bytes = hyper::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default()
+            .to_vec();
+        (status, bytes)
+    }
+
+    async fn v40_sessions(
+        st: &Arc<ApiState>,
+        headers: HeaderMap,
+        q: HashMap<String, String>,
+    ) -> (StatusCode, Value) {
+        let resp = audit_sessions(Extension(st.clone()), headers, Query(q)).await;
+        let status = resp.status();
+        let bytes = hyper::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    fn v40_new_body(
+        device: &str,
+        uuid: &str,
+        conn: i64,
+        nonce: &str,
+        ip: &str,
+    ) -> String {
+        format!(
+            "{{\"id\":\"{device}\",\"uuid\":\"{uuid}\",\"conn_id\":{conn},\"session_id\":\"s{conn}\",\"nonce\":\"{nonce}\",\"action\":\"new\",\"ip\":\"{ip}\"}}"
+        )
+    }
+
+    fn v40_auth_body(
+        device: &str,
+        uuid: &str,
+        conn: i64,
+        nonce: &str,
+        peer_id: &str,
+        peer_name: &str,
+    ) -> String {
+        format!(
+            "{{\"id\":\"{device}\",\"uuid\":\"{uuid}\",\"conn_id\":{conn},\"session_id\":\"s{conn}\",\"nonce\":\"{nonce}\",\"peer\":[\"{peer_id}\",\"{peer_name}\"],\"type\":\"remote\"}}"
+        )
+    }
+
+    fn v40_close_body(device: &str, uuid: &str, conn: i64, nonce: &str) -> String {
+        format!(
+            "{{\"id\":\"{device}\",\"uuid\":\"{uuid}\",\"conn_id\":{conn},\"session_id\":\"s{conn}\",\"nonce\":\"{nonce}\",\"action\":\"close\"}}"
+        )
+    }
+
+    async fn v40_seed_device(st: &Arc<ApiState>, id: &str, uuid: &str, user: Option<&str>) {
+        upsert_device(
+            st,
+            id,
+            uuid,
+            user.map(|u| u.to_string()),
+            &format!("host-{id}"),
+            "windows",
+            "user",
+            "1005030",
+            "",
+        )
+        .await;
+    }
+
+    #[test]
+    fn audit_post_good_stores_row_and_empty_body() {
+        v39_block(async {
+            let (st, path) = v39_test_state("audit-ok").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            let (status, body) = v40_post(
+                &st,
+                &v40_new_body("111", "dXV1aWQx", 7, "n-1", "203.0.113.9"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            // Success MUST be an empty body per the client contract.
+            assert!(body.is_empty(), "body was {:?}", String::from_utf8_lossy(&body));
+            let n = v39_count(&st.pool, "select count(*) as c from audit_conn where nonce=?", "n-1").await;
+            assert_eq!(n, 1);
+            let row = sqlx::query("select action, ip, conn_id from audit_conn where nonce=?")
+                .bind("n-1")
+                .fetch_one(&st.pool)
+                .await
+                .expect("audit row");
+            assert_eq!(row.try_get::<String, _>("action").unwrap_or_default(), "new");
+            assert_eq!(row.try_get::<String, _>("ip").unwrap_or_default(), "203.0.113.9");
+            assert_eq!(row.try_get::<i64, _>("conn_id").unwrap_or(0), 7);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_post_duplicate_nonce_idempotent() {
+        v39_block(async {
+            let (st, path) = v39_test_state("audit-dup").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            let body = v40_new_body("111", "dXV1aWQx", 7, "n-dup", "203.0.113.9");
+            let (s1, b1) = v40_post(&st, &body).await;
+            let (s2, b2) = v40_post(&st, &body).await;
+            assert_eq!(s1, StatusCode::OK);
+            assert_eq!(s2, StatusCode::OK);
+            assert!(b1.is_empty());
+            assert!(b2.is_empty());
+            let n = v39_count(&st.pool, "select count(*) as c from audit_conn where nonce=?", "n-dup").await;
+            assert_eq!(n, 1);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_post_unknown_device_403() {
+        v39_block(async {
+            let (st, path) = v39_test_state("audit-403").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            // No such device at all.
+            let (s, _) = v40_post(&st, &v40_new_body("999", "dXV1aWQ5", 1, "n-x1", "1.1.1.1")).await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+            // Known device, wrong uuid.
+            let (s, _) = v40_post(&st, &v40_new_body("111", "d3Jvbmd1dWlk", 1, "n-x2", "1.1.1.1")).await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+            let n = v39_count(&st.pool, "select count(*) as c from audit_conn where nonce=?", "n-x1").await;
+            assert_eq!(n, 0);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_post_malformed_400() {
+        v39_block(async {
+            let (st, path) = v39_test_state("audit-400").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            let (s, _) = v40_post(&st, "not json at all").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            let (s, _) = v40_post(&st, "{\"uuid\":\"dXV1aWQx\",\"nonce\":\"n-m1\"}").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            let (s, _) = v40_post(&st, "{\"id\":\"111\",\"uuid\":\"dXV1aWQx\"}").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            // Neither action nor peer: not a recognizable audit event.
+            let (s, _) = v40_post(&st, "{\"id\":\"111\",\"uuid\":\"dXV1aWQx\",\"nonce\":\"n-m2\"}").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            let n = v39_count(&st.pool, "select count(*) as c from audit_conn where nonce=?", "n-m2").await;
+            assert_eq!(n, 0);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_session_assembly_open_and_closed() {
+        v39_block(async {
+            let (st, path) = v39_test_state("audit-asm").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            v40_seed_device(&st, "222", "dXV1aWQy", Some("bob")).await;
+            // Closed session: new + auth + close.
+            let (s, _) = v40_post(&st, &v40_new_body("111", "dXV1aWQx", 7, "a-1", "203.0.113.9")).await;
+            assert_eq!(s, StatusCode::OK);
+            let (s, _) = v40_post(&st, &v40_auth_body("111", "dXV1aWQx", 7, "a-2", "222", "bob-pc")).await;
+            assert_eq!(s, StatusCode::OK);
+            let (s, _) = v40_post(&st, &v40_close_body("111", "dXV1aWQx", 7, "a-3")).await;
+            assert_eq!(s, StatusCode::OK);
+            // Open session: new only (close lost or still running).
+            let (s, _) = v40_post(&st, &v40_new_body("111", "dXV1aWQx", 8, "a-4", "203.0.113.9")).await;
+            assert_eq!(s, StatusCode::OK);
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            assert_eq!(rows.len(), 2);
+            let closed = rows.iter().find(|r| r.conn_id == 7).expect("closed session");
+            assert!(closed.ended_at.is_some());
+            assert!(closed.ended_at.unwrap_or(0) >= closed.started_at);
+            assert_eq!(closed.controller_id, "222");
+            assert_eq!(closed.controller_name, "bob-pc");
+            assert_eq!(closed.controller_username.as_deref(), Some("bob"));
+            assert_eq!(closed.controlled_username.as_deref(), Some("alice"));
+            assert_eq!(closed.controlled_hostname, "host-111");
+            assert_eq!(closed.controller_ip, "203.0.113.9");
+            assert_eq!(closed.conn_type, "remote");
+            // No RELAY_SERVERS in the test env: relayed must be NULL,
+            // never guessed.
+            assert_eq!(closed.relayed, None);
+            let open = rows.iter().find(|r| r.conn_id == 8).expect("open session");
+            assert_eq!(open.ended_at, None);
+            assert!(audit_session_json(open)["duration_sec"].is_null());
+            assert!(audit_session_json(open)["ended_at"].is_null());
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn relay_ip_matching() {
+        let set = resolve_relay_ips("203.0.113.1, 198.51.100.2:21117, [2001:db8::1]:21117");
+        assert_eq!(set.len(), 3);
+        let some = Some(set);
+        assert_eq!(relayed_for_ip("203.0.113.1", &some), Some(true));
+        assert_eq!(relayed_for_ip("198.51.100.2", &some), Some(true));
+        assert_eq!(relayed_for_ip("2001:db8::1", &some), Some(true));
+        // IPv4-mapped IPv6 normalizes to plain IPv4.
+        assert_eq!(relayed_for_ip("::ffff:203.0.113.1", &some), Some(true));
+        assert_eq!(relayed_for_ip("192.0.2.55", &some), Some(false));
+        assert_eq!(relayed_for_ip("not-an-ip", &some), None);
+        assert_eq!(relayed_for_ip("", &some), None);
+        // Undetermined relay list: never guess.
+        assert_eq!(relayed_for_ip("203.0.113.1", &None), None);
+        assert!(resolve_relay_ips("").is_empty());
+        assert!(resolve_relay_ips("   ").is_empty());
+    }
+
+    #[test]
+    fn audit_sessions_scoping() {
+        v39_block(async {
+            let (st, path) = v39_test_state("audit-scope").await;
+            create_user(&st.pool, "admin", "admin123").await.expect("admin");
+            create_user(&st.pool, "alice", "alice123").await.expect("alice");
+            create_user(&st.pool, "bob", "bob12345").await.expect("bob");
+            // alice's device controlled by bob's device; bob's device
+            // controlled by an unbound device; alice controls bob's.
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            v40_seed_device(&st, "222", "dXV1aWQy", Some("bob")).await;
+            v40_seed_device(&st, "333", "dXV1aWQz", None).await;
+            // Session 1: bob (222) -> alice's 111.
+            v40_post(&st, &v40_new_body("111", "dXV1aWQx", 1, "s-1", "10.0.0.9")).await;
+            v40_post(&st, &v40_auth_body("111", "dXV1aWQx", 1, "s-2", "222", "bob-pc")).await;
+            // Session 2: unbound 333 -> bob's 222.
+            v40_post(&st, &v40_new_body("222", "dXV1aWQy", 1, "s-3", "10.0.0.8")).await;
+            v40_post(&st, &v40_auth_body("222", "dXV1aWQy", 1, "s-4", "333", "guest-pc")).await;
+            // Session 3: alice (111) -> bob's 222.
+            v40_post(&st, &v40_new_body("222", "dXV1aWQy", 2, "s-5", "10.0.0.7")).await;
+            v40_post(&st, &v40_auth_body("222", "dXV1aWQy", 2, "s-6", "111", "alice-pc")).await;
+            let admin_sid = new_web_session(&st, "admin").await.expect("admin sid");
+            let alice_sid = new_web_session(&st, "alice").await.expect("alice sid");
+            let bob_sid = new_web_session(&st, "bob").await.expect("bob sid");
+            // Admin sees all three.
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&admin_sid), HashMap::new()).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 3);
+            // Alice sees sessions 1 (controlled hers) and 3
+            // (controller hers), not 2.
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&alice_sid), HashMap::new()).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 2);
+            // Bob sees all three: controller of 1, controlled of 2+3.
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&bob_sid), HashMap::new()).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 3);
+            // Unauthenticated: 401.
+            let (s, _) = v40_sessions(&st, HeaderMap::new(), HashMap::new()).await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED);
+            // Search filter: only session 1 mentions bob-pc as
+            // controller name... but session 2's controlled device is
+            // 222/bob — search matches controller OR controlled, so
+            // "bob" matches all three (bob-pc, bob's device, bob's
+            // device). "guest" matches only session 2.
+            let mut q = HashMap::new();
+            q.insert("q".to_string(), "guest".to_string());
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 1);
+            // Pagination: 2 per page.
+            let mut q = HashMap::new();
+            q.insert("per_page".to_string(), "2".to_string());
+            q.insert("page".to_string(), "2".to_string());
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 3);
+            assert_eq!(v["sessions"].as_array().map(|a| a.len()).unwrap_or(0), 1);
             let _ = std::fs::remove_file(&path);
         });
     }

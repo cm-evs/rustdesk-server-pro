@@ -67,7 +67,7 @@ const I18N={zh:{
 'auth.login_page_title':'登录 - RustDesk 服务控制台','auth.register_page_title':'注册 - RustDesk 服务控制台',
 'auth.oidc_title':'登录 RustDesk','auth.oidc_desc':'使用你的账号登录，登录后请返回 RustDesk 客户端。',
 'auth.oidc_ok_title':'登录成功','auth.oidc_ok_desc':'请返回 RustDesk 客户端，登录状态会自动完成。可以关闭此页面。',
-'nav.overview':'概览','nav.devices':'设备','nav.users':'用户管理','nav.tokens':'API Token',
+'nav.overview':'概览','nav.devices':'设备','nav.audit':'审计日志','nav.users':'用户管理','nav.tokens':'API Token',
 'nav.genclient':'生成客户端','nav.settings':'服务器设置',
 'ov.users':'注册用户','ov.devices':'已绑定设备','ov.peers':'已注册终端（hbbs）',
 'ov.about':'说明','ov.about_text':'客户端在「设置 → 网络」填入本服务器地址，或直接使用「生成客户端」里预绑定配置的安装包，即可配合账号登录使用。设备在客户端登录账号后会通过心跳自动绑定到所属用户。',
@@ -120,7 +120,7 @@ const I18N={zh:{
 'set.mirror_ph':'如 https://gh-proxy.com',
 'set.hide':'在客户端隐藏服务器/密钥设置（通过心跳下发）',
 'set.allowreg':'允许开放注册（任何人可自助注册账号）',
-'set.allowreg_note':'关闭后，只有管理员登录状态下打开注册页才能新建账号。公网部署建议关闭。',
+'set.allowreg_note':'关闭后，任何人无法自助注册；管理员在「用户管理」可建号。公网部署建议关闭。',
 'set.allowrc':'允许远程修改配置（通过心跳下发到所有客户端）',
 'set.allowrc_note':'开启后，控制端可以操作被控端的 RustDesk 客户端界面与设置（包括改密码、改配置），不用再逐台到被控端本地勾选。仅在自有设备上开启；已在本机手动改过这一项的客户端以本机设置为准。',
 'set.mustlogin':'必须登录（所有客户端必须登录后才能连接）',
@@ -192,7 +192,14 @@ const I18N={zh:{
 'relay.delete_confirm':'确定删除节点 {n} 吗？删除后该节点的凭证立即失效，代理将停止心跳（hbbr 本身继续运行，需在中继机器上手动停止）。',
 'relay.load_fail':'加载中继节点失败','relay.online':'● 在线','relay.offline':'● 离线',
 'relay.unknown_time':'未知','relay.never':'从未',
-'relay.port_change_note':'改端口会重启 hbbr（会话中断）；只改限速时即时生效，不重启。'
+'relay.port_change_note':'改端口会重启 hbbr（会话中断）；只改限速时即时生效，不重启。',
+'aud.title':'审计日志','aud.desc':'被控端上报的连接记录：谁在什么时间从哪里连到哪台设备、是否走中继、连了多久。用户名来自设备绑定，未绑定设备只显示 ID。',
+'aud.search_ph':'搜索控制端/被控端 ID、用户名、主机名','aud.search':'搜索','aud.refresh':'刷新',
+'aud.range_today':'今天','aud.range_7d':'7 天','aud.range_30d':'30 天','aud.range_all':'全部',
+'aud.col_started':'开始时间','aud.col_controller':'控制端','aud.col_controlled':'被控端',
+'aud.col_ip':'控制端 IP','aud.col_relay':'中继/直连','aud.col_duration':'时长','aud.col_status':'状态',
+'aud.relayed':'中继','aud.direct':'直连','aud.unknown':'—','aud.open':'进行中','aud.closed':'已结束',
+'aud.empty':'暂无审计记录。','aud.page':'第 {p} / {n} 页（共 {t} 条）','aud.prev':'上一页','aud.next':'下一页'
 },en:{
 'app.title':'RustDesk Server Console','app.logout':'Sign out','app.loading':'Loading…',
 'app.load_failed':'Load failed','app.colon':': ','app.period':'. ','app.retry':'Retry',
@@ -213,7 +220,7 @@ const I18N={zh:{
 'auth.login_page_title':'Sign in - RustDesk Server Console','auth.register_page_title':'Register - RustDesk Server Console',
 'auth.oidc_title':'Sign in to RustDesk','auth.oidc_desc':'Sign in with your account, then return to the RustDesk client.',
 'auth.oidc_ok_title':'Signed in','auth.oidc_ok_desc':'Return to the RustDesk client; the sign-in will complete automatically. You can close this page.',
-'nav.overview':'Overview','nav.devices':'Devices','nav.users':'User Management','nav.tokens':'API Tokens',
+'nav.overview':'Overview','nav.devices':'Devices','nav.audit':'Audit Log','nav.users':'User Management','nav.tokens':'API Tokens',
 'nav.genclient':'Generate Client','nav.settings':'Server Settings',
 'ov.users':'Registered users','ov.devices':'Bound devices','ov.peers':'Registered endpoints (hbbs)',
 'ov.about':'About','ov.about_text':'In the client, fill in this server address under Settings → Network, or use a pre-configured installer from Generate Client, then sign in with an account. Devices are bound to their owner automatically via heartbeat after signing in.',
@@ -267,7 +274,7 @@ const I18N={zh:{
 'set.mirror_ph':'e.g. https://gh-proxy.com',
 'set.hide':'Hide server/key settings in clients (pushed via heartbeat)',
 'set.allowreg':'Allow open registration (anyone can self-register)',
-'set.allowreg_note':'When off, new accounts can only be created by an admin opening the registration page while signed in. Turn it off for public deployments.',
+'set.allowreg_note':'When off, nobody can self-register; admins can create accounts in User Management. Recommended off for public deployments.',
 'set.allowrc':'Allow remote configuration changes (pushed to all clients via heartbeat)',
 'set.allowrc_note':'When on, controllers can operate the controlled side’s RustDesk client UI and settings (including changing passwords and configuration) without enabling it locally on each machine. Only enable this on your own devices; clients where this was set manually keep their local setting.',
 'set.mustlogin':'Require login (all clients must log in before connecting)',
@@ -339,7 +346,14 @@ const I18N={zh:{
 'relay.delete_confirm':'Delete node {n}? Its credential is revoked immediately and the agent stops heartbeating (hbbr itself keeps running — stop it on the relay host if needed).',
 'relay.load_fail':'Failed to load relay nodes','relay.online':'● Online','relay.offline':'● Offline',
 'relay.unknown_time':'Unknown','relay.never':'Never',
-'relay.port_change_note':'Changing the port restarts hbbr (sessions drop); changing only the limits applies live without a restart.'
+'relay.port_change_note':'Changing the port restarts hbbr (sessions drop); changing only the limits applies live without a restart.',
+'aud.title':'Audit Log','aud.desc':'Connection records reported by controlled devices: who connected to which device, when, from where, relayed or direct, and for how long. Usernames come from device binding; unbound devices show only their ID.',
+'aud.search_ph':'Search controller/controlled ID, username, hostname','aud.search':'Search','aud.refresh':'Refresh',
+'aud.range_today':'Today','aud.range_7d':'7 days','aud.range_30d':'30 days','aud.range_all':'All',
+'aud.col_started':'Started','aud.col_controller':'Controller','aud.col_controlled':'Controlled',
+'aud.col_ip':'Controller IP','aud.col_relay':'Relay/Direct','aud.col_duration':'Duration','aud.col_status':'Status',
+'aud.relayed':'Relay','aud.direct':'Direct','aud.unknown':'—','aud.open':'In progress','aud.closed':'Ended',
+'aud.empty':'No audit records yet.','aud.page':'Page {p} / {n} ({t} total)','aud.prev':'Previous','aud.next':'Next'
 }};
 function curLang(){try{const l=localStorage.getItem('rdp-lang');return l==='en'?'en':'zh';}catch(e){return 'zh';}}
 function t(k){const d=I18N[curLang()]||I18N.zh;if(d[k]!=null)return d[k];if(I18N.zh[k]!=null)return I18N.zh[k];return k;}
@@ -565,6 +579,7 @@ const CONSOLE_BODY: &str = r#"
 <nav>
 <button data-s="overview" class="active" data-i18n="nav.overview">概览</button>
 <button data-s="devices" data-i18n="nav.devices">设备</button>
+<button data-s="audit" data-i18n="nav.audit">审计日志</button>
 <button data-s="users" class="adminonly" data-i18n="nav.users">用户管理</button>
 <button data-s="tokens" data-i18n="nav.tokens">API Token</button>
 <button data-s="genclient" data-i18n="nav.genclient">生成客户端</button>
@@ -598,6 +613,16 @@ const CONSOLE_BODY: &str = r#"
 <h2 style="margin-top:20px" data-i18n="relay.links_title">待使用的注册链接</h2>
 <div id="relay-links" data-i18n="app.loading">加载中…</div></div>
 <div class="card" id="relay-detail-card" style="display:none"><div id="relay-detail"></div></div>
+</section>
+
+<section id="s-audit">
+<div class="card"><h2 data-i18n="aud.title">审计日志</h2>
+<p class="muted" data-i18n="aud.desc">被控端上报的连接记录：谁在什么时间从哪里连到哪台设备、是否走中继、连了多久。用户名来自设备绑定，未绑定设备只显示 ID。</p>
+<p><input id="aud-q" placeholder="搜索控制端/被控端 ID、用户名、主机名" data-i18n-ph="aud.search_ph" style="width:320px"> <button id="aud-search" data-i18n="aud.search">搜索</button>
+<select id="aud-days" style="width:120px"><option value="1" data-i18n="aud.range_today">今天</option><option value="7" data-i18n="aud.range_7d">7 天</option><option value="30" selected data-i18n="aud.range_30d">30 天</option><option value="0" data-i18n="aud.range_all">全部</option></select>
+<button class="ghost" id="aud-refresh" data-i18n="aud.refresh">刷新</button></p>
+<div id="aud-list" data-i18n="app.loading">加载中…</div>
+<p id="aud-pager" style="margin-top:12px"></p></div>
 </section>
 
 <section id="s-users">
@@ -645,7 +670,7 @@ const CONSOLE_BODY: &str = r#"
 <input id="set-mirror" placeholder="如 https://gh-proxy.com" data-i18n-ph="set.mirror_ph">
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-hide" style="width:auto;margin:0"> <span data-i18n="set.hide">在客户端隐藏服务器/密钥设置（通过心跳下发）</span></label>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-allowreg" style="width:auto;margin:0"> <span data-i18n="set.allowreg">允许开放注册（任何人可自助注册账号）</span></label>
-<p class="muted" data-i18n="set.allowreg_note">关闭后，只有管理员登录状态下打开注册页才能新建账号。公网部署建议关闭。</p>
+<p class="muted" data-i18n="set.allowreg_note">关闭后，任何人无法自助注册；管理员在「用户管理」可建号。公网部署建议关闭。</p>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-allowrc" style="width:auto;margin:0"> <span data-i18n="set.allowrc">允许远程修改配置（通过心跳下发到所有客户端）</span></label>
 <p class="muted" data-i18n="set.allowrc_note">开启后，控制端可以操作被控端的 RustDesk 客户端界面与设置（包括改密码、改配置），不用再逐台到被控端本地勾选。仅在自有设备上开启；已在本机手动改过这一项的客户端以本机设置为准。</p>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-mustlogin" style="width:auto;margin:0"> <span data-i18n="set.mustlogin">必须登录（所有客户端必须登录后才能连接）</span></label>
@@ -706,6 +731,7 @@ window.__onLangChange=()=>{
   const active=document.querySelector('nav button.active');
   const s=active?active.dataset.s:'overview';
   if(s==='overview')loadOverview(); if(s==='devices')loadDevices();
+  if(s==='audit')loadAudit(AUDIT_PAGE);
   if(s==='users')loadUsers(); if(s==='tokens')loadTokens();
   if(s==='genclient'){loadGen();loadCfg();loadDl();} if(s==='settings')loadSettings();
   if(RELAY_DETAIL_ID)showRelay(RELAY_DETAIL_ID);
@@ -713,7 +739,7 @@ window.__onLangChange=()=>{
 // v38: hash routing — the console section lives in the URL (#/devices,
 // #/devices/relay-3), so a refresh or browser back/forward restores the
 // same view instead of always landing on overview.
-const SECTIONS=['overview','devices','users','tokens','genclient','settings'];
+const SECTIONS=['overview','devices','audit','users','tokens','genclient','settings'];
 function sectionAllowed(s){
   if(SECTIONS.indexOf(s)<0)return false;
   if(s==='users'||s==='settings')return !!(ME&&ME.is_admin);
@@ -735,6 +761,7 @@ function showSection(s,relay){
     if(relay){ loadDevices().then(()=>{ const r=parseHash(); if(r.s==='devices'&&r.relay===relay&&RELAY_DETAIL_ID!==relay)showRelay(relay); }); }
     else{ closeRelayDetail(); loadDevices(); }
   }else closeRelayDetail();
+  if(s==='audit')loadAudit(AUDIT_PAGE);
   if(s==='users')loadUsers(); if(s==='tokens')loadTokens();
   if(s==='genclient'){loadGen();loadCfg();loadDl();} if(s==='settings')loadSettings();
 }
@@ -768,6 +795,42 @@ async function loadDevices(){
   renderRelays(j.relays||[]);
   if(ME&&ME.is_admin)loadRelayLinks();
 }
+let AUDIT_PAGE=1;
+function fmtDur(sec){
+  if(sec==null||isNaN(sec))return '-';
+  sec=Math.max(0,Math.round(sec));
+  const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;
+  if(h)return h+'h '+m+'m';
+  if(m)return m+'m '+s+'s';
+  return s+'s';
+}
+function whoCell(id,name,username){
+  const main=esc(name||id||'-');
+  const sub=[id,username].filter(Boolean).map(esc).join(' · ');
+  return main+(sub&&sub!==main?'<br><span class="muted">'+sub+'</span>':'');
+}
+async function loadAudit(page){
+  AUDIT_PAGE=Math.max(1,page||1);
+  const q=$('aud-q').value.trim(), days=$('aud-days').value;
+  let j; try{ j=await api('/api/audit/sessions?q='+encodeURIComponent(q)+'&days='+encodeURIComponent(days)+'&page='+AUDIT_PAGE+'&per_page=20'); }catch(e){ if(e.message!=='unauth')loadFail($('aud-list'),'loadAudit'); return; }
+  if(!j.ok){ loadFail($('aud-list'),'loadAudit',j.error); return; }
+  if(!j.sessions.length){$('aud-list').innerHTML='<p class="muted">'+t('aud.empty')+'</p>';}
+  else{$('aud-list').innerHTML='<table><tr><th>'+t('aud.col_started')+'</th><th>'+t('aud.col_controller')+'</th><th>'+t('aud.col_controlled')+'</th><th>'+t('aud.col_ip')+'</th><th>'+t('aud.col_relay')+'</th><th>'+t('aud.col_duration')+'</th><th>'+t('aud.col_status')+'</th></tr>'+
+    j.sessions.map(s=>{
+      const open=s.ended_at==null;
+      const dur=open?fmtDur(Date.now()/1000-s.started_at):fmtDur(s.duration_sec);
+      const relay=s.relayed===true?t('aud.relayed'):s.relayed===false?t('aud.direct'):t('aud.unknown');
+      return `<tr><td class="nowrap">${new Date(s.started_at*1000).toLocaleString()}</td><td>${whoCell(s.controller_id,s.controller_name,s.controller_username)}</td><td>${whoCell(s.device_id,s.controlled_hostname,s.controlled_username)}</td><td>${esc(s.controller_ip||'-')}</td><td>${relay}</td><td class="nowrap">${dur}</td><td>${open?'<span class="ok">'+t('aud.open')+'</span>':'<span class="muted">'+t('aud.closed')+'</span>'}</td></tr>`;
+    }).join('')+'</table>';}
+  const pages=Math.max(1,Math.ceil(j.total/j.per_page));
+  $('aud-pager').innerHTML='<button class="ghost" id="aud-prev"'+(AUDIT_PAGE<=1?' disabled':'')+'>'+t('aud.prev')+'</button> <span class="muted">'+t('aud.page').replace('{p}',AUDIT_PAGE).replace('{n}',pages).replace('{t}',j.total)+'</span> <button class="ghost" id="aud-next"'+(AUDIT_PAGE>=pages?' disabled':'')+'>'+t('aud.next')+'</button>';
+  $('aud-prev').onclick=()=>loadAudit(AUDIT_PAGE-1);
+  $('aud-next').onclick=()=>loadAudit(AUDIT_PAGE+1);
+}
+$('aud-search').onclick=()=>loadAudit(1);
+$('aud-days').onchange=()=>loadAudit(1);
+$('aud-refresh').onclick=()=>loadAudit(AUDIT_PAGE);
+$('aud-q').addEventListener('keydown',e=>{if(e.key==='Enter')loadAudit(1);});
 let RELAYS=[];
 function renderRelays(relays){
   if(!ME||!ME.is_admin)return;
