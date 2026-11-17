@@ -477,6 +477,19 @@ cd rustdesk-server-pro-linux-*
 - 验证：新增 7 个单元测试（platform 映射、合并加入设备与标签、同 ID 去重、畸形 blob 透传、上传剥离、无 blob 合成与 null、接口级合并/剥离/权限范围），cargo test 106/106（debug 与 release；lib 91 + hbbr 14 + 集成 1）；新增地址簿端到端 27/27（debug 与 release 各两遍：15 字段往返字节一致、合并字段与标签、同 ID 条目保留、无 blob 合成与 null、畸形 blob 原样返回、上传剥离与存储检查、解绑自愈、权限范围、401）；全量回归 72 次运行全绿（控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 19/19 ×2、审计 45/45 ×2、审计界面 41/41 ×2、地址簿 27/27 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动。
 - 真机确认项：客户端登录后，地址簿里出现已绑定设备（「登录设备」分组），主机名/平台正确；客户端里给自动加入的条目设密码后能正常连接；解绑设备后地址簿里该条目消失。
 
+## v40.2（预览版）：自助修改密码（Fixes #9）
+
+- 背景（2026-11-17，GitHub issue #9）：普通用户看不到用户管理模块，没有修改密码的入口；全项目唯一的改密码接口是管理员专用的 `POST /api/admin/users/:name/password`。改密码只能找管理员重置。
+- 新增：自助改密码接口 `POST /api/auth/change-password`（控制台管理面，任意登录用户可用）。请求体 `{"old_password": "...", "new_password": "..."}`。服务端先校验旧密码（bcrypt），旧密码不对返回 400「旧密码不正确」；新密码至少 6 位，不足返回 400。成功返回 `{"ok": true}`，并记一条 `[auth] password-changed ... other_sessions_revoked=<N>` 审计日志（logs/hbbs.log）。未登录返回 401。旧密码错误返回 400 而不是 401：控制台的 api() 辅助函数把任何 401 当作「会话过期」跳回登录页，用 400 才能在表单内显示错误。
+- 安全：接口只改调用者自己的密码（取自登录会话，不接受用户名字段），且必须校验旧密码。管理员重置接口不对普通用户放开：放开会让任意登录用户改别人的密码。
+- 防暴力破解：旧密码验证失败计入 AuthGuard（与登录同一套按账号/按 IP 计数与锁定规则）；连续失败 5 次后账号锁定 15 分钟（起步，重复锁定翻倍，上限 12 小时），锁定期内返回 429；改密码成功后清空账号失败计数（与登录成功一致）。
+- 会话处理：改密码成功后吊销调用者的其他网页会话（其他设备/浏览器需用新密码重新登录），当前会话保持有效。用 API Token 调用的改密码没有当前网页会话，该账号的全部网页会话都会吊销。
+- 新增：控制台入口。顶栏（用户名旁边）加「修改密码」按钮，所有登录用户可见（不带 adminonly）；点开表单填旧密码、新密码、确认新密码，成功/失败都在表单内提示。中英文切换覆盖全部新文案（12 个新键，字典 331/331 对齐）。
+- 限制：客户端 access_token 不受影响（改密码后已登录的客户端保持登录状态，登出重登时才需要新密码）；被禁用的账号无法登录，自然无法调用本接口。
+- 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。本版是预览版：PRO_VERSION 仍为 40，一键更新不会推送预览版，须手动下载安装。
+- 验证：新增 6 个单元测试（改密码成功更新 hash 并吊销其他会话、旧密码错误拒绝、新密码过短拒绝、未登录 401、连续失败锁定、成功后清空失败计数），cargo test 112/112（debug 与 release；lib 97 + hbbr 14 + 集成 1）；新增自助改密码端到端 40/40（debug 与 release 各两遍：基本流程、会话吊销、AuthGuard 锁定、管理面拆分）；新增控制台界面端到端 30/30（debug 与 release 各两遍：普通用户可见入口、管理区隐藏、表单校验、旧密码错误不跳转登录、改密码成功、中英文切换）；全量回归 80 次运行全绿（控制台 28/28 ×2、模板 17/17 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 19/19 ×2、审计 45/45 ×2、审计界面 41/41 ×2、地址簿 27/27 ×2、自助改密码 40/40 ×2、自助改密码界面 30/30 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs 与 src/api_pages.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动。
+- 真机确认项：普通用户在控制台点「修改密码」，旧密码正确时改密码成功，新密码能登录，旧密码不能登录；其他浏览器/设备的登录失效；旧密码错误时页面内提示错误，不跳回登录页。
+
 ## API 调用说明
 
 服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/client-downloads`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。
@@ -713,7 +726,7 @@ curl -s -X POST http://203.0.113.10:21114/api/admin/update/restart \
 # {"ok":true}，服务端约 0.5 秒后退出，由启动器换上新版并拉起
 ```
 
-**其他管理接口**（控制台页面内部使用）：`GET /api/admin/overview`（概览统计）、`GET /api/admin/users` 与 `POST /api/admin/users`（新建用户）、`POST /api/admin/users/:name/password`、`POST /api/admin/users/:name/:action`（用户管理）、`GET/POST /api/admin/settings`（服务器设置）、`POST /api/admin/template/download` 与 `GET /api/admin/template/status`（模板下载）。这几个接口的字段以控制台页面的实际调用为准，不再逐一列出。
+**其他管理接口**（控制台页面内部使用）：`GET /api/admin/overview`（概览统计）、`GET /api/admin/users` 与 `POST /api/admin/users`（新建用户）、`POST /api/admin/users/:name/password`、`POST /api/admin/users/:name/:action`（用户管理）、`POST /api/auth/change-password`（自助改密码，任意登录用户）、`GET/POST /api/admin/settings`（服务器设置）、`POST /api/admin/template/download` 与 `GET /api/admin/template/status`（模板下载）。这几个接口的字段以控制台页面的实际调用为准，不再逐一列出。
 
 ## 日志
 

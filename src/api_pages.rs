@@ -67,6 +67,10 @@ const I18N={zh:{
 'auth.login_page_title':'登录 - RustDesk 服务控制台','auth.register_page_title':'注册 - RustDesk 服务控制台',
 'auth.oidc_title':'登录 RustDesk','auth.oidc_desc':'使用你的账号登录，登录后请返回 RustDesk 客户端。',
 'auth.oidc_ok_title':'登录成功','auth.oidc_ok_desc':'请返回 RustDesk 客户端，登录状态会自动完成。可以关闭此页面。',
+'pwd.title':'修改密码','pwd.old':'旧密码','pwd.new':'新密码','pwd.confirm':'确认新密码',
+'pwd.old_ph':'当前使用的密码','pwd.new_ph':'新密码（至少 6 位）','pwd.confirm_ph':'再次输入新密码',
+'pwd.submit':'确认修改','pwd.ok':'密码已修改。其他设备上的登录已失效，请用新密码重新登录。',
+'pwd.mismatch':'两次输入的新密码不一致','pwd.empty_old':'请输入旧密码','pwd.short':'新密码至少 6 位',
 'nav.overview':'概览','nav.devices':'设备','nav.audit':'审计日志','nav.users':'用户管理','nav.tokens':'API Token',
 'nav.genclient':'生成客户端','nav.settings':'服务器设置',
 'ov.users':'注册用户','ov.devices':'已绑定设备','ov.peers':'已注册终端（hbbs）',
@@ -220,6 +224,10 @@ const I18N={zh:{
 'auth.login_page_title':'Sign in - RustDesk Server Console','auth.register_page_title':'Register - RustDesk Server Console',
 'auth.oidc_title':'Sign in to RustDesk','auth.oidc_desc':'Sign in with your account, then return to the RustDesk client.',
 'auth.oidc_ok_title':'Signed in','auth.oidc_ok_desc':'Return to the RustDesk client; the sign-in will complete automatically. You can close this page.',
+'pwd.title':'Change Password','pwd.old':'Current password','pwd.new':'New password','pwd.confirm':'Confirm new password',
+'pwd.old_ph':'Your current password','pwd.new_ph':'New password (at least 6 characters)','pwd.confirm_ph':'Enter the new password again',
+'pwd.submit':'Confirm change','pwd.ok':'Password changed. Other devices have been signed out; sign in again with the new password.',
+'pwd.mismatch':'The new passwords do not match','pwd.empty_old':'Enter the current password','pwd.short':'The new password must be at least 6 characters',
 'nav.overview':'Overview','nav.devices':'Devices','nav.audit':'Audit Log','nav.users':'User Management','nav.tokens':'API Tokens',
 'nav.genclient':'Generate Client','nav.settings':'Server Settings',
 'ov.users':'Registered users','ov.devices':'Bound devices','ov.peers':'Registered endpoints (hbbs)',
@@ -574,8 +582,14 @@ const CONSOLE_BODY: &str = r#"
 <div class="wrap">
 <div style="display:flex;justify-content:space-between;align-items:center">
 <h1 data-i18n="app.title">RustDesk 服务控制台</h1>
-<div><span id="who" class="muted"></span> <button class="langbtn ghost" data-lang="zh">中文</button><button class="langbtn ghost" data-lang="en">English</button> <button class="ghost" id="logout" data-i18n="app.logout">退出</button></div>
+<div><span id="who" class="muted"></span> <button class="langbtn ghost" data-lang="zh">中文</button><button class="langbtn ghost" data-lang="en">English</button> <button class="ghost" id="pwdchg" data-i18n="pwd.title">修改密码</button> <button class="ghost" id="logout" data-i18n="app.logout">退出</button></div>
 </div>
+<div class="card" id="pwd-card" style="display:none"><h2 data-i18n="pwd.title">修改密码</h2>
+<div class="err" id="pwd-err"></div><div class="ok" id="pwd-ok"></div>
+<label data-i18n="pwd.old">旧密码</label><input id="pwd-old" type="password" placeholder="当前使用的密码" data-i18n-ph="pwd.old_ph">
+<label data-i18n="pwd.new">新密码</label><input id="pwd-new" type="password" placeholder="新密码（至少 6 位）" data-i18n-ph="pwd.new_ph">
+<label data-i18n="pwd.confirm">确认新密码</label><input id="pwd-confirm" type="password" placeholder="再次输入新密码" data-i18n-ph="pwd.confirm_ph">
+<button id="pwd-submit" data-i18n="pwd.submit">确认修改</button></div>
 <nav>
 <button data-s="overview" class="active" data-i18n="nav.overview">概览</button>
 <button data-s="devices" data-i18n="nav.devices">设备</button>
@@ -777,6 +791,25 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
 });
 $('dev-refresh').onclick=()=>loadDevices();
 $('logout').onclick=async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(e){} location.href='/console/login';};
+$('pwdchg').onclick=()=>{
+  const c=$('pwd-card');
+  const show=c.style.display==='none';
+  c.style.display=show?'':'none';
+  if(show){$('pwd-old').focus();c.scrollIntoView({behavior:'smooth'});}
+};
+$('pwd-submit').onclick=async()=>{
+  const btn=$('pwd-submit'); if(btn.disabled)return; btn.disabled=true;
+  $('pwd-err').textContent='';$('pwd-ok').textContent='';
+  const old=$('pwd-old').value, nw=$('pwd-new').value, cf=$('pwd-confirm').value;
+  if(!old){$('pwd-err').textContent=t('pwd.empty_old');btn.disabled=false;return;}
+  if(nw.length<6){$('pwd-err').textContent=t('pwd.short');btn.disabled=false;return;}
+  if(nw!==cf){$('pwd-err').textContent=t('pwd.mismatch');btn.disabled=false;return;}
+  try{
+    const j=await api('/api/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:old,new_password:nw})});
+    if(j.ok){$('pwd-old').value='';$('pwd-new').value='';$('pwd-confirm').value='';$('pwd-ok').textContent=t('pwd.ok');}else{$('pwd-err').textContent=j.error||t('app.failed');}
+  }catch(e){ if(e.message!=='unauth')$('pwd-err').textContent=t('app.network_err'); }
+  btn.disabled=false;
+};
 
 async function loadOverview(){
   if(!ME.is_admin)return;

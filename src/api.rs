@@ -1761,6 +1761,102 @@ async fn me(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMap) -> Resp
     }
 }
 
+/// Self-service password change (issue #9). Any logged-in web user
+/// may change ONLY their own password, and only after proving the
+/// old one. Deliberately separate from the admin reset endpoint:
+/// opening that one to regular users would let any logged-in user
+/// change anyone else's password. Wrong old password returns 400
+/// (not 401): the console's api() helper treats any 401 as "session
+/// expired" and redirects to the login page, which would swallow
+/// the inline error.
+async fn change_password(
+    Extension(st): Extension<Arc<ApiState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    let ip = addr.ip().to_string();
+    let remain = guard_locked(&st, &u.username, &ip);
+    if remain > 0 {
+        auth_log(
+            "pwd-change-locked",
+            "web",
+            &u.username,
+            &ip,
+            &format!("remain_secs={remain}"),
+        );
+        return err_resp(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!("尝试过于频繁，已临时锁定，请约 {} 分钟后再试", (remain + 59) / 60),
+        );
+    }
+    let v = parse_body(&body);
+    let old_password = sfield(&v, "old_password");
+    let new_password = sfield(&v, "new_password");
+    if new_password.len() < 6 {
+        return err_resp(StatusCode::BAD_REQUEST, "密码至少 6 位");
+    }
+    match verify_user(&st.pool, &u.username, &old_password).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            guard_fail(&st, &u.username, &ip, "web");
+            auth_log(
+                "pwd-change-fail",
+                "web",
+                &u.username,
+                &ip,
+                "reason=bad-old-password",
+            );
+            return err_resp(StatusCode::BAD_REQUEST, "旧密码不正确");
+        }
+        Err(e) => {
+            return err_resp(StatusCode::FORBIDDEN, &e);
+        }
+    }
+    let hash = match bcrypt::hash(&new_password, 10) {
+        Ok(h) => h,
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if let Err(e) = sqlx::query("update users set password_hash=? where username=?")
+        .bind(&hash)
+        .bind(&u.username)
+        .execute(&st.pool)
+        .await
+    {
+        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+    guard_success(&st, &u.username);
+    // Revoke the caller's OTHER web sessions (other devices/browsers
+    // must sign in again with the new password); the current session
+    // stays valid. API-token callers have no web session to keep, so
+    // all of their web sessions go.
+    let current_sid = cookie_val(&headers, "rdp_sid");
+    let revoked = match &current_sid {
+        Some(sid) => sqlx::query("delete from web_sessions where username=? and token!=?")
+            .bind(&u.username)
+            .bind(sid)
+            .execute(&st.pool)
+            .await,
+        None => sqlx::query("delete from web_sessions where username=?")
+            .bind(&u.username)
+            .execute(&st.pool)
+            .await,
+    };
+    let revoked_n = revoked.map(|r| r.rows_affected()).unwrap_or(0);
+    auth_log(
+        "password-changed",
+        "web",
+        &u.username,
+        &ip,
+        &format!("other_sessions_revoked={revoked_n}"),
+    );
+    jresp(StatusCode::OK, json!({ "ok": true }))
+}
+
 // ------------------------------ console APIs ------------------------------
 
 fn unauthorized() -> Response {
@@ -5436,6 +5532,7 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/auth/register", post(web_register))
             .route("/api/auth/login", post(web_login))
             .route("/api/auth/logout", post(web_logout))
+            .route("/api/auth/change-password", post(change_password))
             .route("/api/me", get(me))
             .route("/api/client-config", get(client_config_view))
             .route("/api/client-downloads", get(client_downloads))
@@ -7289,6 +7386,245 @@ mod tests {
             let peers = blob["peers"].as_array().expect("peers");
             assert_eq!(peers.len(), 1);
             assert_eq!(peers[0]["id"].as_str(), Some("222"));
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    // ---- issue #9: self-service password change ----
+
+    async fn v41_call_change(
+        st: &Arc<ApiState>,
+        headers: HeaderMap,
+        body: &str,
+    ) -> (StatusCode, Value) {
+        let resp = change_password(
+            Extension(st.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))),
+            headers,
+            body.to_string(),
+        )
+        .await;
+        let status = resp.status();
+        let bytes = hyper::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    #[test]
+    fn pwd_change_ok_updates_hash_and_revokes_other_sessions() {
+        v39_block(async {
+            let (st, path) = v39_test_state("pwd-ok").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "alice", "alice123")
+                .await
+                .expect("create alice");
+            create_user(&st.pool, "bob", "bob12345")
+                .await
+                .expect("create bob");
+            let sid_cur = new_web_session(&st, "alice").await.expect("alice session 1");
+            let sid_other = new_web_session(&st, "alice").await.expect("alice session 2");
+            let (status, v) = v41_call_change(
+                &st,
+                v39_sid_headers(&sid_cur),
+                "{\"old_password\":\"alice123\",\"new_password\":\"alice456\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["ok"], true);
+            // New password works, old one does not.
+            assert!(matches!(
+                verify_user(&st.pool, "alice", "alice456").await,
+                Ok(Some(_))
+            ));
+            assert!(matches!(
+                verify_user(&st.pool, "alice", "alice123").await,
+                Ok(None)
+            ));
+            // Current session survives, the other one is revoked.
+            assert_eq!(
+                v39_count(
+                    &st.pool,
+                    "select count(*) as c from web_sessions where token=?",
+                    sid_cur.as_str()
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                v39_count(
+                    &st.pool,
+                    "select count(*) as c from web_sessions where token=?",
+                    sid_other.as_str()
+                )
+                .await,
+                0
+            );
+            // Another user's password is untouched.
+            assert!(matches!(
+                verify_user(&st.pool, "bob", "bob12345").await,
+                Ok(Some(_))
+            ));
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn pwd_change_wrong_old_rejected() {
+        v39_block(async {
+            let (st, path) = v39_test_state("pwd-wrong").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "alice", "alice123")
+                .await
+                .expect("create alice");
+            let sid = new_web_session(&st, "alice").await.expect("alice session");
+            let (status, v) = v41_call_change(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"old_password\":\"not-the-password\",\"new_password\":\"alice456\"}",
+            )
+            .await;
+            // 400, not 401: the caller IS authenticated; the console's
+            // api() helper would redirect to login on a 401.
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(v["error"], "旧密码不正确");
+            assert!(matches!(
+                verify_user(&st.pool, "alice", "alice123").await,
+                Ok(Some(_))
+            ));
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn pwd_change_short_new_rejected() {
+        v39_block(async {
+            let (st, path) = v39_test_state("pwd-short").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "alice", "alice123")
+                .await
+                .expect("create alice");
+            let sid = new_web_session(&st, "alice").await.expect("alice session");
+            let (status, v) = v41_call_change(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"old_password\":\"alice123\",\"new_password\":\"abc\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(v["error"], "密码至少 6 位");
+            assert!(matches!(
+                verify_user(&st.pool, "alice", "alice123").await,
+                Ok(Some(_))
+            ));
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn pwd_change_unauthenticated_401() {
+        v39_block(async {
+            let (st, path) = v39_test_state("pwd-401").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            let (status, _) = v41_call_change(
+                &st,
+                HeaderMap::new(),
+                "{\"old_password\":\"admin123\",\"new_password\":\"admin456\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn pwd_change_lockout_after_failures() {
+        v39_block(async {
+            let (st, path) = v39_test_state("pwd-lock").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "alice", "alice123")
+                .await
+                .expect("create alice");
+            let sid = new_web_session(&st, "alice").await.expect("alice session");
+            for _ in 0..5 {
+                let (status, _) = v41_call_change(
+                    &st,
+                    v39_sid_headers(&sid),
+                    "{\"old_password\":\"wrong\",\"new_password\":\"alice456\"}",
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+            // The 5th failure engaged the account lock: even the
+            // correct old password is turned away now.
+            let (status, _) = v41_call_change(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"old_password\":\"alice123\",\"new_password\":\"alice456\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn pwd_change_success_clears_failures() {
+        v39_block(async {
+            let (st, path) = v39_test_state("pwd-clear").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "alice", "alice123")
+                .await
+                .expect("create alice");
+            let sid = new_web_session(&st, "alice").await.expect("alice session");
+            for _ in 0..4 {
+                let (status, _) = v41_call_change(
+                    &st,
+                    v39_sid_headers(&sid),
+                    "{\"old_password\":\"wrong\",\"new_password\":\"alice456\"}",
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+            let (status, _) = v41_call_change(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"old_password\":\"alice123\",\"new_password\":\"alice456\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            // Without the success clearing the counter, these 4 more
+            // failures (8 total) would have engaged the lock at the
+            // 5th; the change below would then be 429, not 200.
+            for _ in 0..4 {
+                let (status, _) = v41_call_change(
+                    &st,
+                    v39_sid_headers(&sid),
+                    "{\"old_password\":\"wrong\",\"new_password\":\"alice789\"}",
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+            let (status, _) = v41_call_change(
+                &st,
+                v39_sid_headers(&sid),
+                "{\"old_password\":\"alice456\",\"new_password\":\"alice789\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
             let _ = std::fs::remove_file(&path);
         });
     }
