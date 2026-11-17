@@ -1184,6 +1184,188 @@ async fn client_peers(
     jresp(StatusCode::OK, paged_json(items, cur, size))
 }
 
+// ------------------------------ address book ------------------------------
+// v40.1 (issue #8): auto-add the caller's bound devices to the address
+// book. The stored blob is opaque (ab_store keeps the client's `data`
+// string verbatim; the server never parses peer fields), so every peer
+// field the client knows — forceAlwaysRelay, rdpPort, rdpUsername,
+// loginName, same_server, password, and the rest — already round-trips
+// untouched; the only server-side work is the merge below.
+//
+// Merge-on-GET / strip-on-POST:
+// - ab_get merges the caller's bound devices (devices.username == caller)
+//   into the returned peers with the server-managed tag 登录设备. A
+//   device the user already has an entry for keeps the user's entry
+//   as-is (no tag added, no field touched).
+// - ab_post strips peers tagged 登录设备 before storing: they are
+//   re-added on GET from live binding state, so an unbind self-heals
+//   on the next GET. A user who manually tags a peer 登录设备 sees it
+//   stripped on the next sync; the tag is server-managed.
+// - No stored blob + bound devices: synthesize {"tags", "peers"}.
+//   No blob + no devices: keep the literal "null" contract.
+// - A malformed stored blob is returned verbatim (fail open).
+// Merged blobs are re-serialized through serde_json::Value, which
+// normalizes object key order (alphabetical); the JSON is semantically
+// identical and the client does not depend on key order. When nothing
+// is merged or stripped, the stored string is returned verbatim.
+const AB_LOGIN_DEVICES_TAG: &str = "登录设备";
+
+struct BoundDevice {
+    device_id: String,
+    hostname: String,
+    os: String,
+    os_username: String,
+}
+
+async fn bound_devices(st: &ApiState, username: &str) -> Vec<BoundDevice> {
+    let rows = sqlx::query(
+        "select device_id, hostname, os, os_username from devices where username=? order by device_id",
+    )
+    .bind(username)
+    .fetch_all(&st.pool)
+    .await;
+    match rows {
+        Ok(rows) => rows
+            .iter()
+            .map(|r| BoundDevice {
+                device_id: r.try_get("device_id").unwrap_or_default(),
+                hostname: r.try_get("hostname").unwrap_or_default(),
+                os: r.try_get("os").unwrap_or_default(),
+                os_username: r.try_get("os_username").unwrap_or_default(),
+            })
+            .filter(|d| !d.device_id.is_empty())
+            .collect(),
+        // DB failure must never break the address book: fail open with
+        // no merge (the stored blob is returned as-is).
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Map a sysinfo `os` string to the client's platform strings
+/// (official client 1.5.0 src/common.rs PLATFORM_WINDOWS/LINUX/MACOS/
+/// ANDROID; iOS is "iOS"). The client reports os as
+/// "{distribution_id} / {long_os_version}", e.g.
+/// "windows / Windows 10 Pro", "ubuntu / Ubuntu 22.04".
+/// Unknown values pass through unchanged.
+fn ab_platform_from_os(os: &str) -> String {
+    let lower = os.to_lowercase();
+    if lower.contains("windows") {
+        "Windows".to_string()
+    } else if lower.contains("android") {
+        "Android".to_string()
+    } else if lower.contains("ios") {
+        "iOS".to_string()
+    } else if lower.contains("mac") || lower.contains("darwin") || lower.contains("apple") {
+        "Mac OS".to_string()
+    } else if lower.contains("linux")
+        || [
+            "ubuntu", "debian", "fedora", "arch", "centos", "opensuse", "gentoo", "alpine",
+            "raspbian", "manjaro", "mint", "redhat", "suse", "nixos",
+        ]
+        .iter()
+        .any(|d| lower.contains(d))
+    {
+        "Linux".to_string()
+    } else {
+        os.to_string()
+    }
+}
+
+/// The peer object the server auto-adds for a bound device. No password
+/// or hash: the user sets those in the client.
+fn ab_peer_for_device(d: &BoundDevice) -> Value {
+    json!({
+        "id": d.device_id,
+        "hash": "",
+        "password": "",
+        "username": d.os_username,
+        "hostname": d.hostname,
+        "platform": ab_platform_from_os(&d.os),
+        "alias": "",
+        "tags": [AB_LOGIN_DEVICES_TAG],
+        "forceAlwaysRelay": "false",
+        "rdpPort": "",
+        "rdpUsername": "",
+        "loginName": "",
+        "same_server": null,
+    })
+}
+
+/// A peer's id as a string (the blob normally stores string ids; accept
+/// a numeric id too so dedup never misses on type alone).
+fn ab_peer_id(p: &Value) -> Option<String> {
+    match p.get("id") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Merge bound devices into a stored address-book blob. Returns None
+/// when the blob is not a parseable JSON object (caller returns it
+/// verbatim). With no devices, the blob is returned unchanged.
+fn ab_merge_bound_devices(blob: &str, devices: &[BoundDevice]) -> Option<String> {
+    if devices.is_empty() {
+        return Some(blob.to_string());
+    }
+    let mut v: Value = serde_json::from_str(blob).ok()?;
+    let obj = v.as_object_mut()?;
+    let tags = obj
+        .entry("tags")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(tags) = tags {
+        if !tags
+            .iter()
+            .any(|t| t.as_str() == Some(AB_LOGIN_DEVICES_TAG))
+        {
+            tags.push(Value::String(AB_LOGIN_DEVICES_TAG.to_string()));
+        }
+    }
+    let peers = obj
+        .entry("peers")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(peers) = peers {
+        for d in devices {
+            let exists = peers
+                .iter()
+                .any(|p| ab_peer_id(p).as_deref() == Some(d.device_id.as_str()));
+            if !exists {
+                peers.push(ab_peer_for_device(d));
+            }
+        }
+    }
+    Some(v.to_string())
+}
+
+/// Strip server-managed peers (tagged 登录设备) from a posted blob
+/// before storing. Returns the blob to store: unchanged when nothing
+/// was stripped or the data is not parseable JSON (fail open).
+fn ab_strip_managed_peers(data: &str) -> String {
+    let mut v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return data.to_string(),
+    };
+    let mut stripped = false;
+    if let Some(peers) = v.get_mut("peers").and_then(|p| p.as_array_mut()) {
+        let before = peers.len();
+        peers.retain(|p| {
+            !p.get("tags")
+                .and_then(|t| t.as_array())
+                .map(|tags| {
+                    tags.iter()
+                        .any(|t| t.as_str() == Some(AB_LOGIN_DEVICES_TAG))
+                })
+                .unwrap_or(false)
+        });
+        stripped = peers.len() != before;
+    }
+    if stripped {
+        v.to_string()
+    } else {
+        data.to_string()
+    }
+}
+
 async fn ab_get(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMap) -> Response {
     let caller = match client_caller(&st, &headers).await {
         Some(u) => u,
@@ -1195,16 +1377,35 @@ async fn ab_get(Extension(st): Extension<Arc<ApiState>>, headers: HeaderMap) -> 
         .await
         .ok()
         .flatten();
+    // Bound devices for the merge; empty on DB error (fail open).
+    let devices = bound_devices(&st, &caller.username).await;
     match row {
         Some(r) => {
             let data: String = r.try_get("data").unwrap_or_default();
+            // Malformed blob: merge returns None, return it verbatim.
+            let data = ab_merge_bound_devices(&data, &devices).unwrap_or(data);
             jresp(
                 StatusCode::OK,
                 json!({ "data": data, "licensed_devices": 0 }),
             )
         }
-        // The client treats the literal body "null" as an empty address book.
-        None => (StatusCode::OK, "null").into_response(),
+        None => {
+            if devices.is_empty() {
+                // The client treats the literal body "null" as an empty address book.
+                (StatusCode::OK, "null").into_response()
+            } else {
+                let peers: Vec<Value> =
+                    devices.iter().map(ab_peer_for_device).collect();
+                let blob = json!({
+                    "tags": [AB_LOGIN_DEVICES_TAG],
+                    "peers": peers,
+                });
+                jresp(
+                    StatusCode::OK,
+                    json!({ "data": blob.to_string(), "licensed_devices": 0 }),
+                )
+            }
+        }
     }
 }
 
@@ -1219,6 +1420,9 @@ async fn ab_post(
     };
     let v = parse_body(&body);
     let data = sfield(&v, "data");
+    // Strip server-managed peers: they are re-added on GET from live
+    // binding state, so an unbind self-heals on the next GET.
+    let data = ab_strip_managed_peers(&data);
     let r = sqlx::query(
         "insert into ab_store(username, data) values(?, ?) on conflict(username) do update set data=excluded.data",
     )
@@ -6838,6 +7042,253 @@ mod tests {
             assert_eq!(s, StatusCode::OK);
             assert_eq!(v["total"].as_i64().unwrap_or(-1), 3);
             assert_eq!(v["sessions"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    // ---------------- v40.1: address book auto-add bound devices --------
+
+    fn v401_device(id: &str, host: &str, os: &str, user: &str) -> BoundDevice {
+        BoundDevice {
+            device_id: id.to_string(),
+            hostname: host.to_string(),
+            os: os.to_string(),
+            os_username: user.to_string(),
+        }
+    }
+
+    #[test]
+    fn ab_platform_mapping() {
+        assert_eq!(ab_platform_from_os("windows / Windows 10 Pro"), "Windows");
+        assert_eq!(ab_platform_from_os("Windows 11"), "Windows");
+        assert_eq!(ab_platform_from_os("ubuntu / Ubuntu 22.04.5 LTS"), "Linux");
+        assert_eq!(ab_platform_from_os("debian / Debian GNU/Linux 12"), "Linux");
+        assert_eq!(ab_platform_from_os("macos / macOS 14.5"), "Mac OS");
+        assert_eq!(ab_platform_from_os("darwin / Darwin 23.0"), "Mac OS");
+        assert_eq!(ab_platform_from_os("android / Android 16"), "Android");
+        assert_eq!(ab_platform_from_os("ios / iOS 18.0"), "iOS");
+        assert_eq!(
+            ab_platform_from_os("freebsd / FreeBSD 14"),
+            "freebsd / FreeBSD 14"
+        );
+        assert_eq!(ab_platform_from_os(""), "");
+    }
+
+    #[test]
+    fn ab_merge_adds_devices_and_tag() {
+        let blob = r#"{"tags":["work"],"peers":[{"id":"999","alias":"mine","forceAlwaysRelay":"true","rdpPort":"3389","extra_field":1}]}"#;
+        let devices = vec![
+            v401_device("111", "pc-1", "windows / Windows 10 Pro", "alice"),
+            v401_device("222", "pc-2", "ubuntu / Ubuntu 22.04", "bob"),
+        ];
+        let merged = ab_merge_bound_devices(blob, &devices).expect("merged");
+        let v: Value = serde_json::from_str(&merged).expect("json");
+        let tags = v["tags"].as_array().expect("tags");
+        assert!(tags.iter().any(|t| t.as_str() == Some("work")));
+        assert!(tags.iter().any(|t| t.as_str() == Some("登录设备")));
+        // Existing peer untouched, all its fields intact.
+        let peers = v["peers"].as_array().expect("peers");
+        assert_eq!(peers.len(), 3);
+        let mine = &peers[0];
+        assert_eq!(mine["id"].as_str(), Some("999"));
+        assert_eq!(mine["alias"].as_str(), Some("mine"));
+        assert_eq!(mine["forceAlwaysRelay"].as_str(), Some("true"));
+        assert_eq!(mine["rdpPort"].as_str(), Some("3389"));
+        assert_eq!(mine["extra_field"].as_i64(), Some(1));
+        // Added peers carry device fields + the tag.
+        let p1 = &peers[1];
+        assert_eq!(p1["id"].as_str(), Some("111"));
+        assert_eq!(p1["hostname"].as_str(), Some("pc-1"));
+        assert_eq!(p1["username"].as_str(), Some("alice"));
+        assert_eq!(p1["platform"].as_str(), Some("Windows"));
+        assert_eq!(p1["hash"].as_str(), Some(""));
+        assert_eq!(p1["password"].as_str(), Some(""));
+        assert_eq!(p1["forceAlwaysRelay"].as_str(), Some("false"));
+        assert!(p1["same_server"].is_null());
+        assert_eq!(p1["tags"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+        assert_eq!(p1["tags"][0].as_str(), Some("登录设备"));
+        assert_eq!(peers[2]["platform"].as_str(), Some("Linux"));
+    }
+
+    #[test]
+    fn ab_merge_dedup_by_id() {
+        // The user's own entry for a bound device wins as-is: no tag
+        // added to it, no field touched, no duplicate peer.
+        let blob = r#"{"tags":[],"peers":[{"id":"111","alias":"renamed","tags":["work"],"password":"secret"}]}"#;
+        let devices = vec![v401_device("111", "pc-1", "windows", "alice")];
+        let merged = ab_merge_bound_devices(blob, &devices).expect("merged");
+        let v: Value = serde_json::from_str(&merged).expect("json");
+        let peers = v["peers"].as_array().expect("peers");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["alias"].as_str(), Some("renamed"));
+        assert_eq!(peers[0]["password"].as_str(), Some("secret"));
+        let tags = peers[0]["tags"].as_array().expect("peer tags");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].as_str(), Some("work"));
+    }
+
+    #[test]
+    fn ab_merge_malformed_passthrough() {
+        let devices = vec![v401_device("111", "pc-1", "windows", "alice")];
+        // Not JSON at all.
+        assert_eq!(ab_merge_bound_devices("not json{", &devices), None);
+        // JSON but not an object.
+        assert_eq!(ab_merge_bound_devices("[1,2]", &devices), None);
+        // No devices: verbatim, no tag added.
+        let blob = r#"{"tags":[],"peers":[]}"#;
+        assert_eq!(ab_merge_bound_devices(blob, &[]).as_deref(), Some(blob));
+        // Blob without peers/tags keys: the keys are created.
+        let merged = ab_merge_bound_devices("{}", &devices).expect("merged");
+        let v: Value = serde_json::from_str(&merged).expect("json");
+        assert_eq!(v["peers"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+        assert!(v["tags"]
+            .as_array()
+            .map(|a| a.iter().any(|t| t.as_str() == Some("登录设备")))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn ab_strip_managed_peers_cases() {
+        // Tagged peer stripped, the rest kept.
+        let data = r#"{"tags":["登录设备"],"peers":[{"id":"111","tags":["登录设备"]},{"id":"999","tags":["work"]}]}"#;
+        let stripped = ab_strip_managed_peers(data);
+        let v: Value = serde_json::from_str(&stripped).expect("json");
+        let peers = v["peers"].as_array().expect("peers");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["id"].as_str(), Some("999"));
+        // Nothing tagged: the exact input string comes back.
+        let plain = r#"{"tags":[],"peers":[{"id":"1"}]}"#;
+        assert_eq!(ab_strip_managed_peers(plain), plain);
+        // Not JSON: verbatim.
+        assert_eq!(ab_strip_managed_peers("garbage{"), "garbage{");
+    }
+
+    fn v401_bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("bearer"),
+        );
+        h
+    }
+
+    async fn v401_ab_get(st: &Arc<ApiState>, headers: HeaderMap) -> (StatusCode, Vec<u8>) {
+        let resp = ab_get(Extension(st.clone()), headers).await;
+        let status = resp.status();
+        let bytes = hyper::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default()
+            .to_vec();
+        (status, bytes)
+    }
+
+    async fn v401_ab_post(st: &Arc<ApiState>, headers: HeaderMap, body: &str) -> StatusCode {
+        let resp = ab_post(Extension(st.clone()), headers, body.to_string()).await;
+        resp.status()
+    }
+
+    async fn v401_seed_device(
+        st: &Arc<ApiState>,
+        id: &str,
+        user: &str,
+        host: &str,
+        os: &str,
+        os_user: &str,
+    ) {
+        upsert_device(
+            st,
+            id,
+            &format!("uuid-{id}"),
+            Some(user.to_string()),
+            host,
+            os,
+            os_user,
+            "1005030",
+            "",
+        )
+        .await;
+    }
+
+    #[test]
+    fn ab_get_no_blob_synthesizes_or_null() {
+        v39_block(async {
+            let (st, path) = v39_test_state("ab-noblob").await;
+            create_user(&st.pool, "alice", "alice123").await.expect("alice");
+            create_user(&st.pool, "bob", "bob12345").await.expect("bob");
+            let alice_tok = issue_client_token(&st, "alice", "1", "u1")
+                .await
+                .expect("tok");
+            let bob_tok = issue_client_token(&st, "bob", "2", "u2").await.expect("tok");
+            v401_seed_device(&st, "111", "alice", "alice-pc", "windows / Windows 10", "alice")
+                .await;
+            // Alice: no blob, one bound device -> synthesized blob.
+            let (s, body) = v401_ab_get(&st, v401_bearer_headers(&alice_tok)).await;
+            assert_eq!(s, StatusCode::OK);
+            let v: Value = serde_json::from_slice(&body).expect("json");
+            let blob: Value =
+                serde_json::from_str(v["data"].as_str().unwrap_or("")).expect("blob");
+            assert_eq!(blob["peers"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+            assert_eq!(blob["peers"][0]["id"].as_str(), Some("111"));
+            assert_eq!(blob["peers"][0]["hostname"].as_str(), Some("alice-pc"));
+            assert_eq!(blob["peers"][0]["platform"].as_str(), Some("Windows"));
+            // Bob: no blob, no devices -> literal "null".
+            let (s, body) = v401_ab_get(&st, v401_bearer_headers(&bob_tok)).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(String::from_utf8_lossy(&body), "null");
+            // Unauthenticated: 401.
+            let (s, _) = v401_ab_get(&st, HeaderMap::new()).await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn ab_handlers_merge_strip_and_scope() {
+        v39_block(async {
+            let (st, path) = v39_test_state("ab-handlers").await;
+            create_user(&st.pool, "alice", "alice123").await.expect("alice");
+            create_user(&st.pool, "bob", "bob12345").await.expect("bob");
+            let alice_tok = issue_client_token(&st, "alice", "1", "u1")
+                .await
+                .expect("tok");
+            let bob_tok = issue_client_token(&st, "bob", "2", "u2").await.expect("tok");
+            v401_seed_device(&st, "111", "alice", "alice-pc", "windows", "alice").await;
+            v401_seed_device(&st, "222", "bob", "bob-pc", "ubuntu", "bob").await;
+            // Alice posts a blob containing a stale managed peer (111,
+            // as if synced from an older GET) plus her own peer.
+            let posted = r#"{"tags":["登录设备","work"],"peers":[{"id":"111","tags":["登录设备"],"hostname":"stale"},{"id":"999","tags":["work"],"alias":"mine"}]}"#;
+            let body = serde_json::to_string(&json!({ "data": posted })).expect("body");
+            let s = v401_ab_post(&st, v401_bearer_headers(&alice_tok), &body).await;
+            assert_eq!(s, StatusCode::OK);
+            // GET: the stale managed peer is gone, her own peer is
+            // intact, and 111 is re-added fresh from binding state.
+            let (s, resp) = v401_ab_get(&st, v401_bearer_headers(&alice_tok)).await;
+            assert_eq!(s, StatusCode::OK);
+            let v: Value = serde_json::from_slice(&resp).expect("json");
+            let blob: Value =
+                serde_json::from_str(v["data"].as_str().unwrap_or("")).expect("blob");
+            let peers = blob["peers"].as_array().expect("peers");
+            assert_eq!(peers.len(), 2);
+            let mine = peers
+                .iter()
+                .find(|p| p["id"].as_str() == Some("999"))
+                .expect("mine");
+            assert_eq!(mine["alias"].as_str(), Some("mine"));
+            let auto = peers
+                .iter()
+                .find(|p| p["id"].as_str() == Some("111"))
+                .expect("auto");
+            assert_eq!(auto["hostname"].as_str(), Some("alice-pc"));
+            assert_ne!(auto["hostname"].as_str(), Some("stale"));
+            // Bob sees none of Alice's devices.
+            let (s, resp) = v401_ab_get(&st, v401_bearer_headers(&bob_tok)).await;
+            assert_eq!(s, StatusCode::OK);
+            let v: Value = serde_json::from_slice(&resp).expect("json");
+            let blob: Value =
+                serde_json::from_str(v["data"].as_str().unwrap_or("")).expect("blob");
+            let peers = blob["peers"].as_array().expect("peers");
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0]["id"].as_str(), Some("222"));
             let _ = std::fs::remove_file(&path);
         });
     }

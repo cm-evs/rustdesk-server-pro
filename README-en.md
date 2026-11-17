@@ -50,6 +50,7 @@ A self-hosted remote desktop server based on the official open-source [rustdesk-
 - **v38**: KX encryption on the 21116 control channel (secure_tcp KX v0) + console URL state (hash routing; refresh no longer returns to the overview) + "Last relay used" column in the device list
 - **v39**: admins create users directly in user management (works with registration closed; creating a user does not sign the admin out)
 - **v40**: connection audit log (console "Audit Log" page: who/when/from where/to where/relayed or direct/duration)
+- **v40.1 (preview)**: address book auto-adds bound devices ("登录设备" group; field parity with sctgdesk verified)
 
 ## Quick start
 
