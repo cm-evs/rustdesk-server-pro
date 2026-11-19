@@ -235,7 +235,7 @@ const I18N={zh:{
 'aud.range_today':'今天','aud.range_7d':'7 天','aud.range_30d':'30 天','aud.range_all':'全部',
 'aud.col_started':'开始时间','aud.col_controller':'控制端','aud.col_controlled':'被控端',
 'aud.col_ip':'控制端 IP','aud.col_relay':'中继/直连','aud.col_duration':'时长','aud.col_status':'状态',
-'aud.relayed':'中继','aud.direct':'直连','aud.unknown':'—','aud.open':'进行中','aud.closed':'已结束',
+'aud.relayed':'中继','aud.direct':'直连','aud.unknown':'—','aud.open':'进行中','aud.closed':'已结束','aud.closed_stale':'（无关闭记录）','aud.closed_offline':'（设备离线）',
 'aud.empty':'暂无审计记录。','aud.page':'第 {p} / {n} 页（共 {t} 条）','aud.prev':'上一页','aud.next':'下一页'
 },en:{
 'app.title':'RustDesk Server Console','app.logout':'Sign out','app.loading':'Loading…',
@@ -393,7 +393,7 @@ const I18N={zh:{
 'aud.range_today':'Today','aud.range_7d':'7 days','aud.range_30d':'30 days','aud.range_all':'All',
 'aud.col_started':'Started','aud.col_controller':'Controller','aud.col_controlled':'Controlled',
 'aud.col_ip':'Controller IP','aud.col_relay':'Relay/Direct','aud.col_duration':'Duration','aud.col_status':'Status',
-'aud.relayed':'Relay','aud.direct':'Direct','aud.unknown':'—','aud.open':'In progress','aud.closed':'Ended',
+'aud.relayed':'Relay','aud.direct':'Direct','aud.unknown':'—','aud.open':'In progress','aud.closed':'Ended','aud.closed_stale':'(no close record)','aud.closed_offline':'(device offline)',
 'aud.empty':'No audit records yet.','aud.page':'Page {p} / {n} ({t} total)','aud.prev':'Previous','aud.next':'Next'
 }};
 function curLang(){try{const l=localStorage.getItem('rdp-lang');return l==='en'?'en':'zh';}catch(e){return 'zh';}}
@@ -908,7 +908,8 @@ async function loadAudit(page){
       const open=s.ended_at==null;
       const dur=open?fmtDur(Date.now()/1000-s.started_at):fmtDur(s.duration_sec);
       const relay=s.relayed===true?t('aud.relayed'):s.relayed===false?t('aud.direct'):t('aud.unknown');
-      return `<tr><td class="trunc" title="${esc(new Date(s.started_at*1000).toLocaleString())}">${new Date(s.started_at*1000).toLocaleString()}</td><td>${whoCell(s.controller_id,s.controller_name,s.controller_username)}</td><td>${whoCell(s.device_id,s.controlled_hostname,s.controlled_username)}</td><td class="trunc" title="${esc(s.controller_ip||'-')}">${esc(s.controller_ip||'-')}</td><td>${relay}</td><td class="nowrap">${dur}</td><td>${open?'<span class="ok">'+t('aud.open')+'</span>':'<span class="muted">'+t('aud.closed')+'</span>'}</td></tr>`;
+      const closedMark=s.closed_by==='stale'?' <span class="muted">'+t('aud.closed_stale')+'</span>':s.closed_by==='offline'?' <span class="muted">'+t('aud.closed_offline')+'</span>':'';
+      return `<tr><td class="trunc" title="${esc(new Date(s.started_at*1000).toLocaleString())}">${new Date(s.started_at*1000).toLocaleString()}</td><td>${whoCell(s.controller_id,s.controller_name,s.controller_username)}</td><td>${whoCell(s.device_id,s.controlled_hostname,s.controlled_username)}</td><td class="trunc" title="${esc(s.controller_ip||'-')}">${esc(s.controller_ip||'-')}</td><td>${relay}</td><td class="nowrap">${dur}</td><td>${open?'<span class="ok">'+t('aud.open')+'</span>':'<span class="muted">'+t('aud.closed')+'</span>'+closedMark}</td></tr>`;
     }).join('')+TABLE_CLOSE;}
   const pages=Math.max(1,Math.ceil(j.total/j.per_page));
   $('aud-pager').innerHTML='<button class="ghost" id="aud-prev"'+(AUDIT_PAGE<=1?' disabled':'')+'>'+t('aud.prev')+'</button> <span class="muted">'+t('aud.page').replace('{p}',AUDIT_PAGE).replace('{n}',pages).replace('{t}',j.total)+'</span> <button class="ghost" id="aud-next"'+(AUDIT_PAGE>=pages?' disabled':'')+'>'+t('aud.next')+'</button>';

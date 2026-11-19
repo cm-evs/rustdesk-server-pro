@@ -370,7 +370,7 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "create table if not exists client_tokens(token text primary key, username text not null, device_id text not null default '', uuid text not null default '', created_at integer not null)",
         "create table if not exists oidc_codes(code text primary key, device_id text not null, uuid text not null, username text, created_at integer not null)",
         "create table if not exists api_tokens(id integer primary key autoincrement, username text not null, name text not null, token_hash text not null, created_at integer not null, last_used_at integer)",
-        "create table if not exists devices(device_id text not null, uuid text not null, username text, hostname text not null default '', os text not null default '', os_username text not null default '', version text not null default '', last_seen integer not null, sysinfo text not null default '', last_relay text not null default '', last_relay_at integer not null default 0, primary key(device_id, uuid))",
+        "create table if not exists devices(device_id text not null, uuid text not null, username text, hostname text not null default '', os text not null default '', os_username text not null default '', version text not null default '', last_seen integer not null, sysinfo text not null default '', last_relay text not null default '', last_relay_at integer not null default 0, conns text not null default '[]', conns_updated_at integer not null default 0, primary key(device_id, uuid))",
         "create table if not exists settings(key text primary key, value text not null)",
         "create table if not exists gen_clients(id integer primary key autoincrement, filename text not null, token text not null, label text not null default '', created_by text not null, created_at integer not null)",
         "create table if not exists ab_store(username text primary key, data text not null)",
@@ -386,6 +386,10 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "create table if not exists audit_conn(id integer primary key autoincrement, nonce text not null unique, device_id text not null, device_uuid text not null default '', conn_id integer not null, session_id text not null default '', action text not null, ip text not null default '', peer_id text not null default '', peer_name text not null default '', conn_type text not null default '', primary_auth integer, two_factor integer, conn_audit_ref text not null default '', raw text not null default '', received_at integer not null)",
         "create index if not exists idx_audit_conn_session on audit_conn(device_id, conn_id, received_at)",
         "create index if not exists idx_audit_conn_received on audit_conn(received_at)",
+        // v43: ends of sessions whose "close" never arrived, recorded
+        // by the heartbeat reaper (issue #11). audit_conn keeps the
+        // raw truth: no close rows are fabricated there.
+        "create table if not exists audit_session_close(device_id text not null, conn_id integer not null, ended_at integer not null, reason text not null default 'stale', primary key(device_id, conn_id))",
     ];
     for s in stmts {
         sqlx::query(s)
@@ -402,6 +406,20 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
     for s in [
         "alter table devices add column last_relay text not null default ''",
         "alter table devices add column last_relay_at integer not null default 0",
+    ] {
+        if let Err(e) = sqlx::query(s).execute(&pool).await {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(msg);
+            }
+        }
+    }
+    // v43: the live-connection list from the device's latest
+    // heartbeat (issue #11 reaping). Same duplicate-column tolerance
+    // as the v38 migration above.
+    for s in [
+        "alter table devices add column conns text not null default '[]'",
+        "alter table devices add column conns_updated_at integer not null default 0",
     ] {
         if let Err(e) = sqlx::query(s).execute(&pool).await {
             let msg = e.to_string();
@@ -945,6 +963,103 @@ async fn bind_username(st: &ApiState, headers: &HeaderMap, device_id: &str, uuid
     username_for_device(st, device_id, uuid).await
 }
 
+/// Live connection IDs from a heartbeat body: the `conns` array the
+/// official client sends (src/hbbs_http/sync.rs). The field is
+/// OMITTED when the list is empty, so a missing field means no live
+/// connections; non-number entries are ignored. Same i32 ID
+/// namespace as the audit conn_id (inner.id in post_conn_audit).
+fn heartbeat_conns(v: &Value) -> Vec<i64> {
+    match v.get("conns") {
+        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_i64()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Store a device's latest live-connection list (`at` = heartbeat
+/// receipt time, unix seconds). Called after upsert_device, so the
+/// row exists.
+async fn store_heartbeat_conns(
+    pool: &SqlitePool,
+    device_id: &str,
+    uuid: &str,
+    conns: &[i64],
+    at: i64,
+) {
+    let json = serde_json::to_string(conns).unwrap_or_else(|_| "[]".to_string());
+    let _ = sqlx::query(
+        "update devices set conns=?, conns_updated_at=? where device_id=? and uuid=?",
+    )
+    .bind(&json)
+    .bind(at)
+    .bind(device_id)
+    .bind(uuid)
+    .execute(pool)
+    .await;
+}
+
+/// Grace period before a session missing from the heartbeat's live
+/// list is reaped: covers the race where a session just started and
+/// its audit "new" record landed before the next heartbeat. A close
+/// posted late still wins, because reaping only touches groups with
+/// no close row.
+const AUDIT_REAP_GRACE_SECS: i64 = 60;
+
+/// Reap dead sessions for one device (v43, issue #11): the
+/// controlled client posts "close" exactly once at connection-loop
+/// exit, so a crash/restart/reboot (or exhausted close retries)
+/// leaves the session open forever. The heartbeat's live-connection
+/// list is the ground truth instead: an open session whose last
+/// event is older than the grace period and whose conn_id is absent
+/// from the just-received list is dead — record its end in
+/// audit_session_close (never fabricate audit_conn rows). A conn_id
+/// that reappears in the live list has any stale record deleted:
+/// conn_id restarts when the client restarts, so the id may be
+/// reused by a new session.
+async fn reap_audit_sessions(
+    pool: &SqlitePool,
+    device_id: &str,
+    live_conns: &[i64],
+    at: i64,
+) {
+    // Reappearance hygiene first: a live conn_id is not dead.
+    for conn_id in live_conns {
+        let _ = sqlx::query("delete from audit_session_close where device_id=? and conn_id=?")
+            .bind(device_id)
+            .bind(conn_id)
+            .execute(pool)
+            .await;
+    }
+    let rows = sqlx::query(
+        "select a.conn_id as conn_id from audit_conn a \
+         where a.device_id=? \
+         and not exists (select 1 from audit_conn c where c.device_id=a.device_id and c.conn_id=a.conn_id and c.action='close') \
+         and not exists (select 1 from audit_session_close s where s.device_id=a.device_id and s.conn_id=a.conn_id) \
+         group by a.conn_id having max(a.received_at) < ?",
+    )
+    .bind(device_id)
+    .bind(at - AUDIT_REAP_GRACE_SECS)
+    .fetch_all(pool)
+    .await;
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for r in &rows {
+        let conn_id = r.try_get::<i64, _>("conn_id").unwrap_or(0);
+        if live_conns.contains(&conn_id) {
+            continue;
+        }
+        let _ = sqlx::query(
+            "insert or ignore into audit_session_close(device_id, conn_id, ended_at, reason) values(?, ?, ?, 'stale')",
+        )
+        .bind(device_id)
+        .bind(conn_id)
+        .bind(at)
+        .execute(pool)
+        .await;
+    }
+}
+
 async fn heartbeat(
     Extension(st): Extension<Arc<ApiState>>,
     headers: HeaderMap,
@@ -960,6 +1075,12 @@ async fn heartbeat(
             .map(|x| x.to_string())
             .unwrap_or_default();
         upsert_device(&st, &device_id, &uuid, username, "", "", "", &ver, "").await;
+        // v43: record the live-connection list and reap sessions the
+        // client no longer reports (issue #11).
+        let conns = heartbeat_conns(&v);
+        let at = now();
+        store_heartbeat_conns(&st.pool, &device_id, &uuid, &conns, at).await;
+        reap_audit_sessions(&st.pool, &device_id, &conns, at).await;
     }
     // Strategy push: keep the pushed client options in sync with the
     // console settings (hide-server-settings, allow-remote-config).
@@ -2248,29 +2369,60 @@ fn resolve_relay_ips(servers: &str) -> std::collections::HashSet<std::net::IpAdd
     out
 }
 
-/// Cached relay IPs: (fetched_at, Some(set)) when the --relay-servers
-/// list resolved to at least one IP, None when the list is empty or
-/// nothing resolved (relay detection then reports unknown instead of
-/// guessing). Refreshed at most every 5 minutes; a re-pointed relay
-/// domain takes up to that long to show up.
+/// Union of the --relay-servers list and the server's own public
+/// address (public_host setting, same source client_config() uses):
+/// with no --relay-servers, single-host deployments relay via the
+/// server host itself (the client falls back to the rendezvous host,
+/// port+1), so the host address belongs in the relay set. Empty when
+/// both sources are empty/unresolvable — relay detection then
+/// reports unknown instead of guessing.
+fn relay_ips_union(
+    relay_servers: &str,
+    public_host: &str,
+) -> std::collections::HashSet<std::net::IpAddr> {
+    let mut set = resolve_relay_ips(relay_servers);
+    let host = host_part(public_host);
+    if !host.is_empty() {
+        set.extend(resolve_relay_ips(host));
+    }
+    set
+}
+
+/// Cached relay IPs: (fetched_at, key, Some(set)) when the union
+/// resolved to at least one IP, None when both sources are
+/// empty/unresolvable (relay detection then reports unknown instead
+/// of guessing). Refreshed at most every 5 minutes for unchanged
+/// inputs; the key is (relay-servers, public_host), so an admin
+/// changing public_host in the console takes effect on the next
+/// request instead of waiting out the TTL. A re-pointed relay
+/// domain takes up to 5 minutes to show up.
 static RELAY_IPS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<Option<(std::time::Instant, Option<std::collections::HashSet<std::net::IpAddr>>)>>,
+    std::sync::Mutex<
+        Option<(
+            std::time::Instant,
+            String,
+            Option<std::collections::HashSet<std::net::IpAddr>>,
+        )>,
+    >,
 > = std::sync::OnceLock::new();
 
-fn relay_ips_cached() -> Option<std::collections::HashSet<std::net::IpAddr>> {
+async fn relay_ips_cached(pool: &SqlitePool) -> Option<std::collections::HashSet<std::net::IpAddr>> {
+    let relay_servers = crate::common::get_arg("relay-servers");
+    let public_host = get_setting(pool, "public_host").await;
+    let key = format!("{relay_servers}\0{public_host}");
     let cache = RELAY_IPS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     let mut guard = match cache.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    if let Some((at, ips)) = guard.as_ref() {
-        if at.elapsed() < std::time::Duration::from_secs(300) {
+    if let Some((at, k, ips)) = guard.as_ref() {
+        if *k == key && at.elapsed() < std::time::Duration::from_secs(300) {
             return ips.clone();
         }
     }
-    let set = resolve_relay_ips(&crate::common::get_arg("relay-servers"));
+    let set = relay_ips_union(&relay_servers, &public_host);
     let out = if set.is_empty() { None } else { Some(set) };
-    *guard = Some((std::time::Instant::now(), out.clone()));
+    *guard = Some((std::time::Instant::now(), key, out.clone()));
     out
 }
 
@@ -2301,6 +2453,10 @@ struct AuditSessionRow {
     conn_id: i64,
     started_at: i64,
     ended_at: Option<i64>,
+    /// How the session ended: "event" (client "close" event),
+    /// "stale" (heartbeat reaper, issue #11), "offline" (device
+    /// silent over the offline threshold), None while open.
+    closed_by: Option<&'static str>,
     controller_ip: String,
     controller_id: String,
     controller_name: String,
@@ -2312,12 +2468,23 @@ struct AuditSessionRow {
 struct AuditSessionAcc {
     started_new: Option<i64>,
     first: i64,
+    last: i64,
     ended: Option<i64>,
     ip: String,
     peer_id: String,
     peer_name: String,
     conn_type: String,
 }
+
+/// A session with no close and no stale record is dead once its
+/// device has been silent for 24 h: idle devices heartbeat at least
+/// every 15 s, so a day of silence means the device is gone (a
+/// device that comes back online gets reaped by the heartbeat rule
+/// on its first heartbeat instead). 24 h, not shorter, so a device
+/// asleep overnight is never cut off by this rule alone — when its
+/// heartbeats resume, a genuinely live session keeps its conn_id in
+/// the live list and neither rule touches it.
+const AUDIT_OFFLINE_SECS: i64 = 86400;
 
 /// Assemble sessions from audit_conn rows (newest first, capped at
 /// 20000 events so an unbounded table cannot blow up the console
@@ -2345,6 +2512,7 @@ async fn audit_session_rows(
             .or_insert_with(|| AuditSessionAcc {
                 started_new: None,
                 first: at,
+                last: at,
                 ended: None,
                 ip: String::new(),
                 peer_id: String::new(),
@@ -2353,6 +2521,9 @@ async fn audit_session_rows(
             });
         if at < acc.first {
             acc.first = at;
+        }
+        if at > acc.last {
+            acc.last = at;
         }
         match action.as_str() {
             "new" => {
@@ -2378,13 +2549,14 @@ async fn audit_session_rows(
     }
     // Device info for both ends (most recently seen row wins when a
     // device_id has several uuid rows, e.g. after a reinstall).
+    // last_seen feeds the offline rule below.
     let dev_rows = sqlx::query(
-        "select device_id, username, hostname from devices order by last_seen desc",
+        "select device_id, username, hostname, last_seen from devices order by last_seen desc",
     )
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
-    let mut devs: HashMap<String, (Option<String>, String)> = HashMap::new();
+    let mut devs: HashMap<String, (Option<String>, String, i64)> = HashMap::new();
     for r in &dev_rows {
         let id = r.try_get::<String, _>("device_id").unwrap_or_default();
         if id.is_empty() || devs.contains_key(&id) {
@@ -2392,23 +2564,62 @@ async fn audit_session_rows(
         }
         let username = r.try_get::<Option<String>, _>("username").ok().flatten();
         let hostname = r.try_get::<String, _>("hostname").unwrap_or_default();
-        devs.insert(id, (username, hostname));
+        let last_seen = r.try_get::<i64, _>("last_seen").unwrap_or(0);
+        devs.insert(id, (username, hostname, last_seen));
     }
-    let relay_ips = relay_ips_cached();
+    // Reaped (stale) session ends, recorded by the heartbeat reaper.
+    let stale_rows = sqlx::query("select device_id, conn_id, ended_at from audit_session_close")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut stale: HashMap<(String, i64), i64> = HashMap::new();
+    for r in &stale_rows {
+        let device_id = r.try_get::<String, _>("device_id").unwrap_or_default();
+        let conn_id = r.try_get::<i64, _>("conn_id").unwrap_or(0);
+        let ended_at = r.try_get::<i64, _>("ended_at").unwrap_or(0);
+        stale.insert((device_id, conn_id), ended_at);
+    }
+    let relay_ips = relay_ips_cached(pool).await;
+    let t = now();
     let mut out: Vec<AuditSessionRow> = groups
         .into_iter()
         .map(|((device_id, conn_id), acc)| {
             let started_at = acc.started_new.unwrap_or(acc.first);
-            let (controlled_username, controlled_hostname) = devs
+            let (controlled_username, controlled_hostname, _) = devs
                 .get(&device_id)
                 .cloned()
-                .unwrap_or((None, String::new()));
+                .unwrap_or((None, String::new(), 0));
             let controller_username = if acc.peer_id.is_empty() {
                 None
             } else {
                 devs.get(&acc.peer_id)
-                    .and_then(|(u, _)| u.clone())
+                    .and_then(|(u, _, _)| u.clone())
             };
+            // How the session ended: a "close" event wins; else a
+            // stale record — applied only if it postdates the
+            // group's last event, because conn_id restarts when the
+            // client restarts and a new session may reuse the id
+            // after the old one was reaped; else the offline rule
+            // (computed here, no writes).
+            let mut ended_at = acc.ended;
+            let mut closed_by: Option<&'static str> =
+                if acc.ended.is_some() { Some("event") } else { None };
+            if ended_at.is_none() {
+                if let Some(&s) = stale.get(&(device_id.clone(), conn_id)) {
+                    if s >= acc.last {
+                        ended_at = Some(s);
+                        closed_by = Some("stale");
+                    }
+                }
+            }
+            if ended_at.is_none() {
+                if let Some((_, _, last_seen)) = devs.get(&device_id) {
+                    if *last_seen > 0 && t - *last_seen > AUDIT_OFFLINE_SECS {
+                        ended_at = Some((*last_seen).max(started_at));
+                        closed_by = Some("offline");
+                    }
+                }
+            }
             AuditSessionRow {
                 relayed: relayed_for_ip(&acc.ip, &relay_ips),
                 device_id,
@@ -2416,7 +2627,8 @@ async fn audit_session_rows(
                 controlled_username,
                 conn_id,
                 started_at,
-                ended_at: acc.ended,
+                ended_at,
+                closed_by,
                 controller_ip: acc.ip,
                 controller_id: acc.peer_id,
                 controller_name: acc.peer_name,
@@ -2442,6 +2654,7 @@ fn audit_session_json(r: &AuditSessionRow) -> Value {
         "conn_id": r.conn_id,
         "started_at": r.started_at,
         "ended_at": r.ended_at,
+        "closed_by": r.closed_by,
         "duration_sec": r.ended_at.map(|e| e - r.started_at),
         "controller_ip": r.controller_ip,
         "controller_id": r.controller_id,
@@ -6643,7 +6856,12 @@ mod tests {
     /// Test ApiState backed by a throwaway temp-file DB (an in-memory
     /// pool would split across connections: init_db allows 8).
     async fn v39_test_state(tag: &str) -> (Arc<ApiState>, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("rdp-v39-test-{tag}.sqlite3"));
+        // PID-suffixed: two checkouts running the suite at once
+        // (e.g. parallel worktrees) must not share temp DB files.
+        let path = std::env::temp_dir().join(format!(
+            "rdp-v39-test-{}-{tag}.sqlite3",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let pool = init_db(path.to_str().unwrap_or(""))
             .await
@@ -7067,6 +7285,8 @@ mod tests {
             let closed = rows.iter().find(|r| r.conn_id == 7).expect("closed session");
             assert!(closed.ended_at.is_some());
             assert!(closed.ended_at.unwrap_or(0) >= closed.started_at);
+            assert_eq!(closed.closed_by, Some("event"));
+            assert_eq!(audit_session_json(closed)["closed_by"], "event");
             assert_eq!(closed.controller_id, "222");
             assert_eq!(closed.controller_name, "bob-pc");
             assert_eq!(closed.controller_username.as_deref(), Some("bob"));
@@ -7079,8 +7299,10 @@ mod tests {
             assert_eq!(closed.relayed, None);
             let open = rows.iter().find(|r| r.conn_id == 8).expect("open session");
             assert_eq!(open.ended_at, None);
+            assert_eq!(open.closed_by, None);
             assert!(audit_session_json(open)["duration_sec"].is_null());
             assert!(audit_session_json(open)["ended_at"].is_null());
+            assert!(audit_session_json(open)["closed_by"].is_null());
             let _ = std::fs::remove_file(&path);
         });
     }
@@ -7162,6 +7384,319 @@ mod tests {
             assert_eq!(s, StatusCode::OK);
             assert_eq!(v["total"].as_i64().unwrap_or(-1), 3);
             assert_eq!(v["sessions"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    // ---------------- v43: audit reaping + relay inference (issue #11) --------
+
+    async fn v43_seed_audit(
+        pool: &SqlitePool,
+        device: &str,
+        uuid: &str,
+        conn: i64,
+        nonce: &str,
+        action: &str,
+        ip: &str,
+        at: i64,
+    ) {
+        sqlx::query(
+            "insert into audit_conn(nonce, device_id, device_uuid, conn_id, session_id, action, ip, received_at) values(?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(nonce)
+        .bind(device)
+        .bind(uuid)
+        .bind(conn)
+        .bind(format!("s{conn}"))
+        .bind(action)
+        .bind(ip)
+        .bind(at)
+        .execute(pool)
+        .await
+        .expect("seed audit");
+    }
+
+    async fn v43_seed_stale(pool: &SqlitePool, device: &str, conn: i64, ended_at: i64) {
+        sqlx::query(
+            "insert or ignore into audit_session_close(device_id, conn_id, ended_at, reason) values(?, ?, ?, 'stale')",
+        )
+        .bind(device)
+        .bind(conn)
+        .bind(ended_at)
+        .execute(pool)
+        .await
+        .expect("seed stale");
+    }
+
+    async fn v43_stale_count(pool: &SqlitePool, device: &str, conn: i64) -> i64 {
+        sqlx::query("select count(*) as c from audit_session_close where device_id=? and conn_id=?")
+            .bind(device)
+            .bind(conn)
+            .fetch_one(pool)
+            .await
+            .expect("stale count")
+            .try_get("c")
+            .unwrap_or(-1)
+    }
+
+    async fn v43_close_count(pool: &SqlitePool, device: &str, conn: i64) -> i64 {
+        sqlx::query(
+            "select count(*) as c from audit_conn where device_id=? and conn_id=? and action='close'",
+        )
+        .bind(device)
+        .bind(conn)
+        .fetch_one(pool)
+        .await
+        .expect("close count")
+        .try_get("c")
+        .unwrap_or(-1)
+    }
+
+    async fn v43_set_last_seen(pool: &SqlitePool, device: &str, at: i64) {
+        sqlx::query("update devices set last_seen=? where device_id=?")
+            .bind(at)
+            .bind(device)
+            .execute(pool)
+            .await
+            .expect("set last_seen");
+    }
+
+    #[test]
+    fn audit_reap_stale_session_on_heartbeat() {
+        v39_block(async {
+            let (st, path) = v39_test_state("v43-reap").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            let t = now();
+            // Pre-existing stuck session: last event an hour ago, no
+            // close — the yguangg case. A second old session whose
+            // conn_id is still live must NOT be reaped.
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 7, "r-1", "new", "192.0.2.55", t - 3600)
+                .await;
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 8, "r-2", "new", "192.0.2.55", t - 3600)
+                .await;
+            reap_audit_sessions(&st.pool, "111", &[8], t).await;
+            assert_eq!(v43_stale_count(&st.pool, "111", 7).await, 1);
+            assert_eq!(v43_stale_count(&st.pool, "111", 8).await, 0);
+            // No close rows fabricated in the raw table.
+            assert_eq!(v43_close_count(&st.pool, "111", 7).await, 0);
+            // Reaping twice is a no-op (NOT EXISTS excludes it).
+            reap_audit_sessions(&st.pool, "111", &[8], t).await;
+            assert_eq!(v43_stale_count(&st.pool, "111", 7).await, 1);
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            let dead = rows.iter().find(|r| r.conn_id == 7).expect("reaped session");
+            assert_eq!(dead.ended_at, Some(t));
+            assert_eq!(dead.closed_by, Some("stale"));
+            assert_eq!(audit_session_json(dead)["closed_by"], "stale");
+            // Duration stops growing: ended - started is fixed.
+            assert_eq!(
+                audit_session_json(dead)["duration_sec"].as_i64().unwrap_or(-1),
+                3600
+            );
+            let live = rows.iter().find(|r| r.conn_id == 8).expect("live session");
+            assert_eq!(live.ended_at, None);
+            assert_eq!(live.closed_by, None);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_reap_grace_period_keeps_fresh_session() {
+        v39_block(async {
+            let (st, path) = v39_test_state("v43-grace").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            let t = now();
+            // Fresh session (10 s old): heartbeat without the conn_id
+            // must NOT reap it — the race the grace period covers.
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 7, "g-1", "new", "192.0.2.55", t - 10)
+                .await;
+            reap_audit_sessions(&st.pool, "111", &[], t).await;
+            assert_eq!(v43_stale_count(&st.pool, "111", 7).await, 0);
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            let open = rows.iter().find(|r| r.conn_id == 7).expect("fresh session");
+            assert_eq!(open.ended_at, None);
+            assert_eq!(open.closed_by, None);
+            // Past the grace period, the same heartbeat reaps it.
+            reap_audit_sessions(&st.pool, "111", &[], t + 120).await;
+            assert_eq!(v43_stale_count(&st.pool, "111", 7).await, 1);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_stale_reuse_guard_ignores_old_record() {
+        v39_block(async {
+            let (st, path) = v39_test_state("v43-reuse").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            let t = now();
+            // Old session reaped at t-1800; the client restarted and
+            // a NEW session reused conn_id 7, with events after the
+            // reaping — the stale record must not close the new one.
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 7, "u-1", "new", "192.0.2.55", t - 3600)
+                .await;
+            v43_seed_stale(&st.pool, "111", 7, t - 1800).await;
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 7, "u-2", "new", "192.0.2.55", t - 60)
+                .await;
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].ended_at, None);
+            assert_eq!(rows[0].closed_by, None);
+            // And a stale record that postdates the last event DOES
+            // apply (same setup, reaped after the last event).
+            sqlx::query("update audit_session_close set ended_at=? where device_id=? and conn_id=?")
+                .bind(t - 30)
+                .bind("111")
+                .bind(7)
+                .execute(&st.pool)
+                .await
+                .expect("rewrite stale");
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            assert_eq!(rows[0].ended_at, Some(t - 30));
+            assert_eq!(rows[0].closed_by, Some("stale"));
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_reap_deletes_stale_on_reappearance() {
+        v39_block(async {
+            let (st, path) = v39_test_state("v43-reappear").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            let t = now();
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 7, "p-1", "new", "192.0.2.55", t - 3600)
+                .await;
+            v43_seed_stale(&st.pool, "111", 7, t - 60).await;
+            assert_eq!(v43_stale_count(&st.pool, "111", 7).await, 1);
+            // conn_id 7 is live again: the stale record is deleted.
+            reap_audit_sessions(&st.pool, "111", &[7], t).await;
+            assert_eq!(v43_stale_count(&st.pool, "111", 7).await, 0);
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            let open = rows.iter().find(|r| r.conn_id == 7).expect("session");
+            assert_eq!(open.ended_at, None);
+            assert_eq!(open.closed_by, None);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_offline_rule_ends_silent_device_session() {
+        v39_block(async {
+            let (st, path) = v39_test_state("v43-offline").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            v40_seed_device(&st, "222", "dXV1aWQy", Some("bob")).await;
+            let t = now();
+            // Device 111 silent 25 h: its open session is dead, ended
+            // at max(last_seen, started_at) = last_seen here.
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 7, "o-1", "new", "192.0.2.55", t - 26 * 3600)
+                .await;
+            v43_set_last_seen(&st.pool, "111", t - 25 * 3600).await;
+            // Device 222 seen 1 h ago: its open session stays open.
+            v43_seed_audit(&st.pool, "222", "dXV1aWQy", 7, "o-2", "new", "192.0.2.55", t - 3600)
+                .await;
+            v43_set_last_seen(&st.pool, "222", t - 3600).await;
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            let dead = rows
+                .iter()
+                .find(|r| r.device_id == "111")
+                .expect("offline session");
+            assert_eq!(dead.ended_at, Some(t - 25 * 3600));
+            assert_eq!(dead.closed_by, Some("offline"));
+            assert_eq!(audit_session_json(dead)["closed_by"], "offline");
+            let live = rows
+                .iter()
+                .find(|r| r.device_id == "222")
+                .expect("recent session");
+            assert_eq!(live.ended_at, None);
+            assert_eq!(live.closed_by, None);
+            // The offline rule writes nothing: no stale rows appear.
+            assert_eq!(v43_stale_count(&st.pool, "111", 7).await, 0);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn heartbeat_conns_parsing() {
+        assert!(heartbeat_conns(&json!({"id": "111"})).is_empty());
+        assert_eq!(heartbeat_conns(&json!({"conns": [1, 2]})), vec![1, 2]);
+        assert!(heartbeat_conns(&json!({"conns": []})).is_empty());
+        // Non-number entries are ignored; a non-array is empty.
+        assert_eq!(
+            heartbeat_conns(&json!({"conns": [1, "x", null, 3]})),
+            vec![1, 3]
+        );
+        assert!(heartbeat_conns(&json!({"conns": 7})).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_conns_stored() {
+        v39_block(async {
+            let (st, path) = v39_test_state("v43-store").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            // Fresh rows carry the migration default.
+            let row = sqlx::query("select conns, conns_updated_at from devices where device_id=?")
+                .bind("111")
+                .fetch_one(&st.pool)
+                .await
+                .expect("device row");
+            assert_eq!(row.try_get::<String, _>("conns").unwrap_or_default(), "[]");
+            assert_eq!(row.try_get::<i64, _>("conns_updated_at").unwrap_or(-1), 0);
+            let t = now();
+            store_heartbeat_conns(&st.pool, "111", "dXV1aWQx", &[7, 8], t).await;
+            let row = sqlx::query("select conns, conns_updated_at from devices where device_id=?")
+                .bind("111")
+                .fetch_one(&st.pool)
+                .await
+                .expect("device row");
+            assert_eq!(row.try_get::<String, _>("conns").unwrap_or_default(), "[7,8]");
+            assert_eq!(row.try_get::<i64, _>("conns_updated_at").unwrap_or(-1), t);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn relay_ips_union_public_host() {
+        // public_host-only: no --relay-servers at all.
+        let set = relay_ips_union("", "203.0.113.1");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&"203.0.113.1".parse().unwrap()));
+        // Both empty: empty set, never guessed.
+        assert!(relay_ips_union("", "").is_empty());
+        assert!(relay_ips_union("   ", "").is_empty());
+        // Union of both sources; a :port suffix on public_host is
+        // stripped (host_part).
+        let set = relay_ips_union("203.0.113.1", "198.51.100.2:21116");
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&"203.0.113.1".parse().unwrap()));
+        assert!(set.contains(&"198.51.100.2".parse().unwrap()));
+        // Bracketed IPv6 with a port.
+        let set = relay_ips_union("", "[2001:db8::1]:21116");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&"2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn audit_relay_inference_public_host() {
+        v39_block(async {
+            let (st, path) = v39_test_state("v43-relay").await;
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            v40_post(&st, &v40_new_body("111", "dXV1aWQx", 7, "y-1", "203.0.113.1")).await;
+            v40_post(&st, &v40_close_body("111", "dXV1aWQx", 7, "y-2")).await;
+            v40_post(&st, &v40_new_body("111", "dXV1aWQx", 8, "y-3", "192.0.2.55")).await;
+            v40_post(&st, &v40_close_body("111", "dXV1aWQx", 8, "y-4")).await;
+            // No --relay-servers in the test env and no public_host:
+            // relayed is null, never guessed.
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|r| r.relayed.is_none()));
+            // public_host set to the relay IP: the session whose
+            // new-event IP matches is relayed, the other is direct.
+            set_setting(&st.pool, "public_host", "203.0.113.1")
+                .await
+                .expect("set public_host");
+            let rows = audit_session_rows(&st.pool, None).await.expect("assemble");
+            let relayed = rows.iter().find(|r| r.conn_id == 7).expect("relayed");
+            assert_eq!(relayed.relayed, Some(true));
+            let direct = rows.iter().find(|r| r.conn_id == 8).expect("direct");
+            assert_eq!(direct.relayed, Some(false));
             let _ = std::fs::remove_file(&path);
         });
     }
