@@ -17,9 +17,9 @@ a{color:#58a6ff}.wrap{max-width:1080px;margin:0 auto;padding:24px 16px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:16px}
 h1{font-size:20px;margin:0 0 16px}h2{font-size:16px;margin:0 0 12px}
 input,select{width:100%;padding:9px 10px;margin:6px 0 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3}
-button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:9px 16px;cursor:pointer;font-size:14px}
+button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:9px 16px;cursor:pointer;font-size:14px;line-height:20px;white-space:nowrap;flex-shrink:0}
 button:hover{background:#2270d4}button.danger{background:#b62324}button.danger:hover{background:#8e1b1c}button.ghost{background:#21262d;border:1px solid #30363d}
-table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:14px}td,th{padding:8px;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}
 .err{color:#f85149;min-height:20px}.ok{color:#3fb950}.muted{color:#8b949e;font-size:13px}
 .center{max-width:380px;margin:12vh auto}
 .row{display:flex;gap:16px;flex-wrap:wrap}.row .card{flex:1;min-width:240px}
@@ -27,10 +27,43 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px;borde
 nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
 nav button{background:#21262d;border:1px solid #30363d}nav button.active{background:#1f6feb;border-color:#1f6feb}
 section{display:none}section.active{display:block}
-.dl{display:flex;gap:8px;align-items:center}.dl input{margin:0;min-width:0}
+.dl{display:flex;gap:8px;align-items:center}.dl input{margin:0;min-width:0;flex:1}
 table.gent{table-layout:fixed}
 td.fname{word-break:break-all;font-size:12px;line-height:1.5}
-td.nowrap{white-space:nowrap}
+td.nowrap{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* v43: responsive tables (modern-web-guidance responsive-table +
+   single-line-overflow guides). Every console table sits in a
+   .table-wrapper: a scroll container, keyboard-focusable via
+   tabindex=0, that is also the container-query scope. Headers stick
+   while scrolling; under 600px the table becomes stacked cards with
+   labels injected from --label-N variables (set per table in JS).
+   Long cells truncate with an ellipsis; the full text stays in the
+   DOM, shows via the title attribute on hover, and on narrow (touch)
+   screens the stacked layout shows it in full — the wrapper's
+   horizontal scroll is the other route to content that does not fit. */
+.table-wrapper{overflow:auto;max-inline-size:100%;max-block-size:min(500px,80vh);container-type:inline-size}
+.table-wrapper table{table-layout:fixed}
+thead{position:sticky;inset-block-start:0;z-index:1}
+thead th{position:sticky;inset-block-start:0;background:#1c2128}
+tbody th{position:sticky;inset-inline-start:0;background:#161b22}
+td.trunc{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.table-wrapper table.kv td{overflow-wrap:anywhere}
+@container (width < 600px){
+.table-wrapper table{min-width:0!important}
+.table-wrapper table,.table-wrapper thead,.table-wrapper tbody,.table-wrapper tr,.table-wrapper th,.table-wrapper td{display:block}
+.table-wrapper thead{display:none}
+.table-wrapper tr{margin-block-end:1.5rem;border:1px solid #30363d}
+.table-wrapper tbody th{position:sticky;inset-block-start:0;z-index:2;background:#1c2128}
+.table-wrapper td.trunc,.table-wrapper td.nowrap{white-space:normal;overflow:visible;text-overflow:clip}
+.table-wrapper td:nth-child(1)::before{content:var(--label-1) ": ";font-weight:600;color:#8b949e}
+.table-wrapper td:nth-child(2)::before{content:var(--label-2) ": ";font-weight:600;color:#8b949e}
+.table-wrapper td:nth-child(3)::before{content:var(--label-3) ": ";font-weight:600;color:#8b949e}
+.table-wrapper td:nth-child(4)::before{content:var(--label-4) ": ";font-weight:600;color:#8b949e}
+.table-wrapper td:nth-child(5)::before{content:var(--label-5) ": ";font-weight:600;color:#8b949e}
+.table-wrapper td:nth-child(6)::before{content:var(--label-6) ": ";font-weight:600;color:#8b949e}
+.table-wrapper td:nth-child(7)::before{content:var(--label-7) ": ";font-weight:600;color:#8b949e}
+.table-wrapper td:nth-child(8)::before{content:var(--label-8) ": ";font-weight:600;color:#8b949e}
+}
 code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:13px}
 .cap{display:flex;gap:8px;align-items:center}.cap img{height:54px;border:1px solid #30363d;border-radius:6px;background:#e8ecf1;display:block}.cap input{margin:0}
 .capbtn{background:transparent;border:0;padding:0;cursor:pointer}.capbtn:hover{background:transparent}
@@ -38,7 +71,7 @@ code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:13px}
 .linkbtn{background:none;border:0;color:#58a6ff;padding:0;font-size:13px;cursor:pointer;text-decoration:underline}.linkbtn:hover{background:none}
 .changelog{white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;font-size:13px;line-height:1.6}
 .langrow{display:flex;gap:6px;justify-content:flex-end;margin-bottom:12px}
-button.langbtn{padding:6px 10px;font-size:13px}button.langbtn.active{background:#1f6feb;border-color:#1f6feb}
+button.langbtn.active{background:#1f6feb;border-color:#1f6feb}
 .badge{display:inline-block;background:#1f6feb33;border:1px solid #1f6feb;color:#58a6ff;border-radius:4px;padding:1px 6px;font-size:12px;margin-left:6px;white-space:nowrap}
 "#;
 
@@ -580,9 +613,9 @@ pub fn console_page() -> String {
 
 const CONSOLE_BODY: &str = r#"
 <div class="wrap">
-<div style="display:flex;justify-content:space-between;align-items:center">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
 <h1 data-i18n="app.title">RustDesk 服务控制台</h1>
-<div><span id="who" class="muted"></span> <button class="langbtn ghost" data-lang="zh">中文</button><button class="langbtn ghost" data-lang="en">English</button> <button class="ghost" id="pwdchg" data-i18n="pwd.title">修改密码</button> <button class="ghost" id="logout" data-i18n="app.logout">退出</button></div>
+<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span id="who" class="muted"></span><button class="langbtn ghost" data-lang="zh">中文</button><button class="langbtn ghost" data-lang="en">English</button><button class="ghost" id="pwdchg" data-i18n="pwd.title">修改密码</button><button class="ghost" id="logout" data-i18n="app.logout">退出</button></div>
 </div>
 <div class="card" id="pwd-card" style="display:none"><h2 data-i18n="pwd.title">修改密码</h2>
 <div class="err" id="pwd-err"></div><div class="ok" id="pwd-ok"></div>
@@ -732,6 +765,20 @@ let ME=null;
 async function api(url,opts={}){const r=await fetch(url,opts);if(r.status===401){location.href='/console/login';throw new Error('unauth');}return r.json();}
 async function copyText(t,btn){let ok=false;try{await navigator.clipboard.writeText(t);ok=true;}catch(e){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy');}catch(_){}ta.remove();}if(btn){const o=btn.textContent;btn.textContent=ok?window.t('app.copied'):window.t('app.copy_failed');setTimeout(()=>btn.textContent=o,1200);}}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// v43: responsive-table wrapper (see the CSS comment above). Returns the
+// opening markup for a table: a keyboard-scrollable region with an
+// accessible name, a fixed-layout table whose column headers are also
+// exposed as --label-N CSS variables for the stacked-card layout, and
+// a thead/tbody structure. Header entries may be '' (no label for that
+// column, e.g. an actions column). Close with TABLE_CLOSE.
+function cssStr(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
+function tableOpen(label,headers,minW,attrs,colgroup){
+  let st='min-width:'+minW+'px';
+  headers.forEach((h,i)=>{if(h)st+=';--label-'+(i+1)+':\''+cssStr(h)+'\'';});
+  const th=headers.map(h=>'<th>'+esc(h)+'</th>').join('');
+  return '<div class="table-wrapper" tabindex="0" role="region" aria-label="'+esc(label)+'"><table'+(attrs?' '+attrs:'')+' style="'+st+'">'+(colgroup||'')+'<thead><tr>'+th+'</tr></thead><tbody>';
+}
+const TABLE_CLOSE='</tbody></table></div>';
 function loadFail(el,fnName,msg){el.innerHTML='<p class="err">'+window.t('app.load_failed')+(msg?(window.t('app.colon')+esc(msg)):'')+window.t('app.period')+'<button class="ghost" onclick="'+fnName+'()">'+window.t('app.retry')+'</button></p>';}
 async function init(){
   applyI18n();
@@ -831,8 +878,8 @@ async function loadDevices(){
   if(!j.ok){ loadFail($('dev-list'),'loadDevices',j.error); return; }
   $('dev-updated').textContent=t('dev.updated')+new Date().toLocaleTimeString();
   if(!j.devices.length){$('dev-list').innerHTML='<p class="muted">'+t('dev.empty')+'</p>';}
-  else{$('dev-list').innerHTML='<table><tr><th>'+t('dev.id')+'</th><th>'+t('dev.status')+'</th><th>'+t('dev.hostname')+'</th><th>'+t('dev.os')+'</th><th>'+t('dev.owner')+'</th><th>'+t('dev.version')+'</th><th>'+t('dev.last_seen')+'</th><th>'+t('dev.last_relay')+'</th></tr>'+
-    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">'+t('dev.online')+'</span>':'<span class="muted">'+t('dev.offline')+'</span>'}</td><td>${esc(d.hostname||'')}</td><td>${esc(d.os||'')}</td><td>${d.username?esc(d.username):'<span class=muted>'+t('dev.unbound')+'</span>'}</td><td>${esc(d.version||'')}</td><td>${new Date(d.last_seen*1000).toLocaleString()}</td><td>${esc(d.last_relay||'-')}</td></tr>`).join('')+'</table>';}
+  else{$('dev-list').innerHTML=tableOpen(t('dev.title'),[t('dev.id'),t('dev.status'),t('dev.hostname'),t('dev.os'),t('dev.owner'),t('dev.version'),t('dev.last_seen'),t('dev.last_relay')],820,'','<colgroup><col style="width:10%"><col style="width:8%"><col style="width:18%"><col style="width:13%"><col style="width:9%"><col style="width:7%"><col style="width:18%"><col style="width:17%"></colgroup>')+
+    j.devices.map(d=>`<tr><td>${esc(d.device_id)}</td><td>${(j.now-d.last_seen)<300?'<span class="ok">'+t('dev.online')+'</span>':'<span class="muted">'+t('dev.offline')+'</span>'}</td><td class="trunc" title="${esc(d.hostname||'')}">${esc(d.hostname||'')}</td><td class="trunc" title="${esc(d.os||'')}">${esc(d.os||'')}</td><td class="trunc" title="${esc(d.username||t('dev.unbound'))}">${d.username?esc(d.username):'<span class=muted>'+t('dev.unbound')+'</span>'}</td><td>${esc(d.version||'')}</td><td class="trunc" title="${esc(new Date(d.last_seen*1000).toLocaleString())}">${new Date(d.last_seen*1000).toLocaleString()}</td><td class="trunc" title="${esc(d.last_relay||'-')}">${esc(d.last_relay||'-')}</td></tr>`).join('')+TABLE_CLOSE;}
   renderRelays(j.relays||[]);
   if(ME&&ME.is_admin)loadRelayLinks();
 }
@@ -856,13 +903,13 @@ async function loadAudit(page){
   let j; try{ j=await api('/api/audit/sessions?q='+encodeURIComponent(q)+'&days='+encodeURIComponent(days)+'&page='+AUDIT_PAGE+'&per_page=20'); }catch(e){ if(e.message!=='unauth')loadFail($('aud-list'),'loadAudit'); return; }
   if(!j.ok){ loadFail($('aud-list'),'loadAudit',j.error); return; }
   if(!j.sessions.length){$('aud-list').innerHTML='<p class="muted">'+t('aud.empty')+'</p>';}
-  else{$('aud-list').innerHTML='<table><tr><th>'+t('aud.col_started')+'</th><th>'+t('aud.col_controller')+'</th><th>'+t('aud.col_controlled')+'</th><th>'+t('aud.col_ip')+'</th><th>'+t('aud.col_relay')+'</th><th>'+t('aud.col_duration')+'</th><th>'+t('aud.col_status')+'</th></tr>'+
+  else{$('aud-list').innerHTML=tableOpen(t('aud.title'),[t('aud.col_started'),t('aud.col_controller'),t('aud.col_controlled'),t('aud.col_ip'),t('aud.col_relay'),t('aud.col_duration'),t('aud.col_status')],780,'','<colgroup><col style="width:18%"><col style="width:19%"><col style="width:19%"><col style="width:13%"><col style="width:9%"><col style="width:9%"><col style="width:13%"></colgroup>')+
     j.sessions.map(s=>{
       const open=s.ended_at==null;
       const dur=open?fmtDur(Date.now()/1000-s.started_at):fmtDur(s.duration_sec);
       const relay=s.relayed===true?t('aud.relayed'):s.relayed===false?t('aud.direct'):t('aud.unknown');
-      return `<tr><td class="nowrap">${new Date(s.started_at*1000).toLocaleString()}</td><td>${whoCell(s.controller_id,s.controller_name,s.controller_username)}</td><td>${whoCell(s.device_id,s.controlled_hostname,s.controlled_username)}</td><td>${esc(s.controller_ip||'-')}</td><td>${relay}</td><td class="nowrap">${dur}</td><td>${open?'<span class="ok">'+t('aud.open')+'</span>':'<span class="muted">'+t('aud.closed')+'</span>'}</td></tr>`;
-    }).join('')+'</table>';}
+      return `<tr><td class="trunc" title="${esc(new Date(s.started_at*1000).toLocaleString())}">${new Date(s.started_at*1000).toLocaleString()}</td><td>${whoCell(s.controller_id,s.controller_name,s.controller_username)}</td><td>${whoCell(s.device_id,s.controlled_hostname,s.controlled_username)}</td><td class="trunc" title="${esc(s.controller_ip||'-')}">${esc(s.controller_ip||'-')}</td><td>${relay}</td><td class="nowrap">${dur}</td><td>${open?'<span class="ok">'+t('aud.open')+'</span>':'<span class="muted">'+t('aud.closed')+'</span>'}</td></tr>`;
+    }).join('')+TABLE_CLOSE;}
   const pages=Math.max(1,Math.ceil(j.total/j.per_page));
   $('aud-pager').innerHTML='<button class="ghost" id="aud-prev"'+(AUDIT_PAGE<=1?' disabled':'')+'>'+t('aud.prev')+'</button> <span class="muted">'+t('aud.page').replace('{p}',AUDIT_PAGE).replace('{n}',pages).replace('{t}',j.total)+'</span> <button class="ghost" id="aud-next"'+(AUDIT_PAGE>=pages?' disabled':'')+'>'+t('aud.next')+'</button>';
   $('aud-prev').onclick=()=>loadAudit(AUDIT_PAGE-1);
@@ -878,16 +925,16 @@ function renderRelays(relays){
   RELAYS=relays;
   const el=$('relay-list'); if(!el)return;
   if(!relays.length){el.innerHTML='<p class="muted">'+t('relay.empty')+'</p>';return;}
-  el.innerHTML='<table><tr><th>'+t('relay.node')+'</th><th>'+t('relay.status')+'</th><th>'+t('relay.address')+'</th><th>'+t('relay.port')+'</th><th>'+t('relay.sessions')+'</th><th>'+t('relay.throughput')+'</th><th>'+t('relay.last_hb')+'</th></tr>'+
-    relays.map(r=>`<tr><td><a href="javascript:void(0)" onclick="showRelay(${r.id})">${esc(r.name)}</a><span class="badge">${t('relay.badge')}</span></td><td>${r.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>'}</td><td>${esc(r.address||r.last_ip||'')}</td><td>${r.listen_port||'-'}</td><td>${r.sessions}</td><td>${r.total_kbps} kb/s</td><td>${r.last_heartbeat?new Date(r.last_heartbeat*1000).toLocaleString():t('relay.never')}</td></tr>`).join('')+'</table>';
+  el.innerHTML=tableOpen(t('relay.title'),[t('relay.node'),t('relay.status'),t('relay.address'),t('relay.port'),t('relay.sessions'),t('relay.throughput'),t('relay.last_hb')],760,'','<colgroup><col style="width:17%"><col style="width:10%"><col style="width:22%"><col style="width:9%"><col style="width:10%"><col style="width:13%"><col style="width:19%"></colgroup>')+
+    relays.map(r=>`<tr><td><a href="javascript:void(0)" onclick="showRelay(${r.id})">${esc(r.name)}</a><span class="badge">${t('relay.badge')}</span></td><td>${r.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>'}</td><td class="trunc" title="${esc(r.address||r.last_ip||'')}">${esc(r.address||r.last_ip||'')}</td><td>${r.listen_port||'-'}</td><td>${r.sessions}</td><td>${r.total_kbps} kb/s</td><td class="trunc" title="${r.last_heartbeat?esc(new Date(r.last_heartbeat*1000).toLocaleString()):t('relay.never')}">${r.last_heartbeat?new Date(r.last_heartbeat*1000).toLocaleString():t('relay.never')}</td></tr>`).join('')+TABLE_CLOSE;
 }
 async function loadRelayLinks(){
   let j; try{ j=await api('/api/admin/relays/reg-tokens'); }catch(e){ if(e.message!=='unauth')$('relay-links').innerHTML='<p class="err">'+t('relay.load_fail')+'</p>'; return; }
   if(!j.ok){ $('relay-links').innerHTML='<p class="err">'+esc(j.error||t('relay.load_fail'))+'</p>'; return; }
   const open=j.tokens.filter(x=>!x.used_at);
   if(!open.length){$('relay-links').innerHTML='<p class="muted">'+t('relay.links_empty')+'</p>';return;}
-  $('relay-links').innerHTML='<table><tr><th>'+t('relay.label')+'</th><th>'+t('relay.links_created')+'</th><th>'+t('relay.links_expires')+'</th><th></th></tr>'+
-    open.map(x=>`<tr><td>${esc(x.label||x.token_id.slice(0,8))}</td><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${new Date(x.expires_at*1000).toLocaleString()}</td><td><button class="danger" onclick="relayRevokeLink('${esc(x.token_id)}')">${t('relay.links_revoke')}</button></td></tr>`).join('')+'</table>';
+  $('relay-links').innerHTML=tableOpen(t('relay.links_title'),[t('relay.label'),t('relay.links_created'),t('relay.links_expires'),''],560,'','<colgroup><col style="width:30%"><col style="width:25%"><col style="width:25%"><col style="width:20%"></colgroup>')+
+    open.map(x=>`<tr><td class="trunc" title="${esc(x.label||x.token_id.slice(0,8))}">${esc(x.label||x.token_id.slice(0,8))}</td><td class="trunc" title="${esc(new Date(x.created_at*1000).toLocaleString())}">${new Date(x.created_at*1000).toLocaleString()}</td><td class="trunc" title="${esc(new Date(x.expires_at*1000).toLocaleString())}">${new Date(x.expires_at*1000).toLocaleString()}</td><td><button class="danger" onclick="relayRevokeLink('${esc(x.token_id)}')">${t('relay.links_revoke')}</button></td></tr>`).join('')+TABLE_CLOSE;
 }
 async function relayRevokeLink(tokenId){
   if(!confirm(t('relay.links_revoke_confirm')))return;
@@ -923,7 +970,8 @@ async function showRelay(id){
   const lim=v=>(v==null?'':v);
   $('relay-detail').innerHTML='<p><button class="ghost" onclick="backRelay()">'+t('relay.detail_back')+'</button></p>'+
     '<h2>'+esc(n.name)+'<span class="badge">'+t('relay.badge')+'</span></h2>'+
-    '<table><tr><th>'+t('relay.status')+'</th><td>'+(n.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>')+'</td></tr>'+
+    '<div class="table-wrapper" tabindex="0" role="region" aria-label="'+esc(n.name||t('relay.title'))+'"><table class="kv" style="min-width:360px"><colgroup><col style="width:30%"><col style="width:70%"></colgroup><tbody>'+
+    '<tr><th>'+t('relay.status')+'</th><td>'+(n.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>')+'</td></tr>'+
     '<tr><th>'+t('relay.address')+'</th><td>'+esc(n.address||t('relay.unknown_time'))+'</td></tr>'+
     '<tr><th>'+t('relay.last_ip')+'</th><td>'+esc(n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
     '<tr><th>'+t('relay.agent_ver')+'</th><td>'+esc(n.agent_version||t('relay.unknown_time'))+'</td></tr>'+
@@ -935,7 +983,7 @@ async function showRelay(id){
     '<tr><th>'+t('relay.throughput')+'</th><td>'+n.total_kbps+' kb/s</td></tr>'+
     '<tr><th>'+t('relay.key_done')+'</th><td>'+(n.key_delivered?'<span class="ok">'+t('relay.key_done')+'</span>':'<span class="muted">'+t('relay.key_pending')+'</span>')+'</td></tr>'+
     '<tr><th>'+t('relay.cfg_ver')+'</th><td>'+n.applied_version+' / '+n.config_version+'</td></tr>'+
-    '<tr><th>'+t('relay.pending_cmd')+'</th><td>'+esc(n.pending_command||'-')+'</td></tr></table>'+
+    '<tr><th>'+t('relay.pending_cmd')+'</th><td>'+esc(n.pending_command||'-')+'</td></tr></tbody></table></div>'+
     '<h2 style="margin-top:20px">'+t('relay.cfg_title')+'</h2>'+
     '<p class="muted">'+t('relay.port_change_note')+'</p><div class="err" id="relay-cfg-err"></div><div class="ok" id="relay-cfg-ok"></div>'+
     '<label>'+t('relay.port')+'</label><input id="rcfg-port" type="number" value="'+(cfg.port||21117)+'">'+
@@ -974,12 +1022,12 @@ async function loadUsers(){
   let j; try{ j=await api('/api/admin/users'); }catch(e){ if(e.message!=='unauth')loadFail($('user-list'),'loadUsers'); return; }
   if(!j.ok){ loadFail($('user-list'),'loadUsers',j.error); return; }
   USERS=j.users;
-  $('user-list').innerHTML='<table><tr><th>'+t('usr.username')+'</th><th>'+t('usr.role')+'</th><th>'+t('usr.status')+'</th><th>'+t('usr.created')+'</th><th>'+t('usr.actions')+'</th></tr>'+
-    j.users.map((u,i)=>`<tr><td>${esc(u.username)}</td><td>${u.is_admin?t('usr.admin'):t('usr.regular')}</td><td>${u.disabled?t('usr.disabled'):t('usr.active')}</td><td>${new Date(u.created_at*1000).toLocaleString()}</td>
+  $('user-list').innerHTML=tableOpen(t('usr.title'),[t('usr.username'),t('usr.role'),t('usr.status'),t('usr.created'),t('usr.actions')],720,'','<colgroup><col style="width:18%"><col style="width:10%"><col style="width:10%"><col style="width:20%"><col style="width:42%"></colgroup>')+
+    j.users.map((u,i)=>`<tr><td class="trunc" title="${esc(u.username)}">${esc(u.username)}</td><td>${u.is_admin?t('usr.admin'):t('usr.regular')}</td><td>${u.disabled?t('usr.disabled'):t('usr.active')}</td><td class="trunc" title="${esc(new Date(u.created_at*1000).toLocaleString())}">${new Date(u.created_at*1000).toLocaleString()}</td>
     <td><button class="ghost" onclick="uact(USERS[${i}].username,'${u.disabled?'enable':'disable'}')">${u.disabled?t('usr.enable'):t('usr.disable')}</button>
     <button class="ghost" onclick="uact(USERS[${i}].username,'${u.is_admin?'unadmin':'admin'}')">${u.is_admin?t('usr.unadmin'):t('usr.make_admin')}</button>
     <button class="ghost" onclick="upwd(USERS[${i}].username)">${t('usr.reset_pwd')}</button>
-    <button class="danger" onclick="uact(USERS[${i}].username,'delete')">${t('app.delete')}</button></td></tr>`).join('')+'</table>';
+    <button class="danger" onclick="uact(USERS[${i}].username,'delete')">${t('app.delete')}</button></td></tr>`).join('')+TABLE_CLOSE;
 }
 async function uact(name,act){
   if(act==='delete'&&!confirm(t('usr.delete_confirm').replace('{n}',name)))return;
@@ -1015,8 +1063,8 @@ async function loadTokens(){
   let j; try{ j=await api('/api/tokens'); }catch(e){ if(e.message!=='unauth')loadFail($('tok-list'),'loadTokens'); return; }
   if(!j.ok){ loadFail($('tok-list'),'loadTokens',j.error); return; }
   TOKENS=j.tokens;
-  $('tok-list').innerHTML=j.tokens.length?'<table><tr><th>'+t('tok.name')+'</th><th>'+t('tok.created')+'</th><th>'+t('tok.last_used')+'</th><th></th></tr>'+
-    j.tokens.map((t,i)=>`<tr><td>${esc(t.name)}</td><td>${new Date(t.created_at*1000).toLocaleString()}</td><td>${t.last_used_at?new Date(t.last_used_at*1000).toLocaleString():'-'}</td><td><button class="danger" onclick="tdel(${i})">${window.t('tok.revoke')}</button></td></tr>`).join('')+'</table>':'<p class="muted">'+t('tok.empty')+'</p>';
+  $('tok-list').innerHTML=j.tokens.length?tableOpen(t('tok.title'),[t('tok.name'),t('tok.created'),t('tok.last_used'),''],560,'','<colgroup><col style="width:30%"><col style="width:25%"><col style="width:25%"><col style="width:20%"></colgroup>')+
+    j.tokens.map((t,i)=>`<tr><td class="trunc" title="${esc(t.name)}">${esc(t.name)}</td><td class="trunc" title="${esc(new Date(t.created_at*1000).toLocaleString())}">${new Date(t.created_at*1000).toLocaleString()}</td><td class="trunc" title="${t.last_used_at?esc(new Date(t.last_used_at*1000).toLocaleString()):'-'}">${t.last_used_at?new Date(t.last_used_at*1000).toLocaleString():'-'}</td><td><button class="danger" onclick="tdel(${i})">${window.t('tok.revoke')}</button></td></tr>`).join('')+TABLE_CLOSE:'<p class="muted">'+t('tok.empty')+'</p>';
 }
 $('tok-create').onclick=async()=>{
   const btn=$('tok-create'); if(btn.disabled)return; btn.disabled=true;
@@ -1036,10 +1084,10 @@ async function loadGen(){
   let j; try{ j=await api('/api/admin/gen-clients'); }catch(e){ if(e.message!=='unauth')loadFail($('gen-list'),'loadGen'); return; }
   if(!j.ok){ loadFail($('gen-list'),'loadGen',j.error); return; }
   GEN=j.clients;
-  $('gen-list').innerHTML=j.clients.length?'<table class="gent"><colgroup><col style="width:24%"><col style="width:9%"><col style="width:10%"><col style="width:12%"><col style="width:37%"><col style="width:8%"></colgroup><tr><th>'+t('gen.file')+'</th><th>'+t('gen.remark')+'</th><th>'+t('gen.by')+'</th><th>'+t('gen.time')+'</th><th>'+t('gen.link')+'</th><th></th></tr>'+
-    j.clients.map((c,i)=>`<tr><td class="fname">${esc(c.filename)}</td><td>${esc(c.label||'')}</td><td>${esc(c.created_by||'')}</td><td class="nowrap">${new Date(c.created_at*1000).toLocaleString()}</td>
+  $('gen-list').innerHTML=j.clients.length?tableOpen(t('gen.title'),[t('gen.file'),t('gen.remark'),t('gen.by'),t('gen.time'),t('gen.link'),''],760,'class="gent"','<colgroup><col style="width:21%"><col style="width:9%"><col style="width:9%"><col style="width:17%"><col style="width:28%"><col style="width:16%"></colgroup>')+
+    j.clients.map((c,i)=>`<tr><td class="fname">${esc(c.filename)}</td><td class="trunc" title="${esc(c.label||'')}">${esc(c.label||'')}</td><td class="trunc" title="${esc(c.created_by||'')}">${esc(c.created_by||'')}</td><td class="trunc" title="${esc(new Date(c.created_at*1000).toLocaleString())}">${new Date(c.created_at*1000).toLocaleString()}</td>
     <td><div class="dl"><input readonly value="${esc(c.download_url)}"><button class="ghost" onclick="copyText(this.closest('.dl').querySelector('input').value,this)">${t('app.copy')}</button><button class="ghost" onclick="window.open(this.closest('.dl').querySelector('input').value,'_blank')">${t('app.download')}</button></div></td>
-    <td class="nowrap"><button class="danger" onclick="gdel(${i})">${t('app.delete')}</button></td></tr>`).join('')+'</table>':'<p class="muted">'+(ME.is_admin?t('gen.empty_admin'):t('gen.empty_user'))+'</p>';
+    <td class="nowrap"><button class="danger" onclick="gdel(${i})">${t('app.delete')}</button></td></tr>`).join('')+TABLE_CLOSE:'<p class="muted">'+(ME.is_admin?t('gen.empty_admin'):t('gen.empty_user'))+'</p>';
 }
 async function loadCfg(){
   let j; try{ j=await api('/api/client-config'); }catch(e){ if(e.message!=='unauth')loadFail($('cfg-body'),'loadCfg'); return; }
@@ -1061,7 +1109,7 @@ function renderDl(){
     else if(DL_MIRROR&&p.mirrors&&p.mirrors.length){href=p.mirrors[0];label=t('dl.mirror_link');}
     return '<tr><td>'+esc(p.name)+'</td><td class="fname">'+esc(p.file||'App Store')+'</td><td class="nowrap"><a href="'+esc(href)+'" target="_blank" rel="noopener">'+label+'</a></td></tr>';
   };
-  $('dl-body').innerHTML='<p class="muted">'+t('dl.latest')+esc(j.version)+'</p><table><tr><th>'+t('dl.platform')+'</th><th>'+t('dl.file')+'</th><th>'+t('dl.download')+'</th></tr>'+j.platforms.map(row).join('')+'</table>';
+  $('dl-body').innerHTML='<p class="muted">'+t('dl.latest')+esc(j.version)+'</p>'+tableOpen(t('dl.title'),[t('dl.platform'),t('dl.file'),t('dl.download')],520,'','<colgroup><col style="width:20%"><col style="width:55%"><col style="width:25%"></colgroup>')+j.platforms.map(row).join('')+TABLE_CLOSE;
 }
 async function loadDl(){
   let j; try{ j=await api('/api/client-downloads'); }catch(e){ if(e.message!=='unauth')loadFail($('dl-body'),'loadDl'); return; }
