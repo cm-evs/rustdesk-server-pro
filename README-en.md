@@ -53,6 +53,7 @@ A self-hosted remote desktop server based on the official open-source [rustdesk-
 - **v40.1 (preview)**: address book auto-adds bound devices ("登录设备" group; field parity with sctgdesk verified)
 - **v41**: self-service password change (regular users change their own password in the console, old password verified; other devices are signed out after the change)
 - **v42**: console UX fixes (Cancel button on the change-password panel, user list as the main view of user management) + template version check (skips re-downloading when the local template is already the latest version)
+- **v43**: audit session reaping (sessions with a lost close record end by heartbeat, sessions on devices offline over 24 hours end as offline) + relay inference (public_host joins the relay IP set) + console tables rebuilt per the responsive-table guide (scroll container, sticky headers, stacked cards on narrow screens)
 
 ## Quick start
 
