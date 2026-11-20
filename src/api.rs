@@ -23,7 +23,7 @@ use axum::{
     extract::{ConnectInfo, Extension, Form, Path, Query},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
     Router,
 };
 use hbb_common::{anyhow, log, tokio, ResultType};
