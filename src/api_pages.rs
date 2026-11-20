@@ -40,13 +40,21 @@ td.nowrap{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
    Long cells truncate with an ellipsis; the full text stays in the
    DOM, shows via the title attribute on hover, and on narrow (touch)
    screens the stacked layout shows it in full — the wrapper's
-   horizontal scroll is the other route to content that does not fit. */
+   horizontal scroll is the other route to content that does not fit.
+   v44: a truncated cell also expands in place on click/tap (or
+   Enter/Space when focused), wrapping within its fixed column. */
 .table-wrapper{overflow:auto;max-inline-size:100%;max-block-size:min(500px,80vh);container-type:inline-size}
 .table-wrapper table{table-layout:fixed}
 thead{position:sticky;inset-block-start:0;z-index:1}
 thead th{position:sticky;inset-block-start:0;background:#1c2128}
 tbody th{position:sticky;inset-inline-start:0;background:#161b22}
 td.trunc{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* v44: click/tap a truncated cell to expand it in place. The table
+   layout is fixed, so the column width does not move; the text only
+   wraps within its own column and the row grows taller. */
+td.trunc.expanded{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere}
+td.trunc[tabindex]{cursor:pointer}
+td.trunc:focus-visible{outline:2px solid #1f6feb;outline-offset:-2px}
 .table-wrapper table.kv td{overflow-wrap:anywhere}
 @container (width < 600px){
 .table-wrapper table{min-width:0!important}
@@ -779,6 +787,46 @@ function tableOpen(label,headers,minW,attrs,colgroup){
   return '<div class="table-wrapper" tabindex="0" role="region" aria-label="'+esc(label)+'"><table'+(attrs?' '+attrs:'')+' style="'+st+'">'+(colgroup||'')+'<thead><tr>'+th+'</tr></thead><tbody>';
 }
 const TABLE_CLOSE='</tbody></table></div>';
+// v44: click a truncated table cell to expand the full text in place,
+// click again to collapse (single-line-overflow guide: do not rely on
+// title alone, it is unreachable from the keyboard and on touch, so
+// the click is the other route to the full text). Only cells that are
+// actually truncated become interactive; tables re-render on every
+// load, so a MutationObserver re-marks cells after each render and
+// after section switches, and resize re-marks them too.
+function toggleTrunc(td){
+  const on=td.classList.toggle('expanded');
+  td.setAttribute('aria-expanded',on?'true':'false');
+}
+function markTrunc(){
+  document.querySelectorAll('td.trunc').forEach(td=>{
+    if(td.classList.contains('expanded')){td.setAttribute('tabindex','0');td.setAttribute('aria-expanded','true');return;}
+    if(td.scrollWidth>td.clientWidth+1){td.setAttribute('tabindex','0');td.setAttribute('aria-expanded','false');}
+    else{td.removeAttribute('tabindex');td.removeAttribute('aria-expanded');}
+  });
+}
+let truncTimer=null;
+function scheduleMarkTrunc(){
+  if(truncTimer)return;
+  truncTimer=setTimeout(()=>{truncTimer=null;markTrunc();},50);
+}
+document.addEventListener('click',e=>{
+  if(e.target.closest&&e.target.closest('button,a,input,select,textarea'))return;
+  const td=e.target.closest?e.target.closest('td.trunc'):null;
+  if(!td)return;
+  if(!td.classList.contains('expanded')&&td.scrollWidth<=td.clientWidth+1)return;
+  toggleTrunc(td);
+});
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Enter'&&e.key!==' ')return;
+  const td=e.target;
+  if(!td||td.tagName!=='TD'||!td.classList.contains('trunc'))return;
+  if(!td.hasAttribute('tabindex'))return;
+  e.preventDefault();
+  toggleTrunc(td);
+});
+new MutationObserver(scheduleMarkTrunc).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['class']});
+window.addEventListener('resize',scheduleMarkTrunc);
 function loadFail(el,fnName,msg){el.innerHTML='<p class="err">'+window.t('app.load_failed')+(msg?(window.t('app.colon')+esc(msg)):'')+window.t('app.period')+'<button class="ghost" onclick="'+fnName+'()">'+window.t('app.retry')+'</button></p>';}
 async function init(){
   applyI18n();
