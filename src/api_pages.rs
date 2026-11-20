@@ -135,7 +135,7 @@ const I18N={zh:{
 'tok.last_used':'最近使用','tok.revoke':'吊销','tok.empty':'暂无 Token',
 'tok.new_label':'新 Token（只显示一次，请保存）：',
 'tok.revoke_confirm':'吊销 Token「{n}」？使用该 Token 的程序将立即无法访问，吊销不可恢复。',
-'tok.revoke_failed':'吊销失败',
+'tok.revoke_failed':'吊销失败','tok.save_name':'保存名称',
 'gen.title':'生成预绑定客户端',
 'gen.desc':'生成的安装包已内置本服务器地址与密钥（编码进文件名，界面不显示服务器与密钥设置）。把下载链接发给用户即可，用户安装后直接登录账号使用。',
 'gen.label':'备注（可选）','gen.label_ph':'如：公司办公电脑','gen.btn':'生成 Windows 客户端',
@@ -292,7 +292,7 @@ const I18N={zh:{
 'tok.created':'Created','tok.last_used':'Last used','tok.revoke':'Revoke','tok.empty':'No tokens yet',
 'tok.new_label':'New token (shown only once, please save it):',
 'tok.revoke_confirm':'Revoke token “{n}”? Applications using it will immediately lose access. This cannot be undone.',
-'tok.revoke_failed':'Failed to revoke',
+'tok.revoke_failed':'Failed to revoke','tok.save_name':'Save name',
 'gen.title':'Generate Pre-configured Client',
 'gen.desc':'The generated installer has this server address and key built in (encoded in the file name; the server and key settings are hidden in the client UI). Share the download link with users; they can sign in with their account right after installing.',
 'gen.label':'Remark (optional)','gen.label_ph':'e.g. office PC','gen.btn':'Generate Windows Client',
@@ -1118,8 +1118,9 @@ async function loadTokens(){
 $('tok-create').onclick=async()=>{
   const btn=$('tok-create'); if(btn.disabled)return; btn.disabled=true;
   try{
-    const j=await api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('tok-name').value})});
-    if(j.ok){$('tok-err').textContent='';$('tok-new').innerHTML=t('tok.new_label')+'<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">'+t('app.copy')+'</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||t('app.failed');}
+    const nm=$('tok-name').value;
+    const j=await api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})});
+    if(j.ok){$('tok-err').textContent='';$('tok-name').value='';$('tok-new').innerHTML=t('tok.new_label')+'<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">'+t('app.copy')+'</button></div><div class="dl" style="margin-top:6px"><input id="tok-new-name" value="'+esc(nm||'default')+'"><button class="ghost" onclick="tren('+j.id+')">'+t('tok.save_name')+'</button><button class="ghost" onclick="document.getElementById(\'tok-new\').innerHTML=\'\'">'+t('app.cancel')+'</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||t('app.failed');}
   }catch(e){ if(e.message!=='unauth')$('tok-err').textContent=t('app.network_err'); }
   btn.disabled=false;
 };
@@ -1127,6 +1128,10 @@ async function tdel(i){
   const t=TOKENS[i]; if(!t)return;
   if(!confirm(window.t('tok.revoke_confirm').replace('{n}',t.name)))return;
   const j=await api('/api/tokens/'+t.id,{method:'DELETE'}); if(j.ok)loadTokens(); else alert(j.error||window.t('tok.revoke_failed'));
+}
+async function tren(id){
+  const j=await api('/api/tokens/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('tok-new-name').value})});
+  if(j.ok)loadTokens(); else $('tok-err').textContent=j.error||t('app.failed');
 }
 let GEN=[];
 async function loadGen(){

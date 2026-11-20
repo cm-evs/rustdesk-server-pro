@@ -23,7 +23,7 @@ use axum::{
     extract::{ConnectInfo, Extension, Form, Path, Query},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use hbb_common::{anyhow, log, tokio, ResultType};
@@ -2871,7 +2871,36 @@ async fn tokens_create(
     .execute(&st.pool)
     .await
     {
-        Ok(_) => jresp(StatusCode::OK, json!({ "ok": true, "token": token })),
+        Ok(res) => jresp(
+            StatusCode::OK,
+            json!({ "ok": true, "token": token, "id": res.last_insert_rowid() }),
+        ),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn tokens_rename(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: String,
+) -> Response {
+    let u = match resolve_user(&st, &headers).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    let v = parse_body(&body);
+    let name = sfield(&v, "name");
+    let name = if name.is_empty() { "default" } else { &name };
+    match sqlx::query("update api_tokens set name=? where id=? and username=?")
+        .bind(name)
+        .bind(id)
+        .bind(&u.username)
+        .execute(&st.pool)
+        .await
+    {
+        Ok(res) if res.rows_affected() > 0 => jresp(StatusCode::OK, json!({ "ok": true })),
+        Ok(_) => err_resp(StatusCode::NOT_FOUND, "Token 不存在"),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -5779,7 +5808,7 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/devices", get(devices_list))
             .route("/api/audit/sessions", get(audit_sessions))
             .route("/api/tokens", get(tokens_list).post(tokens_create))
-            .route("/api/tokens/:id", delete(tokens_delete))
+            .route("/api/tokens/:id", delete(tokens_delete).patch(tokens_rename))
             .route("/api/admin/settings", get(settings_get).post(settings_post))
             .route("/api/admin/template/download", post(template_download))
             .route("/api/admin/template/status", get(template_status))
@@ -8183,6 +8212,120 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::OK);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    // ---- v44: token rename ----
+
+    async fn v44_call_create(
+        st: &Arc<ApiState>,
+        headers: HeaderMap,
+        body: &str,
+    ) -> (StatusCode, Value) {
+        let resp = tokens_create(Extension(st.clone()), headers, body.to_string()).await;
+        let status = resp.status();
+        let bytes = hyper::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    async fn v44_call_rename(
+        st: &Arc<ApiState>,
+        headers: HeaderMap,
+        id: i64,
+        body: &str,
+    ) -> (StatusCode, Value) {
+        let resp = tokens_rename(Extension(st.clone()), headers, Path(id), body.to_string()).await;
+        let status = resp.status();
+        let bytes = hyper::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    async fn v44_token_name(pool: &SqlitePool, id: i64) -> String {
+        sqlx::query("select name from api_tokens where id=?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .ok()
+            .and_then(|r| r.try_get::<String, _>("name").ok())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn token_create_returns_id_and_rename_updates_name() {
+        v39_block(async {
+            let (st, path) = v39_test_state("tok-rename").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            let sid = new_web_session(&st, "admin").await.expect("admin session");
+            let headers = v39_sid_headers(&sid);
+            let (status, v) = v44_call_create(&st, headers.clone(), "{\"name\":\"ci\"}").await;
+            assert_eq!(status, StatusCode::OK);
+            let id = v["id"].as_i64().unwrap_or(0);
+            assert!(id > 0);
+            let (status, _) =
+                v44_call_rename(&st, headers.clone(), id, "{\"name\":\"renamed\"}").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v44_token_name(&st.pool, id).await, "renamed");
+            // Empty name falls back to "default", same as create.
+            let (status, _) = v44_call_rename(&st, headers, id, "{\"name\":\"\"}").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v44_token_name(&st.pool, id).await, "default");
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn token_rename_owner_only_and_not_found() {
+        v39_block(async {
+            let (st, path) = v39_test_state("tok-rename-own").await;
+            create_user(&st.pool, "admin", "admin123")
+                .await
+                .expect("create admin");
+            create_user(&st.pool, "alice", "alice123")
+                .await
+                .expect("create alice");
+            let admin_sid = new_web_session(&st, "admin").await.expect("admin session");
+            let alice_sid = new_web_session(&st, "alice").await.expect("alice session");
+            let (_, v) = v44_call_create(
+                &st,
+                v39_sid_headers(&admin_sid),
+                "{\"name\":\"admins\"}",
+            )
+            .await;
+            let id = v["id"].as_i64().unwrap_or(0);
+            assert!(id > 0);
+            // Another user's token: 404, name untouched.
+            let (status, _) = v44_call_rename(
+                &st,
+                v39_sid_headers(&alice_sid),
+                id,
+                "{\"name\":\"stolen\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(v44_token_name(&st.pool, id).await, "admins");
+            // Nonexistent id: 404.
+            let (status, _) = v44_call_rename(
+                &st,
+                v39_sid_headers(&admin_sid),
+                id + 1000,
+                "{\"name\":\"ghost\"}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            // No session: 401.
+            let (status, _) =
+                v44_call_rename(&st, HeaderMap::new(), id, "{\"name\":\"anon\"}").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(v44_token_name(&st.pool, id).await, "admins");
             let _ = std::fs::remove_file(&path);
         });
     }
