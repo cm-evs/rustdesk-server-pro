@@ -1233,7 +1233,7 @@ $('upd-check').onclick=async()=>{
       startUpdDownload(UPD.latest);
     };
   }catch(e){ if(e.message!=='unauth')$('upd-err').textContent=t('set.upd_check_netfail'); }
-  btn.disabled=false;
+  finally{ btn.disabled=false; }
 };
 async function startUpdDownload(version){
   const j=await api('/api/admin/update/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version})});
