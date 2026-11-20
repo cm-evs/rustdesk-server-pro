@@ -513,6 +513,17 @@ cd rustdesk-server-pro-linux-*
 - 验证：cargo test 121/121（debug 与 release 各两遍；lib 106 + hbbr 14 + 集成 1）；模板端到端 40/40（debug 与 release 各两遍）；控制台界面端到端：用户管理界面 34/34、改密码界面 37/37、模板版本检测界面 18/18（debug 与 release 各两遍）；审计回收端到端 26/26（debug 与 release 各两遍）；控制台布局 294/294（1280px 96 + 800px 89 + 480px 102，debug 与 release 各两遍）；全量回归 88 次运行全绿（控制台 28/28 ×2、模板 40/40 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 34/34 ×2、审计 45/45 ×2、审计界面 41/41 ×2、地址簿 27/27 ×2、自助改密码 40/40 ×2、自助改密码界面 37/37 ×2、审计回收 26/26 ×2、控制台布局 294/294 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs 与 src/api_pages.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动。
 - 真机确认项：审计日志里一条丢了关闭记录的会话在设备下次心跳后变成「已结束（无关闭记录）」；离线超过 24 小时的设备会话显示「已结束（设备离线）」；走 VPS 中继的会话在「中继」列显示中继而不是「—」；手机窄屏上控制台表格呈卡片式，按钮横排。
 
+## v44：检测更新按钮修复 + API Token 创建后改名 + 表格截断格点展
+
+- 背景（2026-11-19，真机反馈）：(1) 设置页点检测更新，显示「已是最新版本」后按钮一直灰到刷新。(2) API Token 创建后横幅没有关闭入口，建好的 token 改不了名，名称框里填的名字只进下一次创建。(3) 设备列表系统列截断后全文只能悬停看，触屏/键盘够不着。
+- 修复：检测更新按钮。`$('upd-check').onclick` 的 `!j.ok` 与 `!j.has_update` 提前 return 跳过了 `btn.disabled=false`；改为 `finally` 里恢复按钮，所有退出路径（无更新、失败、网络异常）都恢复可用。
+- 新增：Token 改名。`tokens_create` 返回新 token 的 id；新增 `PATCH /api/tokens/:id`，仅限属主改名（`where id=? and username=?`，别人的 token 返回 404）；空名称按创建逻辑记为 "default"。`#tok-new` 横幅加名称输入框（预填创建时用的名）+ 保存名称按钮 + 关闭按钮；创建成功后名称输入框清空。
+- 新增：表格截断格点展。点被截断的格子展开全文（本列内折行，列宽不动），再点收起；真正被截断的格子才可交互（`scrollWidth > clientWidth` 判定，加 `tabindex="0"` + `aria-expanded`），鼠标、键盘（Enter/Space）、触屏都可用；`title` 属性保留。按 modern-web-guidance single-line-overflow 指南做（"DO NOT rely on `title` alone: it is unreachable from the keyboard and on touch."）。
+- 文案：中英文切换覆盖全部新文案（1 个新键：tok.save_name，字典 337/337 对齐）。
+- 升级：停服 → 只换 hbbs → 启动（hbbr、rdsvc、脚本、地理库均不变）。一键更新推送本版；手动安装到 Release 页面下载对应平台的包，解压后替换 hbbs。
+- 验证：cargo test 123/123（debug 与 release 各两遍；lib 108 + hbbr 14 + 集成 1）；更新按钮端到端 12/12、Token 改名 HTTP 19/19、Token 改名界面 17/17、截断展开 30/30（debug 与 release 各两遍）；全量回归 104 次运行全绿（控制台 28/28 ×2、模板 40/40 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 34/34 ×2、审计 45/45 ×2、审计界面 41/41 ×2、地址簿 27/27 ×2、自助改密码 40/40 ×2、自助改密码界面 37/37 ×2、审计回收 26/26 ×2、控制台布局 294/294 ×2、更新按钮 12/12 ×2、Token 改名 19/19 ×2、Token 改名界面 17/17 ×2、截断展开 30/30 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs 与 src/api_pages.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动。
+- 真机确认项：无更新结果后检测更新按钮能再点；创建 token 后在横幅里改名，列表里名称更新，关闭按钮清掉横幅；设备列表里点系统列的截断格展开全文，再点收起。
+
 ## API 调用说明
 
 服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/client-downloads`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。
