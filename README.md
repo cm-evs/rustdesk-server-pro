@@ -61,6 +61,19 @@
 
 部署、升级与各版本变更说明见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
+## Docker 部署
+
+```bash
+docker run -d --name rustdesk-pro \
+  -p 21114:21114 -p 21115:21115 -p 21116:21116 -p 21116:21116/udp \
+  -p 21117:21117 -p 21118:21118 -p 21119:21119 \
+  -v rustdesk-pro-data:/data \
+  -e RELAY=<服务器公网地址> \
+  ghcr.io/wirh/rustdesk-server-pro:latest
+```
+
+一体镜像同时跑 hbbs + hbbr；经典镜像（`ghcr.io/wirh/rustdesk-server-pro-classic`）一个容器跑一个服务，配合仓库根目录的 `docker-compose.yml` 使用。Docker Hub 同步发布：`tesx/rustdesk-server-pro` 与 `tesx/rustdesk-server-pro-classic`。详细部署方法见 [docs/DEPLOY.md](docs/DEPLOY.md)。
+
 ## 构建
 
 ```bash

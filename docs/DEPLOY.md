@@ -46,6 +46,58 @@ cd rustdesk-server-pro-linux-*
 | 21118 | TCP | WebSocket（Web 客户端） |
 | 21119 | TCP | 中继 WebSocket |
 
+## Docker 部署
+
+两个镜像，版本标签与 Release 一致（`v45`、`latest` 等），支持 amd64 / arm64 / armv7 / i386：
+
+| 镜像 | 说明 |
+|---|---|
+| `ghcr.io/wirh/rustdesk-server-pro`（Docker Hub：`tesx/rustdesk-server-pro`） | 一体镜像：s6 托管 hbbs + hbbr 两个服务 |
+| `ghcr.io/wirh/rustdesk-server-pro-classic`（Docker Hub：`tesx/rustdesk-server-pro-classic`） | 经典镜像：只有 hbbs、hbbr 两个二进制，一个容器跑一个服务，配合 `docker-compose.yml` 使用 |
+
+### 一体镜像（推荐）
+
+```bash
+docker run -d --name rustdesk-pro \
+  -p 21114:21114 -p 21115:21115 -p 21116:21116 -p 21116:21116/udp \
+  -p 21117:21117 -p 21118:21118 -p 21119:21119 \
+  -v rustdesk-pro-data:/data \
+  -e RELAY=<服务器公网地址> \
+  ghcr.io/wirh/rustdesk-server-pro:latest
+```
+
+- 数据（密钥、账号库）存在 `/data`，删容器不丢数据，卷删了才丢
+- `RELAY` 填服务器公网地址（域名或公网 IP），中继地址由此分发
+- `ENCRYPTED_ONLY=1`：只接受带密钥的加密连接（hbbs/hbbr 加 `-k _`）
+- 首次启动后打开 `http://<服务器IP>:21114/console/register` 注册账号，第一个注册的用户自动成为管理员，后续步骤同上文「快速开始」
+
+### 经典镜像（compose）
+
+仓库根目录的 `docker-compose.yml` 即是现成配置：hbbs、hbbr 各一个容器，共用 `./data`（密钥与账号库都在里面）。把文件里的 `rustdesk.example.com` 改成服务器公网地址后：
+
+```bash
+docker compose up -d
+```
+
+### 升级
+
+拉新镜像后重建容器即可，数据在卷里不受影响：
+
+```bash
+docker pull ghcr.io/wirh/rustdesk-server-pro:latest
+docker compose up -d   # 或 docker run 重建
+```
+
+Docker 部署不走控制台一键更新（一键更新只换宿主机上的 hbbs 二进制）。
+
+### 本地构建镜像
+
+```bash
+./docker/build-local.sh [--classic] [--tag TAG] [发布包或解包目录]
+```
+
+默认用 `./dist-pro` 里最新的 linux-x86_64-glibc 发布包。
+
 ## hbbs 新增参数
 
 ```
@@ -535,7 +587,7 @@ cd rustdesk-server-pro-linux-*
 - 文案：中英文切换覆盖全部新文案（1 个新键：app.close，字典 338/338 对齐）。
 - 升级：停服 → 换 hbbs + Windows 服务换 rdsvc.exe + 启动脚本 → 启动（hbbr、地理库不变）。旧 rdsvc 显式传 0.0.0.0 会覆盖新默认，不换则 [::] 修复不生效；Linux start.sh 同理。一键更新只换 hbbs，rdsvc 与脚本需手动换；手动安装到 Release 页面下载对应平台的包，解压后替换 hbbs、rdsvc.exe 与启动脚本。
 - 验证：cargo test 128/128（debug 与 release 各两遍；lib 113 + hbbr 14 + 集成 1）；API key HTTP 25/25、API key 界面 35/35、中继详情界面 30/30、监听 9/9（debug 与 release 各两遍）；全量回归 116 次运行全绿（控制台 28/28 ×2、模板 40/40 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 34/34 ×2、审计 45/45 ×2、审计界面 41/41 ×2、地址簿 27/27 ×2、自助改密码 40/40 ×2、自助改密码界面 37/37 ×2、审计回收 26/26 ×2、控制台布局 294/294 ×2、更新按钮 12/12 ×2、Token 改名 19/19 ×2、截断展开 30/30 ×2、API key 25/25 ×2、API key 界面 35/35 ×2、中继详情界面 30/30 ×2、监听 9/9 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs、src/api_pages.rs 与 src/main.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动；Windows 与 ARM 交叉构建在 vendored OpenSSL 下全部通过（musl 不再需要目标专属 OPENSSL_DIR）。
-- 真机确认项：中继详情页显示心跳来源 IP 与监听端口；API key 页创建/改名/关闭操作正常；用户服务器上 [::] 监听生效（IPv6 客户端能连控制台，IPv4 客户端不受影响）；Docker 镜像在 v45 标签推送后由 CI 构建发布到 GHCR。
+- 真机确认项：中继详情页显示心跳来源 IP 与监听端口；API key 页创建/改名/关闭操作正常；用户服务器上 [::] 监听生效（IPv6 客户端能连控制台，IPv4 客户端不受影响）；Docker 镜像在 v45 标签推送后由 CI 构建发布到 GHCR 与 Docker Hub。
 
 ## API 调用说明
 

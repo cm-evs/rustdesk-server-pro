@@ -38,6 +38,58 @@ Then, in the admin console:
 | 21118 | TCP | WebSocket (web client) |
 | 21119 | TCP | Relay WebSocket |
 
+## Docker Deployment
+
+Two images, tagged the same as the releases (`v45`, `latest`, etc.), built for amd64 / arm64 / armv7 / i386:
+
+| Image | Notes |
+|---|---|
+| `ghcr.io/wirh/rustdesk-server-pro` (Docker Hub: `tesx/rustdesk-server-pro`) | All-in-one image: s6 supervises hbbs + hbbr |
+| `ghcr.io/wirh/rustdesk-server-pro-classic` (Docker Hub: `tesx/rustdesk-server-pro-classic`) | Classic image: only the hbbs and hbbr binaries, one service per container, used with `docker-compose.yml` |
+
+### All-in-one image (recommended)
+
+```bash
+docker run -d --name rustdesk-pro \
+  -p 21114:21114 -p 21115:21115 -p 21116:21116 -p 21116:21116/udp \
+  -p 21117:21117 -p 21118:21118 -p 21119:21119 \
+  -v rustdesk-pro-data:/data \
+  -e RELAY=<your-server-address> \
+  ghcr.io/wirh/rustdesk-server-pro:latest
+```
+
+- Data (keys, account database) lives in `/data`: removing the container keeps it, deleting the volume loses it
+- Set `RELAY` to the server's public address (domain or public IP); the relay address is distributed from it
+- `ENCRYPTED_ONLY=1`: only accept key-authenticated encrypted connections (adds `-k _` to hbbs/hbbr)
+- After the first start, open `http://<server-ip>:21114/console/register` and register an account; the first registered user automatically becomes admin. The remaining steps are the same as in "Quick Start" above.
+
+### Classic image (compose)
+
+The `docker-compose.yml` at the repo root is a ready-made setup: one container each for hbbs and hbbr, sharing `./data` (keys and account database live there). Replace `rustdesk.example.com` in the file with the server's public address, then:
+
+```bash
+docker compose up -d
+```
+
+### Upgrading
+
+Pull the new image and recreate the container; the data in the volume is unaffected:
+
+```bash
+docker pull ghcr.io/wirh/rustdesk-server-pro:latest
+docker compose up -d   # or recreate with docker run
+```
+
+Docker deployments do not use the console's one-click updater (it only swaps the hbbs binary on a host install).
+
+### Building the image locally
+
+```bash
+./docker/build-local.sh [--classic] [--tag TAG] [package or unpacked directory]
+```
+
+Defaults to the newest linux-x86_64-glibc package in `./dist-pro`.
+
 ## New hbbs Parameters
 
 ```
@@ -435,7 +487,7 @@ Environment variable `TEST_HBBS=no`: skips hbbs's self-connection test at startu
 - Strings: the Chinese/English switch covers all new strings (1 new key: app.close; dictionary 338/338 aligned).
 - Upgrade: stop the service → replace hbbs, and on Windows also rdsvc.exe and the launcher scripts → start (hbbr and the geo database are unchanged). The old rdsvc passes 0.0.0.0 explicitly, which overrides the new default — without replacing it the [::] fix does not take effect; the same applies to start.sh on Linux. The one-click updater replaces hbbs only; rdsvc and the scripts must be replaced manually. For a manual install, download the package for your platform from the Release page and replace hbbs, rdsvc.exe, and the launcher scripts.
 - Verification: cargo test 128/128 (two passes on debug and release; lib 113 + hbbr 14 + integration 1); API key HTTP 25/25, API key UI 35/35, relay detail UI 30/30, listener 9/9 (two passes on debug and release); full regression 116 runs, all green (console 28/28 ×2, template 40/40 ×2, anchoring 17/17 ×2, configuration 38/38 ×2, dedicated 69/69 ×2, geo-nearest 12/12 ×2, download 50/50 ×2, language switch 43/43 ×2, must-login 21/21 ×2, relay 68/68 ×2, KX 25/25 ×2, hash routing 38/38 ×2, last relay 25/25 ×2, user management 33/33 ×2, user-management UI 34/34 ×2, audit 45/45 ×2, audit UI 41/41 ×2, address book 27/27 ×2, self-service password change 40/40 ×2, self-service password-change UI 37/37 ×2, audit reaping 26/26 ×2, console layout 294/294 ×2, update button 12/12 ×2, token rename 19/19 ×2, truncation expand 30/30 ×2, API key 25/25 ×2, API key UI 35/35 ×2, relay detail UI 30/30 ×2, listener 9/9 ×2) on both debug and release; ARM qemu console suite 28/28 ×2 on both variants. The Rust changes in this release are confined to src/api.rs, src/api_pages.rs, and src/main.rs (platform-uniform logic), with no new Windows/release-only branches; hbbr is untouched; the Windows and ARM cross builds all pass with vendored OpenSSL (musl no longer needs target-scoped OPENSSL_DIR).
-- Real-machine confirmation items: the relay detail page shows the heartbeat source IP and the listen port; the API key page create/rename/dismiss flow works; the [::] listener takes effect on the user's server (IPv6 clients reach the console, IPv4 clients unaffected); the Docker images are built by CI and published to GHCR after the v45 tag is pushed.
+- Real-machine confirmation items: the relay detail page shows the heartbeat source IP and the listen port; the API key page create/rename/dismiss flow works; the [::] listener takes effect on the user's server (IPv6 clients reach the console, IPv4 clients unaffected); the Docker images are built by CI and published to GHCR and Docker Hub after the v45 tag is pushed.
 
 ## API Usage Notes
 

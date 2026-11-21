@@ -61,6 +61,19 @@ A self-hosted remote desktop server based on the official open-source [rustdesk-
 
 See [docs/DEPLOY-en.md](docs/DEPLOY-en.md) for deployment, upgrades, and per-version change notes.
 
+## Docker deployment
+
+```bash
+docker run -d --name rustdesk-pro \
+  -p 21114:21114 -p 21115:21115 -p 21116:21116 -p 21116:21116/udp \
+  -p 21117:21117 -p 21118:21118 -p 21119:21119 \
+  -v rustdesk-pro-data:/data \
+  -e RELAY=<your-server-address> \
+  ghcr.io/wirh/rustdesk-server-pro:latest
+```
+
+The all-in-one image runs hbbs + hbbr together; the classic image (`ghcr.io/wirh/rustdesk-server-pro-classic`) runs one service per container — use it with the `docker-compose.yml` at the repo root. Docker Hub publishes the same images: `tesx/rustdesk-server-pro` and `tesx/rustdesk-server-pro-classic`. See [docs/DEPLOY-en.md](docs/DEPLOY-en.md) for the full deployment guide.
+
 ## Build
 
 ```bash
