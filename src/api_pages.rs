@@ -81,6 +81,47 @@ code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:13px}
 .langrow{display:flex;gap:6px;justify-content:flex-end;margin-bottom:12px}
 button.langbtn.active{background:#1f6feb;border-color:#1f6feb}
 .badge{display:inline-block;background:#1f6feb33;border:1px solid #1f6feb;color:#58a6ff;border-radius:4px;padding:1px 6px;font-size:12px;margin-left:6px;white-space:nowrap}
+/* v46: sidebar layout (modern-web-guidance navigation-drawer guide,
+   sidebar variant: the same element is a persistent sidebar on wide
+   screens and an icon rail on narrower ones; responsive-design guide:
+   dynamic viewport units for the full-height sidebar). */
+.layout{display:flex;min-height:100vh}
+.sidebar{width:216px;flex-shrink:0;position:sticky;top:0;height:100vh;height:100dvh;display:flex;flex-direction:column;background:#161b22;border-inline-end:1px solid #30363d}
+.sb-brand{display:flex;align-items:center;gap:10px;padding:16px 16px 12px}
+.sb-mark{flex-shrink:0;width:28px;height:28px;border-radius:6px;background:#1f6feb;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px}
+.sb-brand h1{font-size:16px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidebar nav{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:2px;padding:4px 8px;margin:0}
+.nav-group-label{padding:10px 10px 4px;font-size:12px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidebar nav button{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:transparent;border:1px solid transparent;border-radius:6px;padding:9px 10px}
+.sidebar nav button:hover{background:#21262d}
+.sidebar nav button.active{background:#1f6feb;border-color:#1f6feb}
+.sidebar nav button.active:hover{background:#2270d4}
+.nav-ic{flex-shrink:0;width:16px;height:16px}
+.nav-ic svg{width:16px;height:16px;display:block}
+.nav-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sb-collapse{margin:8px;border:1px solid #30363d;background:#21262d;border-radius:6px;padding:8px;cursor:pointer;color:#e6edf3}
+.sb-collapse:hover{background:#30363d}
+.sidebar.collapsed{width:60px}
+.sidebar.collapsed .sb-brand h1,.sidebar.collapsed .nav-label,.sidebar.collapsed .nav-group-label{display:none}
+.sidebar.collapsed .sb-brand{justify-content:center;padding:16px 0 12px}
+.sidebar.collapsed nav button{justify-content:center;padding:9px 0}
+.main{flex:1;min-width:0}
+.topbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.topbar-title{font-size:16px;font-weight:600;margin-inline-end:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Under 1024px the sidebar is an icon rail by CSS (same look as
+   .collapsed, so the two rule sets must stay in sync) and the
+   collapse toggle is hidden; the rail keeps every nav entry one
+   tap away on phones instead of hiding it behind a hamburger. */
+@media (max-width:1023px){
+.sidebar{width:60px}
+.sidebar .sb-brand h1,.sidebar .nav-label,.sidebar .nav-group-label{display:none}
+.sidebar .sb-brand{justify-content:center;padding:16px 0 12px}
+.sidebar nav button{justify-content:center;padding:9px 0}
+.sb-collapse{display:none}
+}
+@media (max-width:599px){
+#who{display:none}
+}
 "#;
 
 // Shared i18n dictionary + helpers, injected into every page by page().
@@ -114,6 +155,8 @@ const I18N={zh:{
 'pwd.mismatch':'两次输入的新密码不一致','pwd.empty_old':'请输入旧密码','pwd.short':'新密码至少 6 位',
 'nav.overview':'概览','nav.devices':'设备','nav.audit':'审计日志','nav.users':'用户管理','nav.tokens':'API key',
 'nav.genclient':'生成客户端','nav.settings':'服务器设置',
+'nav.g_devices':'设备与审计','nav.g_manage':'管理与工具','nav.collapse':'收起侧边栏',
+'nav.expand':'展开侧边栏','nav.label':'主导航',
 'ov.users':'注册用户','ov.devices':'已绑定设备','ov.peers':'已注册终端（hbbs）',
 'ov.about':'说明','ov.about_text':'客户端在「设置 → 网络」填入本服务器地址，或直接使用「生成客户端」里预绑定配置的安装包，即可配合账号登录使用。设备在客户端登录账号后会通过心跳自动绑定到所属用户。',
 'ov.load_fail':'概览加载失败，请刷新重试','ov.load_fail2':'概览加载失败：',
@@ -271,6 +314,8 @@ const I18N={zh:{
 'pwd.mismatch':'The new passwords do not match','pwd.empty_old':'Enter the current password','pwd.short':'The new password must be at least 6 characters',
 'nav.overview':'Overview','nav.devices':'Devices','nav.audit':'Audit Log','nav.users':'User Management','nav.tokens':'API keys',
 'nav.genclient':'Generate Client','nav.settings':'Server Settings',
+'nav.g_devices':'Devices & Audit','nav.g_manage':'Admin & Tools','nav.collapse':'Collapse sidebar',
+'nav.expand':'Expand sidebar','nav.label':'Main navigation',
 'ov.users':'Registered users','ov.devices':'Bound devices','ov.peers':'Registered endpoints (hbbs)',
 'ov.about':'About','ov.about_text':'In the client, fill in this server address under Settings → Network, or use a pre-configured installer from Generate Client, then sign in with an account. Devices are bound to their owner automatically via heartbeat after signing in.',
 'ov.load_fail':'Failed to load the overview. Refresh and retry.','ov.load_fail2':'Failed to load the overview: ',
@@ -620,10 +665,27 @@ pub fn console_page() -> String {
 }
 
 const CONSOLE_BODY: &str = r#"
+<div class="layout">
+<aside class="sidebar" id="sidebar">
+<div class="sb-brand"><span class="sb-mark" aria-hidden="true">R</span><h1 data-i18n="app.title">RustDesk 服务控制台</h1></div>
+<nav aria-label="主导航" data-i18n-aria="nav.label">
+<button data-s="overview" class="active" title="概览" data-i18n-title="nav.overview"><span class="nav-ic" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></span><span class="nav-label" data-i18n="nav.overview">概览</span></button>
+<div class="nav-group-label" data-i18n="nav.g_devices">设备与审计</div>
+<button data-s="devices" title="设备" data-i18n-title="nav.devices"><span class="nav-ic" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="9" rx="1"/><path d="M6 14h4M8 11v3"/></svg></span><span class="nav-label" data-i18n="nav.devices">设备</span></button>
+<button data-s="audit" title="审计日志" data-i18n-title="nav.audit"><span class="nav-ic" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="2" width="9" height="12" rx="1"/><path d="M6 5.5h4M6 8.5h4M6 11.5h2.5"/></svg></span><span class="nav-label" data-i18n="nav.audit">审计日志</span></button>
+<div class="nav-group-label" data-i18n="nav.g_manage">管理与工具</div>
+<button data-s="users" class="adminonly" title="用户管理" data-i18n-title="nav.users"><span class="nav-ic" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5" r="2.6"/><path d="M2.8 14c.5-2.9 2.6-4.5 5.2-4.5S12.7 11.1 13.2 14"/></svg></span><span class="nav-label" data-i18n="nav.users">用户管理</span></button>
+<button data-s="tokens" title="API key" data-i18n-title="nav.tokens"><span class="nav-ic" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="8" r="3"/><path d="M8.5 8H14M11.5 8v2.5M14 8v1.8"/></svg></span><span class="nav-label" data-i18n="nav.tokens">API key</span></button>
+<button data-s="genclient" title="生成客户端" data-i18n-title="nav.genclient"><span class="nav-ic" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8.5M4.5 7.5 8 11l3.5-3.5M3 13.5h10"/></svg></span><span class="nav-label" data-i18n="nav.genclient">生成客户端</span></button>
+<button data-s="settings" class="adminonly" title="服务器设置" data-i18n-title="nav.settings"><span class="nav-ic" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.5"/><path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M11.8 4.2l-1.4 1.4M5.6 10.4l-1.4 1.4"/></svg></span><span class="nav-label" data-i18n="nav.settings">服务器设置</span></button>
+</nav>
+<button type="button" class="sb-collapse" id="sb-collapse" aria-label="收起侧边栏" aria-expanded="true">«</button>
+</aside>
+<div class="main">
 <div class="wrap">
-<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-<h1 data-i18n="app.title">RustDesk 服务控制台</h1>
-<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span id="who" class="muted"></span><button class="langbtn ghost" data-lang="zh">中文</button><button class="langbtn ghost" data-lang="en">English</button><button class="ghost" id="pwdchg" data-i18n="pwd.title">修改密码</button><button class="ghost" id="logout" data-i18n="app.logout">退出</button></div>
+<div class="topbar">
+<span class="topbar-title" id="topbar-title">概览</span>
+<span id="who" class="muted"></span><button class="langbtn ghost" data-lang="zh">中文</button><button class="langbtn ghost" data-lang="en">English</button><button class="ghost" id="pwdchg" data-i18n="pwd.title">修改密码</button><button class="ghost" id="logout" data-i18n="app.logout">退出</button>
 </div>
 <div class="card" id="pwd-card" style="display:none"><h2 data-i18n="pwd.title">修改密码</h2>
 <div class="err" id="pwd-err"></div><div class="ok" id="pwd-ok"></div>
@@ -631,16 +693,6 @@ const CONSOLE_BODY: &str = r#"
 <label data-i18n="pwd.new">新密码</label><input id="pwd-new" type="password" placeholder="新密码（至少 6 位）" data-i18n-ph="pwd.new_ph">
 <label data-i18n="pwd.confirm">确认新密码</label><input id="pwd-confirm" type="password" placeholder="再次输入新密码" data-i18n-ph="pwd.confirm_ph">
 <button id="pwd-submit" data-i18n="pwd.submit">确认修改</button> <button class="ghost" id="pwd-cancel" data-i18n="app.cancel">取消</button></div>
-<nav>
-<button data-s="overview" class="active" data-i18n="nav.overview">概览</button>
-<button data-s="devices" data-i18n="nav.devices">设备</button>
-<button data-s="audit" data-i18n="nav.audit">审计日志</button>
-<button data-s="users" class="adminonly" data-i18n="nav.users">用户管理</button>
-<button data-s="tokens" data-i18n="nav.tokens">API key</button>
-<button data-s="genclient" data-i18n="nav.genclient">生成客户端</button>
-<button data-s="settings" class="adminonly" data-i18n="nav.settings">服务器设置</button>
-</nav>
-
 <section id="s-overview" class="active">
 <div class="row adminonly">
 <div class="card"><div class="muted" data-i18n="ov.users">注册用户</div><div class="stat" id="stat-users">-</div></div>
@@ -765,6 +817,8 @@ const CONSOLE_BODY: &str = r#"
 <p class="muted" data-i18n="set.upd_desc">更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。</p></div>
 </section>
 </div>
+</div>
+</div>
 
 <script>
 window.__pageTitleKey='app.title';
@@ -830,6 +884,7 @@ window.addEventListener('resize',scheduleMarkTrunc);
 function loadFail(el,fnName,msg){el.innerHTML='<p class="err">'+window.t('app.load_failed')+(msg?(window.t('app.colon')+esc(msg)):'')+window.t('app.period')+'<button class="ghost" onclick="'+fnName+'()">'+window.t('app.retry')+'</button></p>';}
 async function init(){
   applyI18n();
+  applySbCollapsed();
   try{ ME=await api('/api/me'); }catch(e){ if(e.message!=='unauth')$('who').textContent=t('app.load_fail_refresh'); return; }
   if(!ME.ok){location.href='/console/login';return;}
   $('who').textContent=ME.username+(ME.is_admin?t('app.who_admin'):'');
@@ -842,6 +897,7 @@ window.__onLangChange=()=>{
   if(ME)$('who').textContent=ME.username+(ME.is_admin?t('app.who_admin'):'');
   const active=document.querySelector('nav button.active');
   const s=active?active.dataset.s:'overview';
+  setTopTitle(s);applySbCollapsed();
   if(s==='overview')loadOverview(); if(s==='devices')loadDevices();
   if(s==='audit')loadAudit(AUDIT_PAGE);
   if(s==='users')loadUsers(); if(s==='tokens')loadTokens();
@@ -863,6 +919,7 @@ function parseHash(){
   return {s:m[1],relay:(m[1]==='devices'&&m[2])?parseInt(m[2],10):null};
 }
 function showSection(s,relay){
+  setTopTitle(s);
   document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
   const btn=document.querySelector('nav button[data-s="'+s+'"]');
   if(btn)btn.classList.add('active');
@@ -883,6 +940,27 @@ function routeFromHash(){
   if(location.hash&&location.hash!==want)history.replaceState(null,'',want);
   showSection(r.s,r.relay);
 }
+// v46: sidebar collapse (Vben layout). The collapsed state persists in
+// localStorage; under 1024px the sidebar is an icon rail by CSS and
+// the toggle is hidden, so there is nothing to sync from JS.
+const SB=$('sidebar');
+let sbCollapsed=false;
+try{sbCollapsed=localStorage.getItem('rdp-sb-collapsed')==='1';}catch(e){}
+function applySbCollapsed(){
+  SB.classList.toggle('collapsed',sbCollapsed);
+  const b=$('sb-collapse');
+  const k=sbCollapsed?'nav.expand':'nav.collapse';
+  b.textContent=sbCollapsed?'»':'«';
+  b.setAttribute('aria-label',t(k));
+  b.title=t(k);
+  b.setAttribute('aria-expanded',sbCollapsed?'false':'true');
+}
+function setTopTitle(s){const el=$('topbar-title');if(el)el.textContent=t('nav.'+s);}
+$('sb-collapse').onclick=()=>{
+  sbCollapsed=!sbCollapsed;
+  try{localStorage.setItem('rdp-sb-collapsed',sbCollapsed?'1':'0');}catch(e){}
+  applySbCollapsed();
+};
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   const h='#/'+b.dataset.s;
   if(location.hash===h)routeFromHash(); else location.hash=h;
