@@ -3220,8 +3220,10 @@ fn fetch_bytes(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
 }
 
 /// Built-in GitHub acceleration mirrors (prefix style: mirror + full URL).
-/// They are tried in order before a direct connection; a slow or dead
-/// mirror is abandoned automatically via the downloader's stall detection.
+/// In China they are tried in order before a direct connection; abroad
+/// the direct connection goes first (see `github_candidates`). A slow
+/// or dead mirror is abandoned automatically via the downloader's stall
+/// detection either way.
 const GH_MIRRORS: [&str; 5] = [
     "https://gh-proxy.com/",
     "https://ghproxy.net/",
@@ -3229,6 +3231,147 @@ const GH_MIRRORS: [&str; 5] = [
     "https://ghfast.top/",
     "https://ghps.cc/",
 ];
+
+/// Which side of the Great Firewall the server is likely on, inferred
+/// from the system timezone (cheap local signal, no network lookup).
+/// Only used to order download candidates; every source is still
+/// tried in turn, so a wrong guess costs one failed attempt at most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadRegion {
+    /// Mainland China: acceleration mirrors first.
+    China,
+    /// Outside mainland China: direct GitHub first.
+    Abroad,
+    /// Could not tell: keep the long-standing mirrors-first order
+    /// (fail-open — the pre-existing behaviour).
+    Unknown,
+}
+
+/// Mainland-China timezone names: IANA names (incl. the `PRC` alias)
+/// and the Windows display name. Other UTC+8 zones (Singapore,
+/// Taipei, Perth, ...) are deliberately absent: GitHub direct works
+/// from there, so they order direct first.
+const CHINA_TZ_NAMES: [&str; 7] = [
+    "Asia/Shanghai",
+    "Asia/Chongqing",
+    "Asia/Chungking",
+    "Asia/Harbin",
+    "Asia/Urumqi",
+    "PRC",
+    "China Standard Time",
+];
+
+/// Infer a region from one timezone value: an IANA name, a Windows
+/// name, or a POSIX TZ string (`CST-8`, `EST5EDT`). Returns `None`
+/// when the value says nothing usable, so the caller can try the
+/// next signal. A bare `UTC+8` offset is ambiguous (China, Singapore,
+/// Taipei, Perth, ...), so it also yields `None` and the fail-open
+/// mirrors-first order applies.
+fn region_from_tz_value(tz: &str) -> Option<DownloadRegion> {
+    let name = tz.trim().trim_start_matches(':');
+    if name.is_empty() {
+        return None;
+    }
+    if CHINA_TZ_NAMES.contains(&name) {
+        return Some(DownloadRegion::China);
+    }
+    // Any other IANA-style zone name (area/city) is outside mainland
+    // China; so are the fixed UTC/GMT names.
+    if name.contains('/')
+        || matches!(name, "UTC" | "GMT" | "UCT" | "Universal" | "Zulu" | "Greenwich")
+    {
+        return Some(DownloadRegion::Abroad);
+    }
+    region_from_posix_tz(name)
+}
+
+/// Infer a region from a POSIX TZ string: a zone abbreviation
+/// (letters, or `<...>` quoted) followed by the offset in hours west
+/// of UTC, e.g. `CST-8` (UTC+8), `EST5EDT` (UTC-5). A non-+8 offset
+/// rules mainland China out; +8 stays `None` (ambiguous, fail-open).
+fn region_from_posix_tz(tz: &str) -> Option<DownloadRegion> {
+    let rest = if let Some(stripped) = tz.strip_prefix('<') {
+        stripped.split('>').nth(1)?
+    } else {
+        tz.trim_start_matches(|c: char| c.is_ascii_alphabetic())
+    };
+    let mut digits = String::new();
+    for c in rest.chars() {
+        if c.is_ascii_digit() || (c == '-' && digits.is_empty()) || (c == '+' && digits.is_empty())
+        {
+            digits.push(c);
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() || digits == "-" || digits == "+" {
+        return None;
+    }
+    let hours_west: i32 = digits.parse().ok()?;
+    // POSIX offsets are hours west of UTC; mainland China is 8 hours
+    // east, i.e. -8 west.
+    if hours_west == -8 {
+        None
+    } else {
+        Some(DownloadRegion::Abroad)
+    }
+}
+
+/// Zone name from an /etc/localtime symlink target such as
+/// `/usr/share/zoneinfo/Asia/Shanghai`.
+fn zoneinfo_name(target: &std::path::Path) -> Option<&str> {
+    target.to_str()?.split("zoneinfo/").nth(1)
+}
+
+/// Detect the download region from local signals only, in order:
+/// the `TZ` environment variable, the /etc/localtime symlink
+/// (Linux), /etc/timezone (Debian/Ubuntu), and finally the current
+/// UTC offset (mainland China is UTC+8 year-round, so any other
+/// offset rules it out). The offset fallback is what covers Windows,
+/// where no registry read is available without a new dependency.
+/// Returns `Unknown` when nothing says otherwise.
+/// A set `TZ` overrides the system files for the process's local
+/// time (that is how libc treats it), so when it is set the files
+/// are skipped and only the offset — which libc derives from `TZ`
+/// — is consulted after it.
+fn detect_download_region() -> DownloadRegion {
+    let tz_set = match std::env::var("TZ") {
+        Ok(tz) if !tz.trim().is_empty() => {
+            if let Some(r) = region_from_tz_value(&tz) {
+                return r;
+            }
+            true
+        }
+        _ => false,
+    };
+    if !tz_set {
+        if let Ok(target) = std::fs::read_link("/etc/localtime") {
+            if let Some(name) = zoneinfo_name(&target) {
+                if let Some(r) = region_from_tz_value(name) {
+                    return r;
+                }
+            }
+        }
+        if let Ok(content) = std::fs::read_to_string("/etc/timezone") {
+            if let Some(r) = region_from_tz_value(content.trim()) {
+                return r;
+            }
+        }
+    }
+    let offset_secs = chrono::Local::now().offset().local_minus_utc();
+    if offset_secs != 8 * 3600 {
+        return DownloadRegion::Abroad;
+    }
+    DownloadRegion::Unknown
+}
+
+/// The detected region, cached at first use: the system timezone
+/// does not change while the server runs.
+static DOWNLOAD_REGION: std::sync::OnceLock<DownloadRegion> = std::sync::OnceLock::new();
+
+fn download_region() -> DownloadRegion {
+    *DOWNLOAD_REGION.get_or_init(detect_download_region)
+}
 
 /// GitHub acceleration prefixes in try order: the admin's custom
 /// mirror (if configured) first, then the built-in mirrors. The
@@ -3247,9 +3390,23 @@ fn mirror_prefixes(custom: &str) -> Vec<String> {
     out
 }
 
-/// Ordered download candidates for one GitHub URL: custom mirror,
-/// built-in mirrors, then direct. Each entry is (label, url).
+/// Ordered download candidates for one GitHub URL, in the detected
+/// region's try order. The admin's custom mirror (explicit config)
+/// always goes first; the region only decides the relative order of
+/// the built-in mirrors and the direct connection: mirrors first in
+/// China (and when the region is unknown — fail-open), direct first
+/// abroad. Shared by the template download and the one-click updater:
+/// both download from the same server on the same network, so one
+/// order serves both.
 fn github_candidates(custom: &str, direct: &str) -> Vec<(String, String)> {
+    github_candidates_for(custom, direct, download_region())
+}
+
+fn github_candidates_for(
+    custom: &str,
+    direct: &str,
+    region: DownloadRegion,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if !custom.is_empty() {
         out.push((
@@ -3257,10 +3414,22 @@ fn github_candidates(custom: &str, direct: &str) -> Vec<(String, String)> {
             format!("{custom}/{direct}"),
         ));
     }
-    for m in GH_MIRRORS {
-        out.push((m.to_string(), format!("{m}{direct}")));
+    let mirrors: Vec<(String, String)> = GH_MIRRORS
+        .iter()
+        .map(|m| (m.to_string(), format!("{m}{direct}")))
+        .collect();
+    let direct_entry = ("直连 GitHub".to_string(), direct.to_string());
+    match region {
+        DownloadRegion::Abroad => {
+            out.push(direct_entry);
+            out.extend(mirrors);
+        }
+        // China and Unknown: mirrors first.
+        _ => {
+            out.extend(mirrors);
+            out.push(direct_entry);
+        }
     }
-    out.push(("直连 GitHub".to_string(), direct.to_string()));
     out
 }
 
@@ -3294,25 +3463,16 @@ fn tpl_final_path(st: &ApiState) -> PathBuf {
 }
 
 /// Fetch the latest official client release document from the GitHub API
-/// (small JSON). Mirrors are tried before a direct connection, because
-/// direct GitHub API access is the part most likely to be slow or blocked
-/// on networks that need acceleration; direct is the last resort. Shared
-/// by the template download and the other-platform download links. On
-/// failure returns the last transport error; callers add their own
+/// (small JSON). The try order is the region-aware candidate order
+/// (`github_candidates`): mirrors first in China, direct first abroad.
+/// Shared by the template download and the other-platform download links.
+/// On failure returns the last transport error; callers add their own
 /// context (the template page and the downloads endpoint word the
 /// failure differently).
 fn fetch_latest_release_json(custom: &str) -> Result<Value, String> {
     let api_url = "https://api.github.com/repos/rustdesk/rustdesk/releases/latest";
-    let mut urls: Vec<String> = Vec::new();
-    if !custom.is_empty() {
-        urls.push(format!("{custom}/{api_url}"));
-    }
-    for m in GH_MIRRORS {
-        urls.push(format!("{m}{api_url}"));
-    }
-    urls.push(api_url.to_string());
     let mut last_err = String::new();
-    for u in urls {
+    for (_label, u) in github_candidates(custom, api_url) {
         match fetch_bytes(&u, 20) {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
@@ -6821,19 +6981,137 @@ mod tests {
 
     #[test]
     fn update_mirror_candidates() {
-        let cs = github_candidates("", "https://github.com/x/y");
+        // Region-explicit: the China order is the long-standing one
+        // (custom mirror, built-in mirrors, direct last).
+        let cs = github_candidates_for("", "https://github.com/x/y", DownloadRegion::China);
         assert_eq!(cs.len(), 6); // 5 built-in mirrors + direct
         assert_eq!(cs[0].0, "https://gh-proxy.com/");
         assert_eq!(cs[0].1, "https://gh-proxy.com/https://github.com/x/y");
         assert_eq!(cs[5].0, "直连 GitHub");
         assert_eq!(cs[5].1, "https://github.com/x/y");
-        let cs = github_candidates("https://m.example", "https://github.com/x/y");
+        let cs = github_candidates_for(
+            "https://m.example",
+            "https://github.com/x/y",
+            DownloadRegion::China,
+        );
         assert_eq!(cs.len(), 7);
         assert_eq!(cs[0].0, "自定义镜像 https://m.example");
         assert_eq!(cs[0].1, "https://m.example/https://github.com/x/y");
         let ps = mirror_prefixes("https://m.example");
         assert_eq!(ps[0], "https://m.example/");
         assert!(ps.iter().all(|p| p.ends_with('/')));
+    }
+
+    #[test]
+    fn github_candidates_region_order() {
+        let direct = "https://github.com/x/y";
+        // Abroad: custom mirror first, then direct, then built-ins.
+        let cs = github_candidates_for("", direct, DownloadRegion::Abroad);
+        assert_eq!(cs.len(), 6);
+        assert_eq!(cs[0].0, "直连 GitHub");
+        assert_eq!(cs[0].1, direct);
+        assert_eq!(cs[1].0, "https://gh-proxy.com/");
+        assert_eq!(cs[5].0, "https://ghps.cc/");
+        let cs = github_candidates_for("https://m.example", direct, DownloadRegion::Abroad);
+        assert_eq!(cs.len(), 7);
+        assert_eq!(cs[0].0, "自定义镜像 https://m.example");
+        assert_eq!(cs[1].0, "直连 GitHub");
+        // Unknown: fail-open, same order as China.
+        let china = github_candidates_for("", direct, DownloadRegion::China);
+        let unknown = github_candidates_for("", direct, DownloadRegion::Unknown);
+        assert_eq!(china, unknown);
+        let china_c = github_candidates_for("https://m.example", direct, DownloadRegion::China);
+        let unknown_c =
+            github_candidates_for("https://m.example", direct, DownloadRegion::Unknown);
+        assert_eq!(china_c, unknown_c);
+    }
+
+    #[test]
+    fn download_region_from_tz_value() {
+        // Mainland-China names.
+        for tz in [
+            "Asia/Shanghai",
+            "Asia/Chongqing",
+            "Asia/Chungking",
+            "Asia/Harbin",
+            "Asia/Urumqi",
+            "PRC",
+            "China Standard Time",
+            ":Asia/Shanghai",
+            "  Asia/Shanghai  ",
+        ] {
+            assert_eq!(
+                region_from_tz_value(tz),
+                Some(DownloadRegion::China),
+                "{tz}"
+            );
+        }
+        // Other zones: direct first, including other UTC+8 zones.
+        for tz in [
+            "America/New_York",
+            "Europe/London",
+            "Asia/Tokyo",
+            "Asia/Singapore",
+            "Asia/Taipei",
+            "Asia/Hong_Kong",
+            "Australia/Perth",
+            "Etc/UTC",
+            "UTC",
+            "GMT",
+        ] {
+            assert_eq!(
+                region_from_tz_value(tz),
+                Some(DownloadRegion::Abroad),
+                "{tz}"
+            );
+        }
+        // Unusable values: the caller falls through to the next signal.
+        for tz in ["", "   ", ":", "CST", "XYZ", "Pacific Standard Time"] {
+            assert_eq!(region_from_tz_value(tz), None, "{tz}");
+        }
+    }
+
+    #[test]
+    fn download_region_from_posix_tz() {
+        // UTC+8 is ambiguous (China, Singapore, Taipei, Perth, ...):
+        // None, so the fail-open mirrors-first order applies.
+        assert_eq!(region_from_posix_tz("CST-8"), None);
+        assert_eq!(region_from_posix_tz("CST-8CDT"), None);
+        assert_eq!(region_from_posix_tz("<+08>-8"), None);
+        // Any other offset rules mainland China out.
+        assert_eq!(
+            region_from_posix_tz("EST5EDT"),
+            Some(DownloadRegion::Abroad)
+        );
+        assert_eq!(region_from_posix_tz("UTC0"), Some(DownloadRegion::Abroad));
+        assert_eq!(region_from_posix_tz("GMT0"), Some(DownloadRegion::Abroad));
+        assert_eq!(region_from_posix_tz("JST-9"), Some(DownloadRegion::Abroad));
+        assert_eq!(
+            region_from_posix_tz("CET-1CEST"),
+            Some(DownloadRegion::Abroad)
+        );
+        assert_eq!(region_from_posix_tz("CST"), None);
+        assert_eq!(region_from_posix_tz(""), None);
+    }
+
+    #[test]
+    fn download_region_from_zoneinfo_path() {
+        assert_eq!(
+            zoneinfo_name(std::path::Path::new(
+                "/usr/share/zoneinfo/Asia/Shanghai"
+            )),
+            Some("Asia/Shanghai")
+        );
+        assert_eq!(
+            zoneinfo_name(std::path::Path::new(
+                "../usr/share/zoneinfo/America/New_York"
+            )),
+            Some("America/New_York")
+        );
+        assert_eq!(
+            zoneinfo_name(std::path::Path::new("/etc/localtime")),
+            None
+        );
     }
 
     #[test]
