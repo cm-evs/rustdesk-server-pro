@@ -20,3 +20,12 @@ client-templates/
 
 # Internal product doc, kept locally only
 PRODUCT.md
+
+# Binaries staged into Docker build contexts by docker/build-local.sh
+# (CI stages them the same way); never commit them.
+/docker/rootfs/usr/bin/hbbs
+/docker/rootfs/usr/bin/hbbr
+/docker/rootfs/usr/bin/rustdesk-utils
+/docker-classic/hbbs
+/docker-classic/hbbr
+/docker-classic/rustdesk-utils

@@ -1,11 +1,17 @@
 name: build
 
 # ------------- NOTE
-# please setup some secrets before running this workflow:
-# DOCKER_IMAGE should be the target image name on docker hub (e.g. "rustdesk/rustdesk-server-s6" )
-# DOCKER_IMAGE_CLASSIC should be the target image name on docker hub for the old build (e.g. "rustdesk/rustdesk-server" )
+# GHCR images are published to ghcr.io/wirh/rustdesk-server-pro
+# (and -classic) with the built-in GITHUB_TOKEN; no setup needed.
+# Docker Hub push is optional: set these secrets to also publish there,
+# otherwise only GHCR is used and the Docker Hub steps are skipped.
+# DOCKER_IMAGE should be the target image name on docker hub (e.g. "<user>/rustdesk-server-pro" )
+# DOCKER_IMAGE_CLASSIC should be the target image name on docker hub for the old build (e.g. "<user>/rustdesk-server-pro-classic" )
 # DOCKER_HUB_USERNAME is the username you normally use to login at https://hub.docker.com/
 # DOCKER_HUB_PASSWORD is a token you should create under "account settings / security" with read/write access
+# Tagging: integer tags (v45) move latest + major; preview tags (v45.1)
+# only get their version tag. workflow_dispatch runs push only a
+# throwaway ci-test tag to GHCR, never latest.
 
 permissions:
   contents: read
@@ -15,6 +21,8 @@ on:
   workflow_dispatch:
   push:
     tags:
+      - 'v[0-9]+'
+      - 'v[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
@@ -23,8 +31,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   LATEST_TAG: latest
-  GHCR_IMAGE: ghcr.io/rustdesk/rustdesk-server-s6
-  GHCR_IMAGE_CLASSIC: ghcr.io/rustdesk/rustdesk-server
+  GHCR_IMAGE: ghcr.io/wirh/rustdesk-server-pro
+  GHCR_IMAGE_CLASSIC: ghcr.io/wirh/rustdesk-server-pro-classic
+  # Docker Hub is optional: these flags say whether its secrets are set.
+  # (`secrets` cannot be used in `if` expressions, hence the indirection.)
+  DOCKER_HUB_LOGIN: ${{ secrets.DOCKER_HUB_USERNAME != '' }}
+  DOCKER_HUB_CONFIGURED: ${{ secrets.DOCKER_HUB_USERNAME != '' && secrets.DOCKER_IMAGE != '' }}
+  DOCKER_HUB_CLASSIC_CONFIGURED: ${{ secrets.DOCKER_HUB_USERNAME != '' && secrets.DOCKER_IMAGE_CLASSIC != '' }}
   
 jobs:
 
@@ -60,6 +73,27 @@ jobs:
           profile: minimal
           target: ${{ matrix.job.target }}
 
+      - name: Create compile-time SQLite database
+        run: |
+          python3 - <<'PYEOF'
+          import re, sqlite3
+          # The sqlx query!/query_as! macros in src/database.rs type-check
+          # against a live database at compile time (DATABASE_URL from
+          # .env). The checked-in .env points at an absolute path that
+          # only exists on the dev machine, so create the database here
+          # and point .env at it. The schema is extracted from the DDL in
+          # src/database.rs, so it cannot drift from the app's schema.
+          src = open('src/database.rs').read()
+          m = re.search(r'sqlx::query!\(\s*"(.*?)"\s*\)', src, re.S)
+          assert m, 'DDL not found in src/database.rs'
+          db = sqlite3.connect('db_v2.sqlite3')
+          db.executescript(m.group(1))
+          db.commit()
+          db.close()
+          open('.env', 'w').write('DATABASE_URL=sqlite:db_v2.sqlite3\n')
+          print('compile-time database ready')
+          PYEOF
+
       - name: Build
         uses: actions-rs/cargo@v1
         with:
@@ -80,8 +114,16 @@ jobs:
             target/${{ matrix.job.target }}/release/rustdesk-utils
           if-no-files-found: error
 
+  # NOTE: disabled (if: false). The sqlx-macros proc-macro DLL fails to
+  # load on the Windows runner (LoadLibraryExW error 1114), a pre-existing
+  # failure also present on v44 code; disabling LTO did not fix it. The
+  # Windows CI artifacts are not consumed (releases are published
+  # manually; Windows packages are built locally), so this job is parked
+  # until the DLL issue is fixed. Re-enabling also needs the same
+  # compile-time SQLite database step as the Linux build job.
   build-win:
     name: Build - windows
+    if: false
     runs-on: windows-2022
 
     steps:
@@ -172,9 +214,12 @@ jobs:
           if-no-files-found: error
 
   # github (draft) release with all binaries
+  # NOTE: releases are published manually (gh CLI + package_pro.sh assets,
+  # after release-copy review), so CI must not create draft releases here.
   release:
 
     name: Github release
+    if: false
     needs: 
       - build
       - build-win
@@ -251,7 +296,7 @@ jobs:
         uses: docker/setup-buildx-action@v2
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -262,22 +307,49 @@ jobs:
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
-          username: rustdesk
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
         
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v4
         with:
-          images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE }}
+          images: ${{ env.GHCR_IMAGE }}
 
-      - name: Get git tag
-        id: vars
+      - name: Compute image tags
+        id: tags
+        env:
+          DOCKER_IMAGE: ${{ secrets.DOCKER_IMAGE }}
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Validation run: push only a throwaway test tag to GHCR, never latest.
+            echo "tags=${{ env.GHCR_IMAGE }}:ci-test-${{ matrix.job.name }}" >> $GITHUB_OUTPUT
+            echo "smoke_tag=ci-test-${{ matrix.job.name }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          {
+            echo "tags<<EOF"
+            if [ -n "$DOCKER_IMAGE" ]; then
+              echo "$DOCKER_IMAGE:${T}-${{ matrix.job.name }}"
+            fi
+            echo "${{ env.GHCR_IMAGE }}:${T}-${{ matrix.job.name }}"
+            if [[ "$T" != *.* ]]; then
+              # Integer tag (e.g. v45): formal release, also move latest + major.
+              # Preview tag (e.g. v45.1) must never move latest or major.
+              if [ -n "$DOCKER_IMAGE" ]; then
+                echo "$DOCKER_IMAGE:${{ env.LATEST_TAG }}-${{ matrix.job.name }}"
+                echo "$DOCKER_IMAGE:${M}-${{ matrix.job.name }}"
+              fi
+              echo "${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}"
+              echo "${{ env.GHCR_IMAGE }}:${M}-${{ matrix.job.name }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "smoke_tag=${T}-${{ matrix.job.name }}" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -285,29 +357,37 @@ jobs:
           context: "./docker"
           platforms: ${{ matrix.job.docker_platform }}
           push: true
+          load: ${{ matrix.job.name == 'amd64' }}
           provenance: false
           build-args: |
             S6_ARCH=${{ matrix.job.s6_platform }}
-          tags: |
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Save amd64 image for smoke test
+        if: matrix.job.name == 'amd64'
+        run: docker save ${{ env.GHCR_IMAGE }}:${{ steps.tags.outputs.smoke_tag }} -o /tmp/smoke-image.tar
+
+      - name: Upload amd64 image for smoke test
+        if: matrix.job.name == 'amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-amd64
+          path: /tmp/smoke-image.tar
+          retention-days: 1
 
   # docker build and push of multiarch images
   docker-manifest:
 
     name: Docker manifest
+    if: github.event_name == 'push'
     needs: docker
     runs-on: ubuntu-22.04
 
     steps:
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -320,20 +400,24 @@ jobs:
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          if [[ "$T" == *.* ]]; then
+            echo "is_preview=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_preview=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
-          username: rustdesk
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # manifest for :1.2.3 tag
-      #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: github.event_name != 'workflow_dispatch'
+        if: env.DOCKER_HUB_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-i386
@@ -342,6 +426,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-i386
@@ -350,6 +435,7 @@ jobs:
       # manifest for :latest tag
       - name: Create and push manifest (:latest)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-i386
@@ -359,7 +445,6 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push GHCR manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: github.event_name != 'workflow_dispatch'
         with:
           base-image: ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}
           extra-images: ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-i386
@@ -368,6 +453,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push GHCR manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true'
         with:
           base-image: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-i386
@@ -376,6 +462,7 @@ jobs:
       # manifest for :latest tag
       - name: Create and push GHCR manifest (:latest)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true'
         with:
           base-image: ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}
           extra-images: ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-i386
@@ -419,7 +506,7 @@ jobs:
         uses: docker/setup-buildx-action@v2
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -430,22 +517,47 @@ jobs:
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
-          username: rustdesk
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
         
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v4
         with:
-          images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE_CLASSIC }}
+          images: ${{ env.GHCR_IMAGE_CLASSIC }}
 
-      - name: Get git tag
-        id: vars
+      - name: Compute image tags
+        id: tags
+        env:
+          DOCKER_IMAGE_CLASSIC: ${{ secrets.DOCKER_IMAGE_CLASSIC }}
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Validation run: push only a throwaway test tag to GHCR, never latest.
+            echo "tags=${{ env.GHCR_IMAGE_CLASSIC }}:ci-test-${{ matrix.job.name }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          {
+            echo "tags<<EOF"
+            if [ -n "$DOCKER_IMAGE_CLASSIC" ]; then
+              echo "$DOCKER_IMAGE_CLASSIC:${T}-${{ matrix.job.name }}"
+            fi
+            echo "${{ env.GHCR_IMAGE_CLASSIC }}:${T}-${{ matrix.job.name }}"
+            if [[ "$T" != *.* ]]; then
+              # Integer tag (e.g. v45): formal release, also move latest + major.
+              # Preview tag (e.g. v45.1) must never move latest or major.
+              if [ -n "$DOCKER_IMAGE_CLASSIC" ]; then
+                echo "$DOCKER_IMAGE_CLASSIC:${{ env.LATEST_TAG }}-${{ matrix.job.name }}"
+                echo "$DOCKER_IMAGE_CLASSIC:${M}-${{ matrix.job.name }}"
+              fi
+              echo "${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}"
+              echo "${{ env.GHCR_IMAGE_CLASSIC }}:${M}-${{ matrix.job.name }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -454,26 +566,21 @@ jobs:
           platforms: ${{ matrix.job.docker_platform }}
           push: true
           provenance: false
-          tags: |
-            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
   # docker build and push of multiarch images
   docker-manifest-classic:
 
     name: Docker manifest
-    needs: docker
+    if: github.event_name == 'push'
+    needs: docker-classic
     runs-on: ubuntu-22.04
 
     steps:
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -486,20 +593,24 @@ jobs:
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          if [[ "$T" == *.* ]]; then
+            echo "is_preview=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_preview=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
-          username: rustdesk
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # manifest for :1.2.3 tag
-      #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: github.event_name != 'workflow_dispatch'
+        if: env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-armv7
@@ -508,6 +619,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
@@ -516,6 +628,7 @@ jobs:
       # manifest for :latest tag
       - name: Create and push manifest (:latest)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-armv7
@@ -525,7 +638,6 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push GHCR manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: github.event_name != 'workflow_dispatch'
         with:
           base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
           extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-armv7
@@ -534,6 +646,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push GHCR manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true'
         with:
           base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
@@ -542,6 +655,7 @@ jobs:
       # manifest for :latest tag
       - name: Create and push GHCR manifest (:latest)
         uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true'
         with:
           base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}
           extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-armv7
@@ -592,11 +706,50 @@ jobs:
           cd debian-build/${{ matrix.job.name }}/
           debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Upload debian packages
+        uses: actions/upload-artifact@v4
         with:
-          draft: true
-          files: |
+          name: debian-packages-${{ matrix.job.name }}
+          path: |
             debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
             debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
             debian-build/rustdesk-server-utils_*_${{ matrix.job.debian_platform }}.deb
+          if-no-files-found: error
+
+  # smoke test the freshly built amd64 image: the API must answer on 21114
+  smoke:
+
+    name: Smoke test - amd64 image
+    needs: docker
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      - name: Download amd64 image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-amd64
+          path: /tmp/smoke
+
+      - name: Run container and probe the API on 21114
+        run: |
+          IMG=$(docker load -i /tmp/smoke/smoke-image.tar | sed -n 's/^Loaded image: //p')
+          if [ -z "$IMG" ]; then
+            echo "failed to load smoke image"
+            exit 1
+          fi
+          echo "loaded $IMG"
+          docker run -d --name rustdesk-smoke -p 21114:21114 "$IMG"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:21114/" || true)
+            if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then
+              echo "API responded on 21114 (HTTP $CODE) after ${i} attempt(s)"
+              docker logs rustdesk-smoke || true
+              docker stop rustdesk-smoke >/dev/null
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not respond on 21114 within 60s"
+          docker logs rustdesk-smoke || true
+          exit 1

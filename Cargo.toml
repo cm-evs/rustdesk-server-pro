@@ -60,6 +60,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
+# Build OpenSSL from source instead of requiring a system copy: the CI
+# cross+musl containers (and the Windows runner) provide no OpenSSL, while
+# hbb_common enables native-tls on tungstenite. Feature unification applies
+# this to the single shared openssl-sys build on every target.
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 # https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support
@@ -70,6 +75,11 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+# Same vendored OpenSSL for the host-side build: resolver v2 resolves
+# build-dependency features separately, so the openssl-sys built for the
+# host (via hbb_common's native-tls) needs its own vendored enablement,
+# otherwise it looks for a system OpenSSL the CI containers don't have.
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [workspace]
 members = ["libs/hbb_common"]
