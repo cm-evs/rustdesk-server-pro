@@ -175,12 +175,12 @@ const I18N={zh:{
 'usr.pwd_prompt':'为 {n} 设置新密码（至少 6 位）','usr.pwd_reset':'已重置',
 'usr.create':'新建用户','usr.create_submit':'创建','usr.password':'密码','usr.new_name_ph':'用户名（3-32 位字母、数字、_-.)','usr.new_pass_ph':'密码（至少 6 位）','usr.created_ok':'用户已创建',
 'tok.title':'API key（供第三方系统集成）','tok.desc1':'请求带',
-'tok.desc2':'即可调用管理接口。API key 只在创建时显示一次。','tok.name':'名称',
-'tok.name_ph':'如：内部系统','tok.create':'添加 API key','tok.created':'创建时间',
+'tok.desc2':'即可调用管理接口。API key 只在创建时显示一次。','tok.remark':'备注',
+'tok.remark_ph':'如：内部系统','tok.create':'添加 API key','tok.created':'创建时间',
 'tok.last_used':'最近使用','tok.revoke':'吊销','tok.empty':'暂无 API key',
 'tok.new_label':'新 API key（只显示一次，请保存）：',
 'tok.revoke_confirm':'吊销 API key「{n}」？使用该 key 的程序将立即无法访问，吊销不可恢复。',
-'tok.revoke_failed':'吊销失败','tok.save_name':'保存名称',
+'tok.revoke_failed':'吊销失败','tok.save_remark':'保存备注',
 'gen.title':'生成预绑定客户端',
 'gen.desc':'生成的安装包已内置本服务器地址与密钥（编码进文件名，界面不显示服务器与密钥设置）。把下载链接发给用户即可，用户安装后直接登录账号使用。',
 'gen.label':'备注（可选）','gen.label_ph':'如：公司办公电脑','gen.btn':'生成 Windows 客户端',
@@ -336,11 +336,11 @@ const I18N={zh:{
 'usr.create':'Create user','usr.create_submit':'Create','usr.password':'Password','usr.new_name_ph':'Username (3-32 letters, digits, _-.)','usr.new_pass_ph':'Password (at least 6 characters)','usr.created_ok':'User created',
 'tok.title':'API keys (for third-party integrations)','tok.desc1':'Send requests with',
 'tok.desc2':'to call the management APIs. An API key is shown only once, when created.',
-'tok.name':'Name','tok.name_ph':'e.g. internal system','tok.create':'Add API key',
+'tok.remark':'Remark','tok.remark_ph':'e.g. internal system','tok.create':'Add API key',
 'tok.created':'Created','tok.last_used':'Last used','tok.revoke':'Revoke','tok.empty':'No API keys yet',
 'tok.new_label':'New API key (shown only once, please save it):',
 'tok.revoke_confirm':'Revoke API key “{n}”? Applications using it will immediately lose access. This cannot be undone.',
-'tok.revoke_failed':'Failed to revoke','tok.save_name':'Save name',
+'tok.revoke_failed':'Failed to revoke','tok.save_remark':'Save remark',
 'gen.title':'Generate Pre-configured Client',
 'gen.desc':'The generated installer has this server address and key built in (encoded in the file name; the server and key settings are hidden in the client UI). Share the download link with users; they can sign in with their account right after installing.',
 'gen.label':'Remark (optional)','gen.label_ph':'e.g. office PC','gen.btn':'Generate Windows Client',
@@ -752,7 +752,6 @@ const CONSOLE_BODY: &str = r#"
 <div class="card"><h2 data-i18n="tok.title">API key（供第三方系统集成）</h2>
 <p class="muted"><span data-i18n="tok.desc1">请求带</span> <code>Authorization: Bearer rdt_...</code> <span data-i18n="tok.desc2">即可调用管理接口。API key 只在创建时显示一次。</span></p>
 <div class="err" id="tok-err"></div><div class="ok" id="tok-new"></div>
-<label for="tok-name" data-i18n="tok.name">名称</label><input id="tok-name" placeholder="如：内部系统" data-i18n-ph="tok.name_ph">
 <button id="tok-create" data-i18n="tok.create">添加 API key</button>
 <div id="tok-list" style="margin-top:12px" data-i18n="app.loading">加载中…</div></div>
 </section>
@@ -1200,15 +1199,14 @@ async function loadTokens(){
   let j; try{ j=await api('/api/tokens'); }catch(e){ if(e.message!=='unauth')loadFail($('tok-list'),'loadTokens'); return; }
   if(!j.ok){ loadFail($('tok-list'),'loadTokens',j.error); return; }
   TOKENS=j.tokens;
-  $('tok-list').innerHTML=j.tokens.length?tableOpen(t('tok.title'),[t('tok.name'),t('tok.created'),t('tok.last_used'),''],560,'','<colgroup><col style="width:30%"><col style="width:25%"><col style="width:25%"><col style="width:20%"></colgroup>')+
+  $('tok-list').innerHTML=j.tokens.length?tableOpen(t('tok.title'),[t('tok.remark'),t('tok.created'),t('tok.last_used'),''],560,'','<colgroup><col style="width:30%"><col style="width:25%"><col style="width:25%"><col style="width:20%"></colgroup>')+
     j.tokens.map((t,i)=>`<tr><td class="trunc" title="${esc(t.name)}">${esc(t.name)}</td><td class="trunc" title="${esc(new Date(t.created_at*1000).toLocaleString())}">${new Date(t.created_at*1000).toLocaleString()}</td><td class="trunc" title="${t.last_used_at?esc(new Date(t.last_used_at*1000).toLocaleString()):'-'}">${t.last_used_at?new Date(t.last_used_at*1000).toLocaleString():'-'}</td><td><button class="danger" onclick="tdel(${i})">${window.t('tok.revoke')}</button></td></tr>`).join('')+TABLE_CLOSE:'<p class="muted">'+t('tok.empty')+'</p>';
 }
 $('tok-create').onclick=async()=>{
   const btn=$('tok-create'); if(btn.disabled)return; btn.disabled=true;
   try{
-    const nm=$('tok-name').value;
-    const j=await api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})});
-    if(j.ok){$('tok-err').textContent='';$('tok-new').innerHTML=t('tok.new_label')+'<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">'+t('app.copy')+'</button></div><div style="margin-top:6px"><button class="ghost" id="tok-save-name" onclick="tren('+j.id+')">'+t('tok.save_name')+'</button></div><div style="margin-top:6px"><button class="ghost" id="tok-close" onclick="document.getElementById(\'tok-new\').innerHTML=\'\'">'+t('app.close')+'</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||t('app.failed');}
+    const j=await api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    if(j.ok){$('tok-err').textContent='';$('tok-new').innerHTML=t('tok.new_label')+'<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">'+t('app.copy')+'</button></div><div style="margin-top:6px"><label for="tok-new-remark">'+t('tok.remark')+'</label><input id="tok-new-remark" placeholder="'+t('tok.remark_ph')+'"></div><div style="margin-top:6px"><button class="ghost" id="tok-save-name" onclick="tren('+j.id+')">'+t('tok.save_remark')+'</button> <button class="ghost" id="tok-close" onclick="document.getElementById(\'tok-new\').innerHTML=\'\'">'+t('app.close')+'</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||t('app.failed');}
   }catch(e){ if(e.message!=='unauth')$('tok-err').textContent=t('app.network_err'); }
   btn.disabled=false;
 };
@@ -1218,7 +1216,7 @@ async function tdel(i){
   const j=await api('/api/tokens/'+t.id,{method:'DELETE'}); if(j.ok)loadTokens(); else alert(j.error||window.t('tok.revoke_failed'));
 }
 async function tren(id){
-  const j=await api('/api/tokens/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('tok-name').value})});
+  const j=await api('/api/tokens/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('tok-new-remark').value})});
   if(j.ok)loadTokens(); else $('tok-err').textContent=j.error||t('app.failed');
 }
 let GEN=[];
