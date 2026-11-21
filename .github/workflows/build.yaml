@@ -33,6 +33,11 @@ env:
   LATEST_TAG: latest
   GHCR_IMAGE: ghcr.io/wirh/rustdesk-server-pro
   GHCR_IMAGE_CLASSIC: ghcr.io/wirh/rustdesk-server-pro-classic
+  # Docker Hub is optional: these flags say whether its secrets are set.
+  # (`secrets` cannot be used in `if` expressions, hence the indirection.)
+  DOCKER_HUB_LOGIN: ${{ secrets.DOCKER_HUB_USERNAME != '' }}
+  DOCKER_HUB_CONFIGURED: ${{ secrets.DOCKER_HUB_USERNAME != '' && secrets.DOCKER_IMAGE != '' }}
+  DOCKER_HUB_CLASSIC_CONFIGURED: ${{ secrets.DOCKER_HUB_USERNAME != '' && secrets.DOCKER_IMAGE_CLASSIC != '' }}
   
 jobs:
 
@@ -262,7 +267,7 @@ jobs:
         uses: docker/setup-buildx-action@v2
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request' && secrets.DOCKER_HUB_USERNAME != ''
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -353,7 +358,7 @@ jobs:
     steps:
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request' && secrets.DOCKER_HUB_USERNAME != ''
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -383,7 +388,7 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: secrets.DOCKER_IMAGE != ''
+        if: env.DOCKER_HUB_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-i386
@@ -392,7 +397,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true' && secrets.DOCKER_IMAGE != ''
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-i386
@@ -401,7 +406,7 @@ jobs:
       # manifest for :latest tag
       - name: Create and push manifest (:latest)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true' && secrets.DOCKER_IMAGE != ''
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-i386
@@ -472,7 +477,7 @@ jobs:
         uses: docker/setup-buildx-action@v2
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request' && secrets.DOCKER_HUB_USERNAME != ''
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -546,7 +551,7 @@ jobs:
     steps:
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request' && secrets.DOCKER_HUB_USERNAME != ''
+        if: github.event_name != 'pull_request' && env.DOCKER_HUB_LOGIN == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -576,7 +581,7 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: secrets.DOCKER_IMAGE_CLASSIC != ''
+        if: env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-armv7
@@ -585,7 +590,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true' && secrets.DOCKER_IMAGE_CLASSIC != ''
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
@@ -594,7 +599,7 @@ jobs:
       # manifest for :latest tag
       - name: Create and push manifest (:latest)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true' && secrets.DOCKER_IMAGE_CLASSIC != ''
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-armv7
