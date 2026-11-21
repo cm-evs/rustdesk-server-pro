@@ -49,7 +49,7 @@ cd rustdesk-server-pro-linux-*
 ## hbbs 新增参数
 
 ```
---api-listen 0.0.0.0:21114   API/后台监听地址（默认即此值；off 关闭）
+--api-listen [::]:21114   API/后台监听地址（默认即此值；off 关闭）
 --api-db api_v1.sqlite3      账号数据库文件（默认服务端目录，见 v21）
 ```
 
@@ -131,7 +131,7 @@ cd rustdesk-server-pro-linux-*
 - 原理：hbbs 的 `-p`（默认 21116）决定中继/ID 端口（附带 NAT
   测试端口 -1、WebSocket +2）；hbbr 的 `-p`（默认 21117）决定
   中继端口（WebSocket +2）；hbbs 的 `--api-listen`（默认
-  0.0.0.0:21114）决定 API/控制台端口。客户端连接时，带端口
+  [::]:21114）决定 API/控制台端口。客户端连接时，带端口
   的地址优先于默认端口，所以生成客户端会把当前生效端口嵌进
   配置里。
 - 改法：编辑程序目录下的 server.env（没有就从
@@ -524,13 +524,26 @@ cd rustdesk-server-pro-linux-*
 - 验证：cargo test 123/123（debug 与 release 各两遍；lib 108 + hbbr 14 + 集成 1）；更新按钮端到端 12/12、Token 改名 HTTP 19/19、Token 改名界面 17/17、截断展开 30/30（debug 与 release 各两遍）；全量回归 104 次运行全绿（控制台 28/28 ×2、模板 40/40 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 34/34 ×2、审计 45/45 ×2、审计界面 41/41 ×2、地址簿 27/27 ×2、自助改密码 40/40 ×2、自助改密码界面 37/37 ×2、审计回收 26/26 ×2、控制台布局 294/294 ×2、更新按钮 12/12 ×2、Token 改名 19/19 ×2、Token 改名界面 17/17 ×2、截断展开 30/30 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs 与 src/api_pages.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动。
 - 真机确认项：无更新结果后检测更新按钮能再点；创建 token 后在横幅里改名，列表里名称更新，关闭按钮清掉横幅；设备列表里点系统列的截断格展开全文，再点收起。
 
+## v45：中继详情地址回退 + API key 页重做 + API 监听默认 IPv6 + Docker 镜像
+
+- 背景（2026-11-21）：(1) 中继节点详情页的地址一直不上报——数据其实每次心跳都在收（来源 IP 与监听端口），缺的只是详情页的回退显示与端口行。(2) v44 的 Token 横幅预填了 "default"，打字会拼成 "default11111"；页面术语与操作需要收拢。(3) issue #12 第一部分：Docker on ARM iStoreOS 下 IPv6 不通，--api-listen 默认只绑 IPv4。(4) Docker 部署需要官方镜像与本地构建脚本。
+- 新增：中继详情页地址回退。节点详情的地址在未配置时回退到最近一次心跳的来源 IP（last_ip），并新增监听端口行。
+- 新增：API Token 页重做。界面统称 API key；创建与改名共用一个名称框；创建按钮改叫「添加 API key」；创建时不再预填 "default"（修掉预填值与输入拼接的坑）；关闭按钮清掉横幅。
+- 新增：--api-listen 默认 [::]:21114（Refs #12）。API/控制台监听默认绑 IPv6 通配地址，IPv6 客户端可直连；绑不上 IPv6 时（主机无 IPv6 或地址未分配）自动回退到同端口 0.0.0.0 并打一条警告，不影响启动。回退逻辑与 --console-listen 平面共用，其默认值不变；21116/21118 会合监听不动。start.sh/start.ps1 与 rdsvc 改传 [::]:$API_PORT。issue #12 的双 IPv6 部分（br-lan 与 pppoe-wan 两个 IPv6 地址）仍在等报告者日志，issue 保持开启。
+- 集成修复：(1) TLS 分支的监听 socket 在交给 tokio 前需设为 nonblocking，否则首次 accept 时 panic（v23 HTTPS 端到端抓到）；(2) last_ip 记录时把 ::ffff: 映射地址还原为纯 IPv4，否则中继详情页显示 ::ffff: 地址（中继详情端到端抓到）。
+- 新增：Docker 镜像。GitHub Actions 在版本标签推送后自动构建并发布到 GHCR：ghcr.io/wirh/rustdesk-server-pro（s6 镜像）与 ghcr.io/wirh/rustdesk-server-pro-classic（classic 镜像）；整数版标签（如 v45）移动 latest 与主版本标签，预览版标签（如 v45.1）不移动 latest。本地构建：./docker/build-local.sh，默认用 ~/workspace/dist-pro 里最新的 linux-x86_64-glibc 包，加 --classic 构建 classic 镜像。Docker Hub 镜像待配置仓库 secrets 后再推，本版暂不提供。
+- 文案：中英文切换覆盖全部新文案（1 个新键：app.close，字典 338/338 对齐）。
+- 升级：停服 → 换 hbbs + Windows 服务换 rdsvc.exe + 启动脚本 → 启动（hbbr、地理库不变）。旧 rdsvc 显式传 0.0.0.0 会覆盖新默认，不换则 [::] 修复不生效；Linux start.sh 同理。一键更新只换 hbbs，rdsvc 与脚本需手动换；手动安装到 Release 页面下载对应平台的包，解压后替换 hbbs、rdsvc.exe 与启动脚本。
+- 验证：cargo test 128/128（debug 与 release 各两遍；lib 113 + hbbr 14 + 集成 1）；API key HTTP 25/25、API key 界面 35/35、中继详情界面 30/30、监听 9/9（debug 与 release 各两遍）；全量回归 116 次运行全绿（控制台 28/28 ×2、模板 40/40 ×2、锚定 17/17 ×2、配置 38/38 ×2、专项 69/69 ×2、就近选路 12/12 ×2、下载 50/50 ×2、语言切换 43/43 ×2、必须登录 21/21 ×2、中继 68/68 ×2、KX 25/25 ×2、hash 路由 38/38 ×2、最近中继 25/25 ×2、用户管理 33/33 ×2、用户管理界面 34/34 ×2、审计 45/45 ×2、审计界面 41/41 ×2、地址簿 27/27 ×2、自助改密码 40/40 ×2、自助改密码界面 37/37 ×2、审计回收 26/26 ×2、控制台布局 294/294 ×2、更新按钮 12/12 ×2、Token 改名 19/19 ×2、截断展开 30/30 ×2、API key 25/25 ×2、API key 界面 35/35 ×2、中继详情界面 30/30 ×2、监听 9/9 ×2），debug 与 release 均通过；ARM 两个变体 qemu 控制台套件 28/28 ×2。本版 Rust 改动集中在 src/api.rs、src/api_pages.rs 与 src/main.rs（全平台统一逻辑），无新增 Windows/release 专属分支；hbbr 不动；Windows 与 ARM 交叉构建在 vendored OpenSSL 下全部通过（musl 不再需要目标专属 OPENSSL_DIR）。
+- 真机确认项：中继详情页显示心跳来源 IP 与监听端口；API key 页创建/改名/关闭操作正常；用户服务器上 [::] 监听生效（IPv6 客户端能连控制台，IPv4 客户端不受影响）；Docker 镜像在 v45 标签推送后由 CI 构建发布到 GHCR。
+
 ## API 调用说明
 
 服务端在 API 端口上提供 HTTP 接口：官方客户端用的登录/设备协议接口，以及控制台用的管理接口（生成客户端、设备列表、在线更新等）。本节以 src/api.rs 的实际路由表为准；示例中的 token、密钥已截断或替换为占位符，格式与真实返回一致。以下示例均已在本地 hbbs 上实测跑通（curl 实测：`/api/me`、`/api/devices`、`/api/client-config`、`/api/client-downloads`、`/api/admin/update/status`、`/api/tokens`、`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/admin/gen-client`、`/api/admin/gen-clients`、下载链接及删除后失效）。
 
 ### Base URL
 
-默认 `http://<服务器地址>:21114`（`--api-listen` 默认 `0.0.0.0:21114`，可改地址/端口，`off` 关闭）。开启 TLS（`--tls-cert` / `--tls-key`）后用 `https://`。管理面拆分后（`--console-listen`，见 v23 一节）注意区分两个地址：
+默认 `http://<服务器地址>:21114`（`--api-listen` 默认 `[::]:21114`，可改地址/端口，`off` 关闭）。开启 TLS（`--tls-cert` / `--tls-key`）后用 `https://`。管理面拆分后（`--console-listen`，见 v23 一节）注意区分两个地址：
 
 - API 地址（21114）：客户端协议接口（`/api/login`、`/api/peers`、`/api/users`、`/api/currentUser`、`/api/heartbeat`、`/api/sysinfo`、`/api/ab`、`/api/sysinfo_ver`、`/api/oidc/*`）+ 下载链接 `/dl/*` + `/oidc/login`；
 - Console 地址：控制台页面（`/console/*`）与管理接口（`/api/auth/*`、`/api/me`、`/api/client-config`、`/api/admin/*`、`/api/devices`、`/api/tokens*`）。

@@ -55,6 +55,7 @@ A self-hosted remote desktop server based on the official open-source [rustdesk-
 - **v42**: console UX fixes (Cancel button on the change-password panel, user list as the main view of user management) + template version check (skips re-downloading when the local template is already the latest version)
 - **v43**: audit session reaping (sessions with a lost close record end by heartbeat, sessions on devices offline over 24 hours end as offline) + relay inference (public_host joins the relay IP set) + console tables rebuilt per the responsive-table guide (scroll container, sticky headers, stacked cards on narrow screens)
 - **v44**: update-check button fix (the button is re-enabled after a no-update result) + token rename after creation (create returns the id, rename in the banner) + click truncated table cells to expand the full text (mouse, keyboard, and touch)
+- **v45**: relay detail address falls back to the heartbeat IP + new listen port row + API Token page reworked as API key (one shared name input, "Add API key", no more "default" prefill) + --api-listen defaults to [::]:21114 (Refs #12, falls back to 0.0.0.0 when IPv6 cannot be bound) + Docker images (built by CI and published to GHCR; integer releases move latest)
 
 ## Quick start
 
