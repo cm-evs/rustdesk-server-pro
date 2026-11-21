@@ -2500,18 +2500,83 @@ struct AuditSessionAcc {
 /// the live list and neither rule touches it.
 const AUDIT_OFFLINE_SECS: i64 = 86400;
 
+/// Parse a YYYY-MM-DD audit date into the server-local day span
+/// [start, end] as unix epoch seconds (inclusive, 00:00:00 to
+/// 23:59:59 local). The date is a plain calendar date with no zone
+/// attached (as sent by the native `<input type="date">`); the
+/// server's local zone is attached here, explicitly: the console
+/// shows session times in the operator's local time and the server
+/// is self-hosted in the operator's zone, so a picked date covers
+/// the calendar day the operator sees. Returns None on a malformed
+/// date or a day with no local midnight (DST gap).
+fn audit_date_span(s: &str) -> Option<(i64, i64)> {
+    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let start = d
+        .and_hms_opt(0, 0, 0)?
+        .and_local_timezone(chrono::Local)
+        .earliest()?
+        .timestamp();
+    let end = d
+        .succ_opt()
+        .and_then(|n| n.and_hms_opt(0, 0, 0))
+        .and_then(|dt| dt.and_local_timezone(chrono::Local).earliest())
+        .map(|z| z.timestamp().saturating_sub(1))
+        .unwrap_or_else(|| start.saturating_add(86399));
+    Some((start, end))
+}
+
+/// Resolve the from/to query params of GET /api/audit/sessions
+/// into (since, until) epoch bounds. Either end may be absent
+/// (open); an empty string counts as absent. from > to and
+/// malformed dates are errors. When either param is present the
+/// caller ignores `days`.
+fn audit_date_range(
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<(Option<i64>, Option<i64>), &'static str> {
+    let from = from.filter(|s| !s.is_empty());
+    let to = to.filter(|s| !s.is_empty());
+    let since = match from {
+        Some(s) => Some(
+            audit_date_span(s)
+                .ok_or("起始日期格式无效（YYYY-MM-DD）")?
+                .0,
+        ),
+        None => None,
+    };
+    let until = match to {
+        Some(s) => Some(
+            audit_date_span(s)
+                .ok_or("结束日期格式无效（YYYY-MM-DD）")?
+                .1,
+        ),
+        None => None,
+    };
+    if let (Some(a), Some(b)) = (since, until) {
+        if a > b {
+            return Err("起始日期不能晚于结束日期");
+        }
+    }
+    Ok((since, until))
+}
+
 /// Assemble sessions from audit_conn rows (newest first, capped at
 /// 20000 events so an unbounded table cannot blow up the console
-/// request). `since` filters by server receipt time (None = all).
-async fn audit_session_rows(
+/// request). `since`/`until` filter by server receipt time
+/// (None = open end). A session appears when at least one of its
+/// events falls inside the window; its shown start/end reflect
+/// in-window events only.
+async fn audit_session_rows_range(
     pool: &SqlitePool,
     since: Option<i64>,
+    until: Option<i64>,
 ) -> Result<Vec<AuditSessionRow>, String> {
     let rows = sqlx::query(
         "select device_id, conn_id, action, ip, peer_id, peer_name, conn_type, received_at \
-         from audit_conn where received_at >= ? order by received_at desc limit 20000",
+         from audit_conn where received_at >= ? and received_at <= ? order by received_at desc limit 20000",
     )
     .bind(since.unwrap_or(0))
+    .bind(until.unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -2660,6 +2725,15 @@ async fn audit_session_rows(
     Ok(out)
 }
 
+/// `audit_session_rows_range` with an open upper end (the `days`
+/// window only needs a lower bound).
+async fn audit_session_rows(
+    pool: &SqlitePool,
+    since: Option<i64>,
+) -> Result<Vec<AuditSessionRow>, String> {
+    audit_session_rows_range(pool, since, None).await
+}
+
 fn audit_session_json(r: &AuditSessionRow) -> Value {
     json!({
         "device_id": r.device_id,
@@ -2780,12 +2854,22 @@ async fn audit_sessions(
         .get("q")
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
-    let since = if days == 0 {
-        None
-    } else {
-        Some(now() - days * 86400)
+    let (since, until) = {
+        let from = q.get("from").map(|s| s.as_str());
+        let to = q.get("to").map(|s| s.as_str());
+        if from.is_some_and(|s| !s.is_empty()) || to.is_some_and(|s| !s.is_empty()) {
+            // Explicit dates win over the relative `days` window.
+            match audit_date_range(from, to) {
+                Ok(r) => r,
+                Err(e) => return err_resp(StatusCode::BAD_REQUEST, e),
+            }
+        } else if days == 0 {
+            (None, None)
+        } else {
+            (Some(now() - days * 86400), None)
+        }
     };
-    let rows = match audit_session_rows(&st.pool, since).await {
+    let rows = match audit_session_rows_range(&st.pool, since, until).await {
         Ok(r) => r,
         Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
@@ -7407,6 +7491,41 @@ mod tests {
     }
 
     #[test]
+    fn audit_date_range_parsing() {
+        // Malformed dates are rejected.
+        assert!(audit_date_range(Some("2026-13-01"), None).is_err());
+        assert!(audit_date_range(Some("2026-02-30"), None).is_err());
+        assert!(audit_date_range(Some("not-a-date"), None).is_err());
+        assert!(audit_date_range(Some("2026/01/01"), None).is_err());
+        assert!(audit_date_range(None, Some("2026-00-10")).is_err());
+        // from after to is rejected; same day is fine.
+        assert!(audit_date_range(Some("2026-01-02"), Some("2026-01-01")).is_err());
+        assert!(audit_date_range(Some("2026-01-01"), Some("2026-01-01")).is_ok());
+        // Empty strings count as absent (open ends).
+        assert_eq!(
+            audit_date_range(Some(""), Some("")).expect("empty"),
+            (None, None)
+        );
+        assert_eq!(audit_date_range(None, None).expect("none"), (None, None));
+        // One-sided ranges leave the other end open.
+        let (since, until) = audit_date_range(Some("2026-01-01"), None).expect("from only");
+        assert!(since.is_some());
+        assert_eq!(until, None);
+        let (since, until) = audit_date_range(None, Some("2026-01-01")).expect("to only");
+        assert_eq!(since, None);
+        assert!(until.is_some());
+        // Adjacent days tile exactly: no gap, no overlap, whatever
+        // the server zone (spans are computed per-day, DST-safe).
+        let (a0, a1) = audit_date_span("2026-01-01").expect("span d1");
+        let (b0, b1) = audit_date_span("2026-01-02").expect("span d2");
+        assert!(a0 < a1 && b0 < b1);
+        assert_eq!(b0, a1 + 1);
+        // A full day is 23-25 h (DST transitions), normally 24 h.
+        assert!((82799..=89999).contains(&(a1 - a0)));
+        assert!((82799..=89999).contains(&(b1 - b0)));
+    }
+
+    #[test]
     fn audit_sessions_scoping() {
         v39_block(async {
             let (st, path) = v39_test_state("audit-scope").await;
@@ -7464,6 +7583,68 @@ mod tests {
             assert_eq!(s, StatusCode::OK);
             assert_eq!(v["total"].as_i64().unwrap_or(-1), 3);
             assert_eq!(v["sessions"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn audit_sessions_from_to_filter() {
+        v39_block(async {
+            let (st, path) = v39_test_state("audit-range").await;
+            create_user(&st.pool, "admin", "admin123").await.expect("admin");
+            v40_seed_device(&st, "111", "dXV1aWQx", Some("alice")).await;
+            // Three closed sessions on three consecutive days; the
+            // day-2 session starts exactly at 00:00 and closes
+            // exactly at 23:59:59 (boundary inclusion).
+            let (d1s, _) = audit_date_span("2026-01-10").expect("d1");
+            let (d2s, d2e) = audit_date_span("2026-01-11").expect("d2");
+            let (d3s, _) = audit_date_span("2026-01-12").expect("d3");
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 1, "r-1a", "new", "10.0.0.1", d1s + 43200).await;
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 1, "r-1b", "close", "10.0.0.1", d1s + 43260).await;
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 2, "r-2a", "new", "10.0.0.1", d2s).await;
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 2, "r-2b", "close", "10.0.0.1", d2e).await;
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 3, "r-3a", "new", "10.0.0.1", d3s + 43200).await;
+            v43_seed_audit(&st.pool, "111", "dXV1aWQx", 3, "r-3b", "close", "10.0.0.1", d3s + 43260).await;
+            let admin_sid = new_web_session(&st, "admin").await.expect("admin sid");
+            // Both ends: only the day-2 session, boundary events included.
+            let mut q = HashMap::new();
+            q.insert("from".to_string(), "2026-01-11".to_string());
+            q.insert("to".to_string(), "2026-01-11".to_string());
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 1);
+            assert_eq!(v["sessions"][0]["conn_id"].as_i64().unwrap_or(-1), 2);
+            // from only: day 2 + day 3.
+            let mut q = HashMap::new();
+            q.insert("from".to_string(), "2026-01-11".to_string());
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 2);
+            // to only: day 1 + day 2.
+            let mut q = HashMap::new();
+            q.insert("to".to_string(), "2026-01-11".to_string());
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 2);
+            // from/to beats days: days=1 would match nothing this
+            // old, but the explicit window still returns day 2.
+            let mut q = HashMap::new();
+            q.insert("from".to_string(), "2026-01-11".to_string());
+            q.insert("to".to_string(), "2026-01-11".to_string());
+            q.insert("days".to_string(), "1".to_string());
+            let (s, v) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["total"].as_i64().unwrap_or(-1), 1);
+            // Invalid dates and from > to are 400.
+            let mut q = HashMap::new();
+            q.insert("from".to_string(), "2026-02-30".to_string());
+            let (s, _) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            let mut q = HashMap::new();
+            q.insert("from".to_string(), "2026-01-12".to_string());
+            q.insert("to".to_string(), "2026-01-10".to_string());
+            let (s, _) = v40_sessions(&st, v39_sid_headers(&admin_sid), q).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
             let _ = std::fs::remove_file(&path);
         });
     }
