@@ -81,6 +81,8 @@ code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:13px}
 .langrow{display:flex;gap:6px;justify-content:flex-end;margin-bottom:12px}
 button.langbtn.active{background:#1f6feb;border-color:#1f6feb}
 .badge{display:inline-block;background:#1f6feb33;border:1px solid #1f6feb;color:#58a6ff;border-radius:4px;padding:1px 6px;font-size:12px;margin-left:6px;white-space:nowrap}
+footer{border-top:1px solid #30363d;margin-top:8px;padding:16px 0 8px}
+footer h2{font-size:14px}
 "#;
 
 // Shared i18n dictionary + helpers, injected into every page by page().
@@ -244,7 +246,8 @@ const I18N={zh:{
 'aud.col_started':'开始时间','aud.col_controller':'控制端','aud.col_controlled':'被控端',
 'aud.col_ip':'控制端 IP','aud.col_relay':'中继/直连','aud.col_duration':'时长','aud.col_status':'状态',
 'aud.relayed':'中继','aud.direct':'直连','aud.unknown':'—','aud.open':'进行中','aud.closed':'已结束','aud.closed_stale':'（无关闭记录）','aud.closed_offline':'（设备离线）',
-'aud.empty':'暂无审计记录。','aud.page':'第 {p} / {n} 页（共 {t} 条）','aud.prev':'上一页','aud.next':'下一页'
+'aud.empty':'暂无审计记录。','aud.page':'第 {p} / {n} 页（共 {t} 条）','aud.prev':'上一页','aud.next':'下一页',
+'about.title':'关于项目','about.intro':'自托管远程桌面服务端，内置账号体系、网页控制台、客户端生成、中继节点管理与连接审计。基于开源 RustDesk Server。','about.home_label':'项目主页：'
 },en:{
 'app.title':'RustDesk Server Console','app.logout':'Sign out','app.loading':'Loading…',
 'app.load_failed':'Load failed','app.colon':': ','app.period':'. ','app.retry':'Retry',
@@ -402,7 +405,8 @@ const I18N={zh:{
 'aud.col_started':'Started','aud.col_controller':'Controller','aud.col_controlled':'Controlled',
 'aud.col_ip':'Controller IP','aud.col_relay':'Relay/Direct','aud.col_duration':'Duration','aud.col_status':'Status',
 'aud.relayed':'Relay','aud.direct':'Direct','aud.unknown':'—','aud.open':'In progress','aud.closed':'Ended','aud.closed_stale':'(no close record)','aud.closed_offline':'(device offline)',
-'aud.empty':'No audit records yet.','aud.page':'Page {p} / {n} ({t} total)','aud.prev':'Previous','aud.next':'Next'
+'aud.empty':'No audit records yet.','aud.page':'Page {p} / {n} ({t} total)','aud.prev':'Previous','aud.next':'Next',
+'about.title':'About','about.intro':'Self-hosted remote desktop server with built-in accounts, web console, client generation, relay management, and connection audit. Based on open-source RustDesk Server.','about.home_label':'Project homepage: '
 }};
 function curLang(){try{const l=localStorage.getItem('rdp-lang');return l==='en'?'en':'zh';}catch(e){return 'zh';}}
 function t(k){const d=I18N[curLang()]||I18N.zh;if(d[k]!=null)return d[k];if(I18N.zh[k]!=null)return I18N.zh[k];return k;}
@@ -764,6 +768,11 @@ const CONSOLE_BODY: &str = r#"
 </div>
 <p class="muted" data-i18n="set.upd_desc">更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。</p></div>
 </section>
+<footer>
+<h2 data-i18n="about.title">关于项目</h2>
+<p class="muted" data-i18n="about.intro">自托管远程桌面服务端，内置账号体系、网页控制台、客户端生成、中继节点管理与连接审计。基于开源 RustDesk Server。</p>
+<p class="muted"><span data-i18n="about.home_label">项目主页：</span><a href="https://github.com/wirh/rustdesk-server-pro" target="_blank" rel="noopener">github.com/wirh/rustdesk-server-pro</a></p>
+</footer>
 </div>
 
 <script>
