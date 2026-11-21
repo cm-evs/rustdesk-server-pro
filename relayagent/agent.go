@@ -20,6 +20,7 @@ type Agent struct {
 	linkKey  []byte
 	api      *apiClient
 	sup      *supervisor
+	pubIP    *publicIPDetector
 	interval time.Duration
 
 	mu         sync.Mutex
@@ -51,6 +52,7 @@ func buildAgent(dir string, stdout bool) (*Agent, error) {
 		dir: dir, log: log, state: state, linkKey: linkKey,
 		api:      newAPIClient(state.Server),
 		sup:      sup,
+		pubIP:    newPublicIPDetector(),
 		interval: defaultHeartbeatInterval,
 	}, nil
 }
@@ -75,6 +77,12 @@ func (a *Agent) Run(stopCh <-chan struct{}) {
 	a.log.Logf("relay-agent %s 启动，节点 %d（%s），服务端 %s",
 		agentVersion, a.state.NodeID, a.state.Name, a.state.Server)
 	a.sup.Start()
+	// Detect the public IP before the first heartbeat so the
+	// console shows it from the start; re-detects run hourly in
+	// the background. Each lookup attempt has a short timeout, so
+	// a dead service delays startup by seconds at most.
+	a.pubIP.refresh(a.log)
+	go a.pubIP.recheckLoop(stopCh, a.log)
 	a.doHeartbeat()
 	if a.Revoked() {
 		a.waitStop(stopCh)
@@ -115,6 +123,9 @@ func (a *Agent) collectStatus() heartbeatStatus {
 		HbbrVersion:  a.sup.Version(),
 		AgentVersion: agentVersion,
 		ListenPort:   a.sup.Port(),
+	}
+	if a.pubIP != nil {
+		st.PublicIP = a.pubIP.Current()
 	}
 	if !a.sup.Running() {
 		return st
