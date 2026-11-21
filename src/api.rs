@@ -5955,15 +5955,25 @@ fn load_tls_config(
 /// assigned locally). Returns the bound listener and the address it
 /// actually listens on. An IPv4 bind failure, or a failed fallback bind,
 /// returns the original error.
+///
+/// The returned listener is nonblocking: the TLS branch hands it to
+/// tokio via `TcpListener::from_std`, which panics on the first accept
+/// when the socket is still blocking. (The plain-HTTP branch passes it
+/// to axum, which also requires a nonblocking socket.)
 fn bind_listener_with_v6_fallback(
     addr: SocketAddr,
 ) -> std::io::Result<(std::net::TcpListener, SocketAddr)> {
-    match std::net::TcpListener::bind(addr) {
+    let bind_nonblocking = |a: SocketAddr| -> std::io::Result<std::net::TcpListener> {
+        let listener = std::net::TcpListener::bind(a)?;
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    };
+    match bind_nonblocking(addr) {
         Ok(listener) => Ok((listener, addr)),
         Err(e) => {
             if addr.is_ipv6() {
                 let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
-                if let Ok(listener) = std::net::TcpListener::bind(v4) {
+                if let Ok(listener) = bind_nonblocking(v4) {
                     log::warn!("failed to bind {addr} ({e}); falling back to {v4}");
                     return Ok((listener, v4));
                 }
@@ -8385,6 +8395,27 @@ mod tests {
         let (listener, effective) = bind_listener_with_v6_fallback(addr).unwrap();
         assert!(effective.is_ipv6() || effective.is_ipv4());
         assert_ne!(listener.local_addr().unwrap().port(), 0);
+    }
+
+    #[test]
+    fn listen_helper_listener_is_nonblocking_for_tokio() {
+        // Regression: the TLS branch hands this listener to
+        // tokio::net::TcpListener::from_std, which panics on the first
+        // accept when the socket is still blocking ("Registering a
+        // blocking socket with the tokio runtime is unsupported").
+        // Accepting one connection here proves the socket is nonblocking.
+        v39_block(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let (listener, _) = bind_listener_with_v6_fallback(addr).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accept = tokio::spawn(async move { listener.accept().await });
+            let _stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (socket, _) = accept.await.unwrap().unwrap();
+            drop(socket);
+        });
     }
 
 }
