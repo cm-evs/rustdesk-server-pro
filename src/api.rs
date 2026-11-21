@@ -2324,6 +2324,20 @@ fn norm_ip(s: &str) -> Option<std::net::IpAddr> {
     })
 }
 
+/// Stringify a peer IP for storage/display, mapping IPv4-mapped IPv6
+/// (::ffff:1.2.3.4) to plain IPv4. The API listener is dual-stack
+/// ([::]) since v45, so IPv4 peers arrive in mapped form; without this
+/// the relay detail page would show ::ffff: addresses.
+fn peer_ip_string(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        v4 => v4.to_string(),
+    }
+}
+
 /// Resolve the --relay-servers list (comma-separated hosts, each a
 /// bare host, host:port or [ipv6]:port) to the set of IPs hbbr listens
 /// on. Domains resolve via ToSocketAddrs like test_if_valid_server;
@@ -5201,7 +5215,7 @@ async fn relay_register(
     let name = name.trim().chars().take(64).collect::<String>();
     let address = address.trim().chars().take(128).collect::<String>();
     let agent_version = agent_version.chars().take(32).collect::<String>();
-    let last_ip = addr.ip().to_string();
+    let last_ip = peer_ip_string(addr.ip());
     let config = relay_default_config();
     let ins = sqlx::query(
         "insert into relay_nodes(name, address, last_ip, link_key, key_delivered, registered_at, agent_version, config_json, config_version, created_by) values(?, ?, ?, ?, 1, ?, ?, ?, 1, ?) returning id",
@@ -5411,7 +5425,7 @@ async fn relay_heartbeat(
     } else {
         pending_command.clone()
     };
-    let last_ip = addr.ip().to_string();
+    let last_ip = peer_ip_string(addr.ip());
     let _ = sqlx::query(
         "update relay_nodes set last_heartbeat=?, last_ip=?, agent_version=?, hbbr_version=?, hbbr_running=?, hbbr_started_at=?, listen_port=?, sessions=?, total_kbps=?, applied_version=?, pending_command=? where id=?",
     )
@@ -8416,6 +8430,19 @@ mod tests {
             let (socket, _) = accept.await.unwrap().unwrap();
             drop(socket);
         });
+    }
+
+    #[test]
+    fn peer_ip_string_maps_mapped_v4_to_plain_v4() {
+        // The API listener is dual-stack ([::]) since v45, so IPv4
+        // peers arrive as ::ffff:a.b.c.d; stored/displayed addresses
+        // must stay plain IPv4. Real IPv6 addresses pass through.
+        let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(peer_ip_string(mapped), "127.0.0.1");
+        let v4: std::net::IpAddr = "27.45.254.164".parse().unwrap();
+        assert_eq!(peer_ip_string(v4), "27.45.254.164");
+        let v6: std::net::IpAddr = "2603:c022:8009:1f01::1".parse().unwrap();
+        assert_eq!(peer_ip_string(v6), "2603:c022:8009:1f01::1");
     }
 
 }
