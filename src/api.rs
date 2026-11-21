@@ -89,7 +89,7 @@ pub struct TplJob {
 /// NOTE: this deliberately does NOT live in version.rs — build.rs
 /// regenerates that file on every build (see hbb_common::gen_version)
 /// and would wipe a hand-written constant.
-const PRO_VERSION: &str = "45";
+const PRO_VERSION: &str = "46";
 
 /// Full installed version: the preview build's complete number (e.g.
 /// "45.1") when baked in at build time via PRO_FULL_VERSION (see
@@ -6892,8 +6892,8 @@ mod tests {
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
         assert_eq!(parse_pro_tag("v32 "), Some((32, 0)));
-        assert_eq!(current_pro_num(), 45);
-        assert_eq!(current_pro_version(), (45, 0));
+        assert_eq!(current_pro_num(), 46);
+        assert_eq!(current_pro_version(), (46, 0));
     }
 
     #[test]
