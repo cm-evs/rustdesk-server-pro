@@ -95,7 +95,7 @@ const I18N={zh:{
 'app.po':'（','app.pc':'）',
 'app.unknown_err':'未知错误','app.network_err':'网络错误，请重试','app.op_failed':'操作失败',
 'app.failed':'失败','app.copy':'复制','app.copied':'已复制','app.copy_failed':'复制失败',
-'app.download':'下载','app.delete':'删除','app.cancel':'取消',
+'app.download':'下载','app.delete':'删除','app.cancel':'取消','app.close':'关闭',
 'app.load_fail_refresh':'加载失败，请检查网络后刷新页面','app.who_admin':'（管理员）',
 'auth.username':'用户名','auth.password':'密码','auth.password_min':'密码（至少 6 位）',
 'auth.captcha':'验证码','auth.cap_img_ph':'输入图片中的字符','auth.cap_text_ph':'输入计算结果',
@@ -112,7 +112,7 @@ const I18N={zh:{
 'pwd.old_ph':'当前使用的密码','pwd.new_ph':'新密码（至少 6 位）','pwd.confirm_ph':'再次输入新密码',
 'pwd.submit':'确认修改','pwd.ok':'密码已修改。其他设备上的登录已失效，请用新密码重新登录。',
 'pwd.mismatch':'两次输入的新密码不一致','pwd.empty_old':'请输入旧密码','pwd.short':'新密码至少 6 位',
-'nav.overview':'概览','nav.devices':'设备','nav.audit':'审计日志','nav.users':'用户管理','nav.tokens':'API Token',
+'nav.overview':'概览','nav.devices':'设备','nav.audit':'审计日志','nav.users':'用户管理','nav.tokens':'API key',
 'nav.genclient':'生成客户端','nav.settings':'服务器设置',
 'ov.users':'注册用户','ov.devices':'已绑定设备','ov.peers':'已注册终端（hbbs）',
 'ov.about':'说明','ov.about_text':'客户端在「设置 → 网络」填入本服务器地址，或直接使用「生成客户端」里预绑定配置的安装包，即可配合账号登录使用。设备在客户端登录账号后会通过心跳自动绑定到所属用户。',
@@ -126,15 +126,15 @@ const I18N={zh:{
 'usr.created':'注册时间','usr.actions':'操作','usr.admin':'管理员','usr.regular':'普通',
 'usr.disabled':'已禁用','usr.active':'正常','usr.enable':'启用','usr.disable':'禁用',
 'usr.unadmin':'取消管理员','usr.make_admin':'设管理员','usr.reset_pwd':'重置密码',
-'usr.delete_confirm':'删除用户 {n}？该账号将无法登录，其设备变为未绑定，名下 API Token 同时吊销；删除不可恢复。',
+'usr.delete_confirm':'删除用户 {n}？该账号将无法登录，其设备变为未绑定，名下 API key 同时吊销；删除不可恢复。',
 'usr.pwd_prompt':'为 {n} 设置新密码（至少 6 位）','usr.pwd_reset':'已重置',
 'usr.create':'新建用户','usr.create_submit':'创建','usr.password':'密码','usr.new_name_ph':'用户名（3-32 位字母、数字、_-.)','usr.new_pass_ph':'密码（至少 6 位）','usr.created_ok':'用户已创建',
-'tok.title':'API Token（供第三方系统集成）','tok.desc1':'请求带',
-'tok.desc2':'即可调用管理接口。Token 只在创建时显示一次。','tok.name':'名称',
-'tok.name_ph':'如：内部系统','tok.create':'创建 Token','tok.created':'创建时间',
-'tok.last_used':'最近使用','tok.revoke':'吊销','tok.empty':'暂无 Token',
-'tok.new_label':'新 Token（只显示一次，请保存）：',
-'tok.revoke_confirm':'吊销 Token「{n}」？使用该 Token 的程序将立即无法访问，吊销不可恢复。',
+'tok.title':'API key（供第三方系统集成）','tok.desc1':'请求带',
+'tok.desc2':'即可调用管理接口。API key 只在创建时显示一次。','tok.name':'名称',
+'tok.name_ph':'如：内部系统','tok.create':'添加 API key','tok.created':'创建时间',
+'tok.last_used':'最近使用','tok.revoke':'吊销','tok.empty':'暂无 API key',
+'tok.new_label':'新 API key（只显示一次，请保存）：',
+'tok.revoke_confirm':'吊销 API key「{n}」？使用该 key 的程序将立即无法访问，吊销不可恢复。',
 'tok.revoke_failed':'吊销失败','tok.save_name':'保存名称',
 'gen.title':'生成预绑定客户端',
 'gen.desc':'生成的安装包已内置本服务器地址与密钥（编码进文件名，界面不显示服务器与密钥设置）。把下载链接发给用户即可，用户安装后直接登录账号使用。',
@@ -251,7 +251,7 @@ const I18N={zh:{
 'app.po':'(','app.pc':')',
 'app.unknown_err':'Unknown error','app.network_err':'Network error, please retry',
 'app.op_failed':'Operation failed','app.failed':'Failed','app.copy':'Copy','app.copied':'Copied',
-'app.copy_failed':'Copy failed','app.download':'Download','app.delete':'Delete','app.cancel':'Cancel','app.load_fail_refresh':'Failed to load. Check your network and refresh the page.',
+'app.copy_failed':'Copy failed','app.download':'Download','app.delete':'Delete','app.cancel':'Cancel','app.close':'Close','app.load_fail_refresh':'Failed to load. Check your network and refresh the page.',
 'app.who_admin':' (admin)',
 'auth.username':'Username','auth.password':'Password','auth.password_min':'Password (at least 6 characters)',
 'auth.captcha':'Captcha','auth.cap_img_ph':'Enter the characters in the image',
@@ -269,7 +269,7 @@ const I18N={zh:{
 'pwd.old_ph':'Your current password','pwd.new_ph':'New password (at least 6 characters)','pwd.confirm_ph':'Enter the new password again',
 'pwd.submit':'Confirm change','pwd.ok':'Password changed. Other devices have been signed out; sign in again with the new password.',
 'pwd.mismatch':'The new passwords do not match','pwd.empty_old':'Enter the current password','pwd.short':'The new password must be at least 6 characters',
-'nav.overview':'Overview','nav.devices':'Devices','nav.audit':'Audit Log','nav.users':'User Management','nav.tokens':'API Tokens',
+'nav.overview':'Overview','nav.devices':'Devices','nav.audit':'Audit Log','nav.users':'User Management','nav.tokens':'API keys',
 'nav.genclient':'Generate Client','nav.settings':'Server Settings',
 'ov.users':'Registered users','ov.devices':'Bound devices','ov.peers':'Registered endpoints (hbbs)',
 'ov.about':'About','ov.about_text':'In the client, fill in this server address under Settings → Network, or use a pre-configured installer from Generate Client, then sign in with an account. Devices are bound to their owner automatically via heartbeat after signing in.',
@@ -283,15 +283,15 @@ const I18N={zh:{
 'usr.created':'Registered','usr.actions':'Actions','usr.admin':'Admin','usr.regular':'Regular',
 'usr.disabled':'Disabled','usr.active':'Active','usr.enable':'Enable','usr.disable':'Disable',
 'usr.unadmin':'Remove admin','usr.make_admin':'Make admin','usr.reset_pwd':'Reset password',
-'usr.delete_confirm':'Delete user {n}? The account will no longer be able to sign in, its devices will become unbound, and its API tokens will be revoked. This cannot be undone.',
+'usr.delete_confirm':'Delete user {n}? The account will no longer be able to sign in, its devices will become unbound, and its API keys will be revoked. This cannot be undone.',
 'usr.pwd_prompt':'Set a new password for {n} (at least 6 characters)','usr.pwd_reset':'Password reset',
 'usr.create':'Create user','usr.create_submit':'Create','usr.password':'Password','usr.new_name_ph':'Username (3-32 letters, digits, _-.)','usr.new_pass_ph':'Password (at least 6 characters)','usr.created_ok':'User created',
-'tok.title':'API Tokens (for third-party integrations)','tok.desc1':'Send requests with',
-'tok.desc2':'to call the management APIs. A token is shown only once, when created.',
-'tok.name':'Name','tok.name_ph':'e.g. internal system','tok.create':'Create Token',
-'tok.created':'Created','tok.last_used':'Last used','tok.revoke':'Revoke','tok.empty':'No tokens yet',
-'tok.new_label':'New token (shown only once, please save it):',
-'tok.revoke_confirm':'Revoke token “{n}”? Applications using it will immediately lose access. This cannot be undone.',
+'tok.title':'API keys (for third-party integrations)','tok.desc1':'Send requests with',
+'tok.desc2':'to call the management APIs. An API key is shown only once, when created.',
+'tok.name':'Name','tok.name_ph':'e.g. internal system','tok.create':'Add API key',
+'tok.created':'Created','tok.last_used':'Last used','tok.revoke':'Revoke','tok.empty':'No API keys yet',
+'tok.new_label':'New API key (shown only once, please save it):',
+'tok.revoke_confirm':'Revoke API key “{n}”? Applications using it will immediately lose access. This cannot be undone.',
 'tok.revoke_failed':'Failed to revoke','tok.save_name':'Save name',
 'gen.title':'Generate Pre-configured Client',
 'gen.desc':'The generated installer has this server address and key built in (encoded in the file name; the server and key settings are hidden in the client UI). Share the download link with users; they can sign in with their account right after installing.',
@@ -636,7 +636,7 @@ const CONSOLE_BODY: &str = r#"
 <button data-s="devices" data-i18n="nav.devices">设备</button>
 <button data-s="audit" data-i18n="nav.audit">审计日志</button>
 <button data-s="users" class="adminonly" data-i18n="nav.users">用户管理</button>
-<button data-s="tokens" data-i18n="nav.tokens">API Token</button>
+<button data-s="tokens" data-i18n="nav.tokens">API key</button>
 <button data-s="genclient" data-i18n="nav.genclient">生成客户端</button>
 <button data-s="settings" class="adminonly" data-i18n="nav.settings">服务器设置</button>
 </nav>
@@ -693,11 +693,11 @@ const CONSOLE_BODY: &str = r#"
 </section>
 
 <section id="s-tokens">
-<div class="card"><h2 data-i18n="tok.title">API Token（供第三方系统集成）</h2>
-<p class="muted"><span data-i18n="tok.desc1">请求带</span> <code>Authorization: Bearer rdt_...</code> <span data-i18n="tok.desc2">即可调用管理接口。Token 只在创建时显示一次。</span></p>
+<div class="card"><h2 data-i18n="tok.title">API key（供第三方系统集成）</h2>
+<p class="muted"><span data-i18n="tok.desc1">请求带</span> <code>Authorization: Bearer rdt_...</code> <span data-i18n="tok.desc2">即可调用管理接口。API key 只在创建时显示一次。</span></p>
 <div class="err" id="tok-err"></div><div class="ok" id="tok-new"></div>
-<label data-i18n="tok.name">名称</label><input id="tok-name" placeholder="如：内部系统" data-i18n-ph="tok.name_ph">
-<button id="tok-create" data-i18n="tok.create">创建 Token</button>
+<label for="tok-name" data-i18n="tok.name">名称</label><input id="tok-name" placeholder="如：内部系统" data-i18n-ph="tok.name_ph">
+<button id="tok-create" data-i18n="tok.create">添加 API key</button>
 <div id="tok-list" style="margin-top:12px" data-i18n="app.loading">加载中…</div></div>
 </section>
 
@@ -1120,7 +1120,7 @@ $('tok-create').onclick=async()=>{
   try{
     const nm=$('tok-name').value;
     const j=await api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})});
-    if(j.ok){$('tok-err').textContent='';$('tok-name').value='';$('tok-new').innerHTML=t('tok.new_label')+'<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">'+t('app.copy')+'</button></div><div class="dl" style="margin-top:6px"><input id="tok-new-name" value="'+esc(nm||'default')+'"><button class="ghost" onclick="tren('+j.id+')">'+t('tok.save_name')+'</button><button class="ghost" onclick="document.getElementById(\'tok-new\').innerHTML=\'\'">'+t('app.cancel')+'</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||t('app.failed');}
+    if(j.ok){$('tok-err').textContent='';$('tok-new').innerHTML=t('tok.new_label')+'<div class="dl" style="margin-top:6px"><input readonly id="tok-new-val" value="'+esc(j.token)+'"><button class="ghost" onclick="copyText(document.getElementById(\'tok-new-val\').value,this)">'+t('app.copy')+'</button></div><div style="margin-top:6px"><button class="ghost" id="tok-save-name" onclick="tren('+j.id+')">'+t('tok.save_name')+'</button></div><div style="margin-top:6px"><button class="ghost" id="tok-close" onclick="document.getElementById(\'tok-new\').innerHTML=\'\'">'+t('app.close')+'</button></div>'; loadTokens();}else{$('tok-err').textContent=j.error||t('app.failed');}
   }catch(e){ if(e.message!=='unauth')$('tok-err').textContent=t('app.network_err'); }
   btn.disabled=false;
 };
@@ -1130,7 +1130,7 @@ async function tdel(i){
   const j=await api('/api/tokens/'+t.id,{method:'DELETE'}); if(j.ok)loadTokens(); else alert(j.error||window.t('tok.revoke_failed'));
 }
 async function tren(id){
-  const j=await api('/api/tokens/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('tok-new-name').value})});
+  const j=await api('/api/tokens/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('tok-name').value})});
   if(j.ok)loadTokens(); else $('tok-err').textContent=j.error||t('app.failed');
 }
 let GEN=[];
