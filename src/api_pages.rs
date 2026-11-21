@@ -241,6 +241,7 @@ const I18N={zh:{
 'aud.title':'审计日志','aud.desc':'被控端上报的连接记录：谁在什么时间从哪里连到哪台设备、是否走中继、连了多久。用户名来自设备绑定，未绑定设备只显示 ID。',
 'aud.search_ph':'搜索控制端/被控端 ID、用户名、主机名','aud.search':'搜索','aud.refresh':'刷新',
 'aud.range_today':'今天','aud.range_7d':'7 天','aud.range_30d':'30 天','aud.range_all':'全部',
+'aud.from':'起始日期','aud.to':'结束日期',
 'aud.col_started':'开始时间','aud.col_controller':'控制端','aud.col_controlled':'被控端',
 'aud.col_ip':'控制端 IP','aud.col_relay':'中继/直连','aud.col_duration':'时长','aud.col_status':'状态',
 'aud.relayed':'中继','aud.direct':'直连','aud.unknown':'—','aud.open':'进行中','aud.closed':'已结束','aud.closed_stale':'（无关闭记录）','aud.closed_offline':'（设备离线）',
@@ -399,6 +400,7 @@ const I18N={zh:{
 'aud.title':'Audit Log','aud.desc':'Connection records reported by controlled devices: who connected to which device, when, from where, relayed or direct, and for how long. Usernames come from device binding; unbound devices show only their ID.',
 'aud.search_ph':'Search controller/controlled ID, username, hostname','aud.search':'Search','aud.refresh':'Refresh',
 'aud.range_today':'Today','aud.range_7d':'7 days','aud.range_30d':'30 days','aud.range_all':'All',
+'aud.from':'From','aud.to':'To',
 'aud.col_started':'Started','aud.col_controller':'Controller','aud.col_controlled':'Controlled',
 'aud.col_ip':'Controller IP','aud.col_relay':'Relay/Direct','aud.col_duration':'Duration','aud.col_status':'Status',
 'aud.relayed':'Relay','aud.direct':'Direct','aud.unknown':'—','aud.open':'In progress','aud.closed':'Ended','aud.closed_stale':'(no close record)','aud.closed_offline':'(device offline)',
@@ -676,6 +678,7 @@ const CONSOLE_BODY: &str = r#"
 <p><input id="aud-q" placeholder="搜索控制端/被控端 ID、用户名、主机名" data-i18n-ph="aud.search_ph" style="width:320px"> <button id="aud-search" data-i18n="aud.search">搜索</button>
 <select id="aud-days" style="width:120px"><option value="1" data-i18n="aud.range_today">今天</option><option value="7" data-i18n="aud.range_7d">7 天</option><option value="30" selected data-i18n="aud.range_30d">30 天</option><option value="0" data-i18n="aud.range_all">全部</option></select>
 <button class="ghost" id="aud-refresh" data-i18n="aud.refresh">刷新</button></p>
+<p><label for="aud-from" data-i18n="aud.from">起始日期</label> <input id="aud-from" type="date" style="width:150px"> <label for="aud-to" data-i18n="aud.to">结束日期</label> <input id="aud-to" type="date" style="width:150px"></p>
 <div id="aud-list" data-i18n="app.loading">加载中…</div>
 <p id="aud-pager" style="margin-top:12px"></p></div>
 </section>
@@ -948,7 +951,13 @@ function whoCell(id,name,username){
 async function loadAudit(page){
   AUDIT_PAGE=Math.max(1,page||1);
   const q=$('aud-q').value.trim(), days=$('aud-days').value;
-  let j; try{ j=await api('/api/audit/sessions?q='+encodeURIComponent(q)+'&days='+encodeURIComponent(days)+'&page='+AUDIT_PAGE+'&per_page=20'); }catch(e){ if(e.message!=='unauth')loadFail($('aud-list'),'loadAudit'); return; }
+  const from=$('aud-from').value, to=$('aud-to').value;
+  let url='/api/audit/sessions?q='+encodeURIComponent(q)+'&days='+encodeURIComponent(days)+'&page='+AUDIT_PAGE+'&per_page=20';
+  // Plain calendar dates, sent as-is: the server attaches its local
+  // zone (see audit_date_span). Either end may be empty (open).
+  if(from)url+='&from='+encodeURIComponent(from);
+  if(to)url+='&to='+encodeURIComponent(to);
+  let j; try{ j=await api(url); }catch(e){ if(e.message!=='unauth')loadFail($('aud-list'),'loadAudit'); return; }
   if(!j.ok){ loadFail($('aud-list'),'loadAudit',j.error); return; }
   if(!j.sessions.length){$('aud-list').innerHTML='<p class="muted">'+t('aud.empty')+'</p>';}
   else{$('aud-list').innerHTML=tableOpen(t('aud.title'),[t('aud.col_started'),t('aud.col_controller'),t('aud.col_controlled'),t('aud.col_ip'),t('aud.col_relay'),t('aud.col_duration'),t('aud.col_status')],780,'','<colgroup><col style="width:18%"><col style="width:19%"><col style="width:19%"><col style="width:13%"><col style="width:9%"><col style="width:9%"><col style="width:13%"></colgroup>')+
@@ -966,6 +975,17 @@ async function loadAudit(page){
 }
 $('aud-search').onclick=()=>loadAudit(1);
 $('aud-days').onchange=()=>loadAudit(1);
+// A set date overrides the relative days window, so the days
+// selector is disabled while either date is set; clearing both
+// dates restores it (and the next search uses days again).
+function syncAuditRange(){
+  $('aud-days').disabled=!!($('aud-from').value||$('aud-to').value);
+}
+$('aud-from').addEventListener('input',syncAuditRange);
+$('aud-from').addEventListener('change',syncAuditRange);
+$('aud-to').addEventListener('input',syncAuditRange);
+$('aud-to').addEventListener('change',syncAuditRange);
+syncAuditRange();
 $('aud-refresh').onclick=()=>loadAudit(AUDIT_PAGE);
 $('aud-q').addEventListener('keydown',e=>{if(e.key==='Enter')loadAudit(1);});
 let RELAYS=[];
