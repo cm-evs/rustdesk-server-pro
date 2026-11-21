@@ -96,6 +96,10 @@ jobs:
   build-win:
     name: Build - windows
     runs-on: windows-2022
+    # The sqlx-macros proc-macro DLL fails to load on Windows with LTO
+    # enabled (LoadLibraryExW error 1114); build this job without LTO.
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
 
     steps:
       
