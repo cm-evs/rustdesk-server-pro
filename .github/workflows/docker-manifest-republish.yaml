@@ -1,0 +1,179 @@
+name: docker-manifest-republish
+
+# Re-publish Docker manifests for a version whose per-arch images were
+# already pushed, without rebuilding anything. Used when a tag run's
+# manifest job failed after the push jobs succeeded (e.g. v45: the
+# :major step failed because MAJOR_TAG == GIT_TAG, which skipped
+# :latest and all GHCR manifests).
+#
+# Dispatch with the version tag, e.g.:
+#   gh workflow run docker-manifest-republish.yaml --ref main -f version_tag=v45
+# Creates, for the main image (4 arches) and the classic image
+# (3 arches), on Docker Hub and GHCR: the version manifest, the major
+# manifest (skipped when it equals the version tag), and latest
+# (skipped for preview tags like v45.1).
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Version tag to (re)publish manifests for (e.g. v45)'
+        required: true
+        type: string
+
+env:
+  LATEST_TAG: latest
+  GHCR_IMAGE: ghcr.io/wirh/rustdesk-server-pro
+  GHCR_IMAGE_CLASSIC: ghcr.io/wirh/rustdesk-server-pro-classic
+  # Docker Hub is optional: these flags say whether its secrets are set.
+  # (`secrets` cannot be used in `if` expressions, hence the indirection.)
+  DOCKER_HUB_LOGIN: ${{ secrets.DOCKER_HUB_USERNAME != '' }}
+  DOCKER_HUB_CONFIGURED: ${{ secrets.DOCKER_HUB_USERNAME != '' && secrets.DOCKER_IMAGE != '' }}
+  DOCKER_HUB_CLASSIC_CONFIGURED: ${{ secrets.DOCKER_HUB_USERNAME != '' && secrets.DOCKER_IMAGE_CLASSIC != '' }}
+
+jobs:
+
+  republish:
+
+    name: Docker manifest republish
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      - name: Log in to Docker Hub
+        if: env.DOCKER_HUB_LOGIN == 'true'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Get version tag
+        id: vars
+        run: |
+          T="${{ inputs.version_tag }}"
+          M=${T%%.*}
+          if ! [[ "$T" =~ ^v[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "version_tag must be vN or vN.M (got: $T)"
+            exit 1
+          fi
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          if [[ "$T" == *.* ]]; then
+            echo "is_preview=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_preview=false" >> $GITHUB_OUTPUT
+          fi
+          if [ "$M" = "$T" ]; then
+            echo "major_is_version=true" >> $GITHUB_OUTPUT
+          else
+            echo "major_is_version=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # main image, Docker Hub
+      - name: Create and push manifest (:ve.rs.ion)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: env.DOCKER_HUB_CONFIGURED == 'true'
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-i386
+          push: true
+
+      - name: Create and push manifest (:major)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && steps.vars.outputs.major_is_version != 'true' && env.DOCKER_HUB_CONFIGURED == 'true'
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-i386
+          push: true
+
+      - name: Create and push manifest (:latest)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CONFIGURED == 'true'
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-i386
+          push: true
+
+      # main image, GHCR
+      - name: Create and push GHCR manifest (:ve.rs.ion)
+        uses: Noelware/docker-manifest-action@0.4.3
+        with:
+          base-image: ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-i386
+          push: true
+
+      - name: Create and push GHCR manifest (:major)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && steps.vars.outputs.major_is_version != 'true'
+        with:
+          base-image: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-i386
+          push: true
+
+      - name: Create and push GHCR manifest (:latest)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true'
+        with:
+          base-image: ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-i386
+          push: true
+
+      # classic image, Docker Hub
+      - name: Create and push classic manifest (:ve.rs.ion)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-armv7
+          push: true
+
+      - name: Create and push classic manifest (:major)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && steps.vars.outputs.major_is_version != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
+          push: true
+
+      - name: Create and push classic manifest (:latest)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-armv7
+          push: true
+
+      # classic image, GHCR
+      - name: Create and push classic GHCR manifest (:ve.rs.ion)
+        uses: Noelware/docker-manifest-action@0.4.3
+        with:
+          base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-armv7
+          push: true
+
+      - name: Create and push classic GHCR manifest (:major)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true' && steps.vars.outputs.major_is_version != 'true'
+        with:
+          base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
+          push: true
+
+      - name: Create and push classic GHCR manifest (:latest)
+        uses: Noelware/docker-manifest-action@0.4.3
+        if: steps.vars.outputs.is_preview != 'true'
+        with:
+          base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-armv7
+          push: true

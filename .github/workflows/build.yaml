@@ -9,8 +9,9 @@ name: build
 # DOCKER_IMAGE_CLASSIC should be the target image name on docker hub for the old build (e.g. "<user>/rustdesk-server-pro-classic" )
 # DOCKER_HUB_USERNAME is the username you normally use to login at https://hub.docker.com/
 # DOCKER_HUB_PASSWORD is a token you should create under "account settings / security" with read/write access
-# Tagging: integer tags (v45) move latest + major; preview tags (v45.1)
-# only get their version tag. workflow_dispatch runs push only a
+# Tagging: integer tags (v45) move latest (their major tag equals the
+# version tag, so no separate :major manifest is created); preview tags
+# (v45.1) only get their version tag. workflow_dispatch runs push only a
 # throwaway ci-test tag to GHCR, never latest.
 
 permissions:
@@ -405,6 +406,11 @@ jobs:
           else
             echo "is_preview=false" >> $GITHUB_OUTPUT
           fi
+          if [ "$M" = "$T" ]; then
+            echo "major_is_version=true" >> $GITHUB_OUTPUT
+          else
+            echo "major_is_version=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -426,7 +432,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CONFIGURED == 'true'
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CONFIGURED == 'true' && steps.vars.outputs.major_is_version != 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-i386
@@ -453,7 +459,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push GHCR manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true'
+        if: steps.vars.outputs.is_preview != 'true' && steps.vars.outputs.major_is_version != 'true'
         with:
           base-image: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-i386
@@ -598,6 +604,11 @@ jobs:
           else
             echo "is_preview=false" >> $GITHUB_OUTPUT
           fi
+          if [ "$M" = "$T" ]; then
+            echo "major_is_version=true" >> $GITHUB_OUTPUT
+          else
+            echo "major_is_version=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -619,7 +630,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true'
+        if: steps.vars.outputs.is_preview != 'true' && env.DOCKER_HUB_CLASSIC_CONFIGURED == 'true' && steps.vars.outputs.major_is_version != 'true'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
@@ -646,7 +657,7 @@ jobs:
       # manifest for :1 tag (major release)
       - name: Create and push GHCR manifest (:major)
         uses: Noelware/docker-manifest-action@0.4.3
-        if: steps.vars.outputs.is_preview != 'true'
+        if: steps.vars.outputs.is_preview != 'true' && steps.vars.outputs.major_is_version != 'true'
         with:
           base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
           extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
