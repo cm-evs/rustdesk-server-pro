@@ -111,16 +111,18 @@ func TestApplyConfigDecisions(t *testing.T) {
 // fullMockServer implements challenge + register + heartbeat per the
 // frozen encrypted protocol, verifying proofs and signatures.
 type fullMockServer struct {
-	t      *testing.T
-	key    []byte
-	mu     sync.Mutex
-	nonce  string
-	used   map[string]bool
-	hb     int
-	sigOK  int
-	sawAck bool
-	revoke bool // revoke once the restart ack is seen
-	badHB  bool // encrypt heartbeat bundles with a wrong key
+	t     *testing.T
+	key   []byte
+	mu    sync.Mutex
+	nonce string
+	used  map[string]bool
+	hb    int
+	sigOK int
+	// lastPublicIP is the public_ip of the most recent heartbeat.
+	lastPublicIP string
+	sawAck       bool
+	revoke       bool // revoke once the restart ack is seen
+	badHB        bool // encrypt heartbeat bundles with a wrong key
 }
 
 func newFullMockServer(t *testing.T) (*fullMockServer, *httptest.Server) {
@@ -178,6 +180,7 @@ func newFullMockServer(t *testing.T) (*fullMockServer, *httptest.Server) {
 				t.Errorf("心跳明文解析失败：%v", err)
 				return
 			}
+			m.lastPublicIP = pt.Status.PublicIP
 			if pt.CommandAck == "restart" {
 				m.sawAck = true
 			}
@@ -216,10 +219,19 @@ func (m *fullMockServer) counts() (hb, sigOK int, sawAck bool) {
 	return m.hb, m.sigOK, m.sawAck
 }
 
+func (m *fullMockServer) publicIP() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastPublicIP
+}
+
 // TestFullFlow walks the whole lifecycle against the mock server:
 // register → decrypt + write keys → heartbeat → decrypt + apply
 // config → restart ack → revoked stops heartbeats.
 func TestFullFlow(t *testing.T) {
+	// No public-IP lookup in this test: the agent must not touch
+	// the real lookup services.
+	t.Setenv(publicIPEnvOverride, "")
 	m, srv := newFullMockServer(t)
 	defer srv.Close()
 	m.revoke = true
@@ -283,6 +295,9 @@ func TestFullFlow(t *testing.T) {
 // cannot decrypt is logged and skipped — no apply, no version bump,
 // heartbeats continue.
 func TestHeartbeatDecryptFailureIgnored(t *testing.T) {
+	// No public-IP lookup in this test: the agent must not touch
+	// the real lookup services.
+	t.Setenv(publicIPEnvOverride, "")
 	m, srv := newFullMockServer(t)
 	defer srv.Close()
 	m.badHB = true
@@ -312,5 +327,64 @@ func TestHeartbeatDecryptFailureIgnored(t *testing.T) {
 	}
 	if agent.Revoked() {
 		t.Fatal("解密失败不应触发吊销")
+	}
+}
+
+// TestPublicIPReportedInHeartbeat: with the lookup endpoint pointed
+// at a local stub, the agent detects its public IP at startup and
+// reports it in the heartbeat status from the first heartbeat on.
+func TestPublicIPReportedInHeartbeat(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.7\n"))
+	}))
+	defer stub.Close()
+	t.Setenv(publicIPEnvOverride, stub.URL)
+
+	m, srv := newFullMockServer(t)
+	defer srv.Close()
+	dir := t.TempDir()
+	writeFakeHbbr(t, dir)
+	writeTestRegistration(t, dir, srv.URL)
+	agent, err := buildAgent(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.interval = 100 * time.Millisecond
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() { agent.Run(stopCh); close(done) }()
+	defer func() { close(stopCh); <-done }()
+
+	waitFor(t, 10*time.Second, func() bool {
+		return m.publicIP() == "203.0.113.7"
+	}, "心跳上报公网 IP")
+}
+
+// TestPublicIPNotReportedWhenDisabled: with detection disabled the
+// heartbeat carries no public_ip — the same wire format an old
+// agent sends, so the server keeps whatever it stored before.
+func TestPublicIPNotReportedWhenDisabled(t *testing.T) {
+	t.Setenv(publicIPEnvOverride, "")
+	m, srv := newFullMockServer(t)
+	defer srv.Close()
+	dir := t.TempDir()
+	writeFakeHbbr(t, dir)
+	writeTestRegistration(t, dir, srv.URL)
+	agent, err := buildAgent(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.interval = 100 * time.Millisecond
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() { agent.Run(stopCh); close(done) }()
+	defer func() { close(stopCh); <-done }()
+
+	waitFor(t, 10*time.Second, func() bool {
+		hb, _, _ := m.counts()
+		return hb >= 2
+	}, "心跳进行")
+	if got := m.publicIP(); got != "" {
+		t.Fatalf("public_ip = %q, want empty when detection is disabled", got)
 	}
 }

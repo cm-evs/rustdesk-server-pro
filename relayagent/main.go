@@ -2,10 +2,11 @@
 //
 // hbbr (the relay server) never talks to hbbs (the ID server), so a
 // relay host runs this agent next to hbbr: it registers the node with
-// hbbs, heartbeats every 20s, reports hbbr status, applies
-// configuration pushed by the server (listen port + speed limits),
-// executes restart commands, and supervises the local hbbr process
-// (start/stop/restart).
+// hbbs, heartbeats every 20s, reports hbbr status (including the
+// node's own public IP, detected via an external lookup service),
+// applies configuration pushed by the server (listen port + speed
+// limits), executes restart commands, and supervises the local hbbr
+// process (start/stop/restart).
 //
 // Usage:
 //

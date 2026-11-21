@@ -134,6 +134,11 @@ type heartbeatStatus struct {
 	ListenPort    int    `json:"listen_port"`
 	Sessions      int    `json:"sessions"`
 	TotalKbps     int    `json:"total_kbps"`
+	// PublicIP is the agent's own public IP, detected via an
+	// external lookup service. Empty when detection is disabled
+	// or has never succeeded; omitted from the JSON then, so the
+	// server sees exactly what an old agent sends.
+	PublicIP string `json:"public_ip,omitempty"`
 }
 
 // heartbeatPlaintext is the encrypted heartbeat payload.

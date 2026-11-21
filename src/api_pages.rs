@@ -1061,7 +1061,7 @@ function renderRelays(relays){
   const el=$('relay-list'); if(!el)return;
   if(!relays.length){el.innerHTML='<p class="muted">'+t('relay.empty')+'</p>';return;}
   el.innerHTML=tableOpen(t('relay.title'),[t('relay.node'),t('relay.status'),t('relay.address'),t('relay.port'),t('relay.sessions'),t('relay.throughput'),t('relay.last_hb')],760,'','<colgroup><col style="width:17%"><col style="width:10%"><col style="width:22%"><col style="width:9%"><col style="width:10%"><col style="width:13%"><col style="width:19%"></colgroup>')+
-    relays.map(r=>`<tr><td><a href="javascript:void(0)" onclick="showRelay(${r.id})">${esc(r.name)}</a><span class="badge">${t('relay.badge')}</span></td><td>${r.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>'}</td><td class="trunc" title="${esc(r.address||r.last_ip||'')}">${esc(r.address||r.last_ip||'')}</td><td>${r.listen_port||'-'}</td><td>${r.sessions}</td><td>${r.total_kbps} kb/s</td><td class="trunc" title="${r.last_heartbeat?esc(new Date(r.last_heartbeat*1000).toLocaleString()):t('relay.never')}">${r.last_heartbeat?new Date(r.last_heartbeat*1000).toLocaleString():t('relay.never')}</td></tr>`).join('')+TABLE_CLOSE;
+    relays.map(r=>`<tr><td><a href="javascript:void(0)" onclick="showRelay(${r.id})">${esc(r.name)}</a><span class="badge">${t('relay.badge')}</span></td><td>${r.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>'}</td><td class="trunc" title="${esc(r.address||r.public_ip||r.last_ip||'')}">${esc(r.address||r.public_ip||r.last_ip||'')}</td><td>${r.listen_port||'-'}</td><td>${r.sessions}</td><td>${r.total_kbps} kb/s</td><td class="trunc" title="${r.last_heartbeat?esc(new Date(r.last_heartbeat*1000).toLocaleString()):t('relay.never')}">${r.last_heartbeat?new Date(r.last_heartbeat*1000).toLocaleString():t('relay.never')}</td></tr>`).join('')+TABLE_CLOSE;
 }
 async function loadRelayLinks(){
   let j; try{ j=await api('/api/admin/relays/reg-tokens'); }catch(e){ if(e.message!=='unauth')$('relay-links').innerHTML='<p class="err">'+t('relay.load_fail')+'</p>'; return; }
@@ -1107,7 +1107,7 @@ async function showRelay(id){
     '<h2>'+esc(n.name)+'<span class="badge">'+t('relay.badge')+'</span></h2>'+
     '<div class="table-wrapper" tabindex="0" role="region" aria-label="'+esc(n.name||t('relay.title'))+'"><table class="kv" style="min-width:360px"><colgroup><col style="width:30%"><col style="width:70%"></colgroup><tbody>'+
     '<tr><th>'+t('relay.status')+'</th><td>'+(n.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>')+'</td></tr>'+
-    '<tr><th>'+t('relay.address')+'</th><td>'+esc(n.address||n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.address')+'</th><td>'+esc(n.address||n.public_ip||n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
     '<tr><th>'+t('relay.port')+'</th><td>'+(n.listen_port||'-')+'</td></tr>'+
     '<tr><th>'+t('relay.last_ip')+'</th><td>'+esc(n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
     '<tr><th>'+t('relay.agent_ver')+'</th><td>'+esc(n.agent_version||t('relay.unknown_time'))+'</td></tr>'+

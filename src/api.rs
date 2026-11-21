@@ -376,7 +376,7 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "create table if not exists ab_store(username text primary key, data text not null)",
         "create table if not exists captcha_codes(id text primary key, code_hash text not null, expires_at integer not null)",
         "create table if not exists relay_reg_tokens(token_id text primary key, link_key text not null, label text not null default '', created_by text not null, created_at integer not null, expires_at integer not null, used_at integer, used_by integer)",
-        "create table if not exists relay_nodes(id integer primary key autoincrement, name text not null, address text not null default '', last_ip text not null default '', link_key text not null, key_delivered integer not null default 0, registered_at integer not null, last_heartbeat integer not null default 0, agent_version text not null default '', hbbr_version text not null default '', hbbr_running integer not null default 0, hbbr_started_at integer not null default 0, listen_port integer not null default 0, sessions integer not null default 0, total_kbps integer not null default 0, config_json text not null default '{}', config_version integer not null default 1, applied_version integer not null default 0, pending_command text not null default '', created_by text not null default '')",
+        "create table if not exists relay_nodes(id integer primary key autoincrement, name text not null, address text not null default '', last_ip text not null default '', public_ip text not null default '', link_key text not null, key_delivered integer not null default 0, registered_at integer not null, last_heartbeat integer not null default 0, agent_version text not null default '', hbbr_version text not null default '', hbbr_running integer not null default 0, hbbr_started_at integer not null default 0, listen_port integer not null default 0, sessions integer not null default 0, total_kbps integer not null default 0, config_json text not null default '{}', config_version integer not null default 1, applied_version integer not null default 0, pending_command text not null default '', created_by text not null default '')",
         // v40: connection-audit records posted by the controlled side
         // (POST /api/audit/conn). nonce is UNIQUE: the client retries
         // a post for up to 120 s, and the insert is insert-or-ignore,
@@ -421,6 +421,20 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "alter table devices add column conns text not null default '[]'",
         "alter table devices add column conns_updated_at integer not null default 0",
     ] {
+        if let Err(e) = sqlx::query(s).execute(&pool).await {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(msg);
+            }
+        }
+    }
+    // v46: the public IP the relay agent reports about itself. The
+    // heartbeat connection's peer IP is the router's LAN address on
+    // NAT setups, so the server cannot learn the relay's real
+    // public IP from the connection; the agent detects it via an
+    // external lookup service and sends it in the heartbeat status.
+    // Same duplicate-column tolerance as the migrations above.
+    for s in ["alter table relay_nodes add column public_ip text not null default ''"] {
         if let Err(e) = sqlx::query(s).execute(&pool).await {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
@@ -2335,6 +2349,17 @@ fn peer_ip_string(ip: std::net::IpAddr) -> String {
             None => v6.to_string(),
         },
         v4 => v4.to_string(),
+    }
+}
+
+/// A public IP the relay agent reports about itself: it must parse
+/// as an IP address (anything else is ignored, so a corrupt or
+/// hostile value never lands in the database); IPv4-mapped IPv6 is
+/// normalized to plain IPv4, like last_ip.
+fn valid_public_ip(s: &str) -> String {
+    match s.trim().parse::<std::net::IpAddr>() {
+        Ok(ip) => peer_ip_string(ip),
+        Err(_) => String::new(),
     }
 }
 
@@ -5066,6 +5091,7 @@ fn relay_node_summary(r: &sqlx::sqlite::SqliteRow, now_ts: i64) -> Value {
         "name": r.try_get::<String, _>("name").unwrap_or_default(),
         "address": r.try_get::<String, _>("address").unwrap_or_default(),
         "last_ip": r.try_get::<String, _>("last_ip").unwrap_or_default(),
+        "public_ip": r.try_get::<String, _>("public_ip").unwrap_or_default(),
         "key_delivered": r.try_get::<i64, _>("key_delivered").unwrap_or(0) != 0,
         "registered_at": r.try_get::<i64, _>("registered_at").unwrap_or(0),
         "last_heartbeat": last_hb,
@@ -5420,17 +5446,22 @@ async fn relay_heartbeat(
     let listen_port = status.get("listen_port").and_then(|x| x.as_i64()).unwrap_or(0);
     let sessions = status.get("sessions").and_then(|x| x.as_i64()).unwrap_or(0);
     let total_kbps = status.get("total_kbps").and_then(|x| x.as_i64()).unwrap_or(0);
+    let public_ip = valid_public_ip(&sfield(&status, "public_ip"));
     let new_pending = if !command_ack.is_empty() && command_ack == pending_command {
         String::new()
     } else {
         pending_command.clone()
     };
     let last_ip = peer_ip_string(addr.ip());
+    // An old agent sends no public_ip (or an empty one): the
+    // coalesce(nullif(...)) keeps the stored value instead of
+    // wiping it, so a mixed old/new fleet never loses the address.
     let _ = sqlx::query(
-        "update relay_nodes set last_heartbeat=?, last_ip=?, agent_version=?, hbbr_version=?, hbbr_running=?, hbbr_started_at=?, listen_port=?, sessions=?, total_kbps=?, applied_version=?, pending_command=? where id=?",
+        "update relay_nodes set last_heartbeat=?, last_ip=?, public_ip=coalesce(nullif(?,''),public_ip), agent_version=?, hbbr_version=?, hbbr_running=?, hbbr_started_at=?, listen_port=?, sessions=?, total_kbps=?, applied_version=?, pending_command=? where id=?",
     )
     .bind(t)
     .bind(&last_ip)
+    .bind(&public_ip)
     .bind(&agent_version)
     .bind(&hbbr_version)
     .bind(if hbbr_running { 1 } else { 0 })
@@ -8443,6 +8474,19 @@ mod tests {
         assert_eq!(peer_ip_string(v4), "27.45.254.164");
         let v6: std::net::IpAddr = "2603:c022:8009:1f01::1".parse().unwrap();
         assert_eq!(peer_ip_string(v6), "2603:c022:8009:1f01::1");
+    }
+
+    #[test]
+    fn valid_public_ip_parses_and_normalizes() {
+        assert_eq!(valid_public_ip("203.0.113.7"), "203.0.113.7");
+        assert_eq!(valid_public_ip("::ffff:203.0.113.7"), "203.0.113.7");
+        assert_eq!(
+            valid_public_ip("2603:c022:8009:1f01::1"),
+            "2603:c022:8009:1f01::1"
+        );
+        assert_eq!(valid_public_ip(" 203.0.113.7\n"), "203.0.113.7");
+        assert_eq!(valid_public_ip("not an ip"), "");
+        assert_eq!(valid_public_ip(""), "");
     }
 
 }
