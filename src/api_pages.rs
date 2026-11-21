@@ -233,7 +233,7 @@ const I18N={zh:{
 'set.tpl_downloading':'正在下载官方客户端模板','set.tpl_speed':' · 速度 ',
 'set.tpl_source':' · 来源：','set.tpl_done':'下载完成','set.tpl_failed':'下载失败：',
 'set.tpl_start_failed':'启动下载失败：','set.tpl_downloading2':'正在下载…','set.tpl_uptodate':'已是最新版本（{v}），无需下载',
-'set.upd_title':'服务端版本更新','set.upd_loading':'读取中…','set.upd_check':'检测更新',
+'set.upd_title':'服务端版本更新','set.upd_loading':'读取中…','set.upd_check':'检测更新','set.upd_prerelease':'检测预览版',
 'set.upd_desc':'更新包来自本项目的 GitHub Releases，按当前平台自动选择。GitHub 加速用的是上方「GitHub 加速镜像前缀」设置，未配置时用内置镜像链。下载完成后新文件先暂存，点「立即重启」后由启动器（rdsvc / start.sh / start.ps1 / systemd）在重启时替换生效；直接运行 hbbs（无启动器托管）时，需手动把 hbbs.new / hbbr.new 改名覆盖原文件后再启动。',
 'set.upd_load_fail':'版本信息加载失败，请刷新重试','set.upd_load_fail2':'版本信息加载失败：',
 'set.upd_current':'当前版本：','set.upd_base':'（上游基底 ','set.upd_platform':'）｜平台：',
@@ -394,7 +394,7 @@ const I18N={zh:{
 'set.tpl_downloading':'Downloading the official client template','set.tpl_speed':' · Speed ',
 'set.tpl_source':' · Source: ','set.tpl_done':'Download complete','set.tpl_failed':'Download failed: ',
 'set.tpl_start_failed':'Failed to start download: ','set.tpl_downloading2':'Downloading…','set.tpl_uptodate':'Already the latest version ({v}), no download needed',
-'set.upd_title':'Server Update','set.upd_loading':'Loading…','set.upd_check':'Check for Updates',
+'set.upd_title':'Server Update','set.upd_loading':'Loading…','set.upd_check':'Check for Updates','set.upd_prerelease':'Include prereleases',
 'set.upd_desc':'Update packages come from this project’s GitHub Releases and are selected automatically for the current platform. GitHub acceleration uses the “GitHub mirror prefix” setting above, or the built-in mirror chain when unset. After downloading, the new files are staged; clicking “Restart Now” lets the launcher (rdsvc / start.sh / start.ps1 / systemd) replace them during restart. If you run hbbs directly (no launcher), rename hbbs.new / hbbr.new over the original files manually before starting.',
 'set.upd_load_fail':'Failed to load version info. Refresh and retry.','set.upd_load_fail2':'Failed to load version info: ',
 'set.upd_current':'Current version: ','set.upd_base':' (upstream base ','set.upd_platform':') | Platform: ',
@@ -810,6 +810,7 @@ const CONSOLE_BODY: &str = r#"
 <p class="muted" id="upd-current" data-i18n="set.upd_loading">读取中…</p>
 <div class="err" id="upd-err"></div>
 <button id="upd-check" data-i18n="set.upd_check">检测更新</button>
+<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="upd-prerelease" style="width:auto;margin:0"> <span data-i18n="set.upd_prerelease">检测预览版</span></label>
 <div id="upd-result" style="display:none;margin-top:12px"></div>
 <div id="upd-prog" style="display:none;margin-top:12px">
 <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;height:14px;overflow:hidden">
@@ -1349,11 +1350,13 @@ async function loadUpdate(){
   if(j.staged){ showStaged(j.staged_version); }
   if(j.running){ pollUpd(); }
 }
+$('upd-prerelease').checked=localStorage.getItem('upd-include-prerelease')==='1';
+$('upd-prerelease').onchange=()=>{localStorage.setItem('upd-include-prerelease',$('upd-prerelease').checked?'1':'0');};
 $('upd-check').onclick=async()=>{
   const btn=$('upd-check'); if(btn.disabled)return; btn.disabled=true;
   $('upd-err').textContent=''; $('upd-result').style.display='none'; $('upd-result').innerHTML='';
   try{
-    const j=await api('/api/admin/update/check',{method:'POST'});
+    const j=await api('/api/admin/update/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({include_prerelease:$('upd-prerelease').checked})});
     if(!j.ok){ $('upd-err').textContent=j.error||t('set.upd_check_fail'); return; }
     $('upd-result').style.display='block';
     if(!j.has_update){

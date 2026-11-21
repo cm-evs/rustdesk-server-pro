@@ -91,6 +91,15 @@ pub struct TplJob {
 /// and would wipe a hand-written constant.
 const PRO_VERSION: &str = "45";
 
+/// Full installed version: the preview build's complete number (e.g.
+/// "45.1") when baked in at build time via PRO_FULL_VERSION (see
+/// build.rs), else PRO_VERSION. Formal builds never set
+/// PRO_FULL_VERSION, so for them this is exactly PRO_VERSION.
+const FULL_VERSION: &str = match option_env!("PRO_FULL_VERSION") {
+    Some(v) => v,
+    None => PRO_VERSION,
+};
+
 /// Progress state of the background one-click server update download.
 #[derive(Default)]
 pub struct UpdJob {
@@ -3656,8 +3665,11 @@ async fn template_status(
 // Windows a running exe is locked and cannot replace itself.
 // Downloads reuse the template pipeline's mirror chain and the same
 // `github_mirror` setting. The version parameter is strictly
-// validated (`^v[0-9]+$`) and only ever addresses our own repo's
-// releases; no caller-supplied URL is fetched.
+// validated (`^v[0-9]+(\.[0-9]+)?$`) and only ever addresses our own
+// repo's releases; no caller-supplied URL is fetched. The check can
+// optionally include prereleases (vN.M tags): /releases/latest never
+// returns a prerelease, so that mode lists releases instead and picks
+// the newest overall version.
 
 const UPDATE_REPO_API: &str = "https://api.github.com/repos/wirh/rustdesk-server-pro";
 const UPDATE_RELEASES_PAGE: &str =
@@ -3665,24 +3677,69 @@ const UPDATE_RELEASES_PAGE: &str =
 const UPDATE_ASSET_PREFIX: &str =
     "https://github.com/wirh/rustdesk-server-pro/releases/download/";
 
-/// "v32" (or a bare "32") -> Some(32); anything else -> None.
-fn parse_pro_tag(tag: &str) -> Option<u64> {
-    let t = tag.trim().trim_start_matches('v');
-    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+/// Test-only override for the update check/download GitHub origin:
+/// when PRO_UPDATE_BASE is set (a local stub server in e2e tests),
+/// the API and download URLs are built under it instead of
+/// github.com. Unset in production, where the defaults above apply
+/// unchanged.
+fn update_base_override() -> Option<String> {
+    std::env::var("PRO_UPDATE_BASE")
+        .ok()
+        .map(|b| b.trim().trim_end_matches('/').to_string())
+        .filter(|b| !b.is_empty())
+}
+
+fn update_api_base() -> String {
+    match update_base_override() {
+        Some(base) => format!("{base}/repos/wirh/rustdesk-server-pro"),
+        None => UPDATE_REPO_API.to_string(),
+    }
+}
+
+fn update_asset_prefix() -> String {
+    match update_base_override() {
+        Some(base) => format!("{base}/wirh/rustdesk-server-pro/releases/download/"),
+        None => UPDATE_ASSET_PREFIX.to_string(),
+    }
+}
+
+/// "v32" (or a bare "32") -> Some((32, 0)); "v32.1" -> Some((32, 1));
+/// anything else -> None. Tuple order is the version order:
+/// v45 < v45.1 < v45.2 < v46.
+fn parse_pro_tag(tag: &str) -> Option<(u64, u64)> {
+    let t = tag.trim().strip_prefix('v').unwrap_or(tag.trim());
+    let (major, minor) = match t.split_once('.') {
+        Some((maj, min)) => (maj, min),
+        None => (t, "0"),
+    };
+    if major.is_empty()
+        || !major.bytes().all(|b| b.is_ascii_digit())
+        || minor.is_empty()
+        || !minor.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
-    t.parse::<u64>().ok()
+    Some((major.parse::<u64>().ok()?, minor.parse::<u64>().ok()?))
+}
+
+/// The installed version as a (major, minor) pair. A malformed baked
+/// FULL_VERSION falls back to PRO_VERSION, so a bad build-time value
+/// can only ever report the formal version, never a bogus one.
+fn current_pro_version() -> (u64, u64) {
+    parse_pro_tag(FULL_VERSION)
+        .or_else(|| parse_pro_tag(PRO_VERSION))
+        .unwrap_or((0, 0))
 }
 
 fn current_pro_num() -> u64 {
-    parse_pro_tag(PRO_VERSION).unwrap_or(0)
+    current_pro_version().0
 }
 
-/// Strict `^v[0-9]+$` check for the download endpoint's version
-/// parameter (and for tags extracted from redirect URLs).
+/// Strict `^v[0-9]+(\.[0-9]+)?$` check for the download endpoint's
+/// version parameter (and for tags extracted from redirect URLs).
 fn valid_version_param(v: &str) -> bool {
     let t = v.trim();
-    t.len() > 1 && t.starts_with('v') && t[1..].bytes().all(|b| b.is_ascii_digit())
+    t.len() > 1 && t.starts_with('v') && parse_pro_tag(t).is_some()
 }
 
 /// Release-package platform for (OS, arch, musl). Kept as a pure
@@ -3712,11 +3769,16 @@ fn update_asset_name(version: &str, platform: &str) -> String {
 
 /// GET a GitHub API JSON document: direct first, then each mirror in
 /// order. A failed attempt falls through to the next source; only the
-/// last error is reported.
+/// last error is reported. In stub mode (PRO_UPDATE_BASE set) the URL
+/// is not a github.com URL, so no mirror can proxy it — fail fast
+/// instead of sending a localhost URL to five real mirrors.
 fn fetch_github_api(custom: &str, api_url: &str) -> Result<Value, String> {
     match fetch_json(api_url, 15) {
         Ok(v) => return Ok(v),
         Err(e) => {
+            if update_base_override().is_some() {
+                return Err(e);
+            }
             let mut last_err = e;
             for m in mirror_prefixes(custom) {
                 match fetch_json(&format!("{m}{api_url}"), 15) {
@@ -3829,13 +3891,54 @@ fn fetch_redirect_tag(url: &str) -> Result<String, String> {
     })
 }
 
+/// In preview mode, list releases and pick the newest overall
+/// version (formal or prerelease): /releases/latest never returns a
+/// prerelease, so the list is the only way to see them. Entries whose
+/// tag is not a vN / vN.M tag are ignored.
+fn check_releases_list(custom: &str) -> Result<CheckOutcome, String> {
+    let api_url = format!("{}/releases?per_page=100", update_api_base());
+    let v = fetch_github_api(custom, &api_url)?;
+    let list = v
+        .as_array()
+        .ok_or_else(|| "GitHub 返回的发布列表格式不正确".to_string())?;
+    let mut best: Option<(CheckOutcome, (u64, u64))> = None;
+    for rel in list {
+        let out = match parse_release_json(rel) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let ver = match parse_pro_tag(&out.tag) {
+            Some(v) => v,
+            None => continue,
+        };
+        let better = match &best {
+            None => true,
+            Some((_, bv)) => ver > *bv,
+        };
+        if better {
+            best = Some((out, ver));
+        }
+    }
+    match best {
+        Some((out, _)) => Ok(out),
+        None => Err("发布列表里没有可识别的版本号".to_string()),
+    }
+}
+
 /// Check our repo's latest release, with acceleration retries: direct
 /// GitHub API first, then the API through each mirror, then the
 /// /releases/latest page (redirect tag only, no release notes) through
 /// each mirror and direct. Only when every path fails is the check a
-/// failure.
-fn check_latest_release(custom: &str) -> Result<CheckOutcome, String> {
-    let api_url = format!("{UPDATE_REPO_API}/releases/latest");
+/// failure. With `include_prerelease` the releases list is tried
+/// first; a failed list lookup falls through to the formal-only path
+/// below rather than failing the check outright.
+fn check_latest_release(custom: &str, include_prerelease: bool) -> Result<CheckOutcome, String> {
+    if include_prerelease {
+        if let Ok(out) = check_releases_list(custom) {
+            return Ok(out);
+        }
+    }
+    let api_url = format!("{}/releases/latest", update_api_base());
     if let Ok(v) = fetch_github_api(custom, &api_url) {
         return parse_release_json(&v);
     }
@@ -3997,7 +4100,8 @@ fn run_update_job(st: Arc<ApiState>, version: String) {
         return;
     }
     let custom = custom_mirror(&st);
-    let api_url = format!("{UPDATE_REPO_API}/releases/tags/{version}");
+    let api_url = format!("{}/releases/tags/{version}", update_api_base());
+    let asset_prefix = update_asset_prefix();
     let asset_name = update_asset_name(&version, platform);
     // Resolve the asset URL from the release metadata. If the API
     // lookup fails (rate-limited, blocked, or the release is gone),
@@ -4025,14 +4129,14 @@ fn run_update_job(st: Arc<ApiState>, version: String) {
                     }
                 }
             }
-            if url.is_empty() || !url.starts_with(UPDATE_ASSET_PREFIX) {
+            if url.is_empty() || !url.starts_with(&asset_prefix) {
                 finish_err(&st, format!("{version} 没有 {platform} 平台的安装包"));
                 return;
             }
             (url, size)
         }
         Err(_) => (
-            format!("{UPDATE_ASSET_PREFIX}{version}/{asset_name}"),
+            format!("{asset_prefix}{version}/{asset_name}"),
             0,
         ),
     };
@@ -4043,7 +4147,17 @@ fn run_update_job(st: Arc<ApiState>, version: String) {
     let part = upd_part_path(&st);
     let mut last_err = String::new();
     let mut ok = false;
-    for (label, url) in github_candidates(&custom, &asset_url) {
+    // A stub asset URL (test override, not github.com) cannot go
+    // through the mirror chain — the mirrors would only prepend dead
+    // prefixes to it — so it is fetched directly. Production asset
+    // URLs always start with the github.com prefix and keep the full
+    // mirror chain.
+    let candidates = if asset_url.starts_with("https://github.com/") {
+        github_candidates(&custom, &asset_url)
+    } else {
+        vec![("直连".to_string(), asset_url.clone())]
+    };
+    for (label, url) in candidates {
         set_upd_job(&st, |j| j.source = label.clone());
         let _ = std::fs::remove_file(&part);
         match download_to_file(&url, &part, 1800) {
@@ -4079,8 +4193,8 @@ fn run_update_job(st: Arc<ApiState>, version: String) {
     match extract_update(&part, &exe_dir) {
         Ok(()) => {
             let _ = std::fs::remove_file(&part);
-            // `version` passed the strict ^v[0-9]+$ check, so it needs
-            // no JSON escaping here.
+            // `version` passed the strict ^v[0-9]+(\.[0-9]+)?$ check,
+            // so it needs no JSON escaping here.
             let _ = std::fs::write(
                 staged_meta(&exe_dir),
                 format!("{{\"version\":\"{version}\"}}"),
@@ -4129,7 +4243,7 @@ async fn update_status(
         StatusCode::OK,
         json!({
             "ok": true,
-            "current": format!("v{}", PRO_VERSION),
+            "current": format!("v{}", FULL_VERSION),
             "current_num": current_pro_num(),
             "upstream_base": crate::version::VERSION,
             "platform": this_platform().unwrap_or("unknown"),
@@ -4149,6 +4263,7 @@ async fn update_status(
 async fn update_check(
     Extension(st): Extension<Arc<ApiState>>,
     headers: HeaderMap,
+    body: String,
 ) -> Response {
     let u = match resolve_user(&st, &headers).await {
         Some(u) => u,
@@ -4157,6 +4272,13 @@ async fn update_check(
     if !u.is_admin {
         return forbidden();
     }
+    // The console sends {include_prerelease: bool} from the update
+    // section's checkbox (localStorage-kept, default off); an empty
+    // or missing body means formal releases only, as before.
+    let include_prerelease = parse_body(&body)
+        .get("include_prerelease")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
     // Read the mirror setting with the handler's own async runtime —
     // custom_mirror() builds a throwaway runtime and must only run on
     // plain (non-tokio) threads like the download jobs.
@@ -4168,11 +4290,13 @@ async fn update_check(
     // The check can take a while when every source is slow (direct
     // API, then each mirror, then the redirect fallback), so it runs
     // on a blocking thread instead of an API worker.
-    let res = tokio::task::spawn_blocking(move || check_latest_release(&custom)).await;
+    let res =
+        tokio::task::spawn_blocking(move || check_latest_release(&custom, include_prerelease))
+            .await;
     match res {
         Ok(Ok(out)) => {
             let has_update = parse_pro_tag(&out.tag)
-                .map(|n| n > current_pro_num())
+                .map(|n| n > current_pro_version())
                 .unwrap_or(false);
             jresp(
                 StatusCode::OK,
@@ -4206,7 +4330,10 @@ async fn update_download(
     let v = parse_body(&body);
     let version = sfield(&v, "version");
     if !valid_version_param(&version) {
-        return err_resp(StatusCode::BAD_REQUEST, "版本号格式不正确（应为 v32 这样的格式）");
+        return err_resp(
+            StatusCode::BAD_REQUEST,
+            "版本号格式不正确（应为 v32 或 v32.1 这样的格式）",
+        );
     }
     if this_platform().is_none() {
         return err_resp(StatusCode::BAD_REQUEST, "当前平台不支持在线更新");
@@ -6508,25 +6635,61 @@ mod tests {
 
     #[test]
     fn update_tag_parsing() {
-        assert_eq!(parse_pro_tag("v32"), Some(32));
-        assert_eq!(parse_pro_tag("32"), Some(32));
-        assert_eq!(parse_pro_tag("v031"), Some(31));
-        assert_eq!(parse_pro_tag("v32.1"), None);
+        assert_eq!(parse_pro_tag("v32"), Some((32, 0)));
+        assert_eq!(parse_pro_tag("32"), Some((32, 0)));
+        assert_eq!(parse_pro_tag("v031"), Some((31, 0)));
+        assert_eq!(parse_pro_tag("v32.1"), Some((32, 1)));
+        assert_eq!(parse_pro_tag("v32.12"), Some((32, 12)));
+        assert_eq!(parse_pro_tag("v32.1.2"), None);
+        assert_eq!(parse_pro_tag("v32."), None);
+        assert_eq!(parse_pro_tag("v.1"), None);
+        assert_eq!(parse_pro_tag("vv32"), None);
         assert_eq!(parse_pro_tag("latest"), None);
         assert_eq!(parse_pro_tag("v"), None);
         assert_eq!(parse_pro_tag(""), None);
-        assert_eq!(parse_pro_tag("v32 "), Some(32));
+        assert_eq!(parse_pro_tag("v32 "), Some((32, 0)));
         assert_eq!(current_pro_num(), 45);
+        assert_eq!(current_pro_version(), (45, 0));
+    }
+
+    #[test]
+    fn update_version_ordering() {
+        let v = |t: &str| parse_pro_tag(t).unwrap();
+        assert!(v("v45") < v("v45.1"));
+        assert!(v("v45.1") < v("v45.2"));
+        assert!(v("v45.2") < v("v46"));
+        assert!(v("v45.10") > v("v45.9"));
+        assert_eq!(v("v45"), v("45"));
+    }
+
+    #[test]
+    fn update_full_version_defaults_to_pro_version() {
+        // No PRO_FULL_VERSION in the test build: the full version is
+        // the formal version, so formal builds behave exactly as
+        // before.
+        assert_eq!(FULL_VERSION, PRO_VERSION);
+    }
+
+    #[test]
+    fn update_github_base_defaults() {
+        // No PRO_UPDATE_BASE in the test environment: production URLs.
+        std::env::remove_var("PRO_UPDATE_BASE");
+        assert_eq!(update_api_base(), UPDATE_REPO_API);
+        assert_eq!(update_asset_prefix(), UPDATE_ASSET_PREFIX);
     }
 
     #[test]
     fn update_version_param() {
         assert!(valid_version_param("v32"));
         assert!(valid_version_param("v1"));
+        assert!(valid_version_param("v32.1"));
+        assert!(valid_version_param("v32.12"));
         assert!(!valid_version_param("32"));
         assert!(!valid_version_param("v"));
         assert!(!valid_version_param("v32x"));
-        assert!(!valid_version_param("v32.1"));
+        assert!(!valid_version_param("v32."));
+        assert!(!valid_version_param("v32.1.2"));
+        assert!(!valid_version_param("vv32"));
         assert!(!valid_version_param("https://example.com/x.zip"));
         assert!(!valid_version_param(""));
     }
@@ -6565,6 +6728,10 @@ mod tests {
         assert_eq!(
             update_asset_name("v31", "windows-x86_64"),
             "rustdesk-server-pro-windows-x86_64-v31.zip"
+        );
+        assert_eq!(
+            update_asset_name("v45.1", "linux-x86_64-glibc"),
+            "rustdesk-server-pro-linux-x86_64-glibc-v45.1.zip"
         );
     }
 
@@ -6695,7 +6862,7 @@ mod tests {
         let tag = fetch_redirect_tag(UPDATE_RELEASES_PAGE)
             .expect("redirect fallback must reach GitHub");
         let n = parse_pro_tag(&tag).expect("redirect tag must be a vN tag");
-        assert!(n >= 31, "expected at least v31, got {tag}");
+        assert!(n >= (31, 0), "expected at least v31, got {tag}");
     }
 
     fn release_fixture(tag: &str, names: &[&str]) -> Value {
