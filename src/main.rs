@@ -21,14 +21,14 @@ fn main() -> ResultType<()> {
         -M, --rmem=[NUMBER(default={RMEM})] 'Sets UDP recv buffer size, set system rmem_max first, e.g., sudo sysctl -w net.core.rmem_max=52428800. vi /etc/sysctl.conf, net.core.rmem_max=52428800, sudo sysctl –p'
         , --mask=[MASK] '[DEPRECATED] Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
         -k, --key=[KEY] 'Only allow the client with the same key'
-        , --api-listen=[ADDR(default=0.0.0.0:21114)] 'Sets the account API and web console listen address, \"off\" to disable'
+        , --api-listen=[ADDR(default=[::]:21114)] 'Sets the account API and web console listen address, \"off\" to disable'
         , --api-db=[FILE(default=api_v1.sqlite3)] 'Sets the API account database file'
         , --console-listen=[ADDR] 'Sets a separate listen address for the web console only; the API address then serves client endpoints only'
         , --tls-cert=[FILE] 'Enables HTTPS on the API/console listeners with this PEM certificate (requires --tls-key)'
         , --tls-key=[FILE] 'Sets the PEM private key matching --tls-cert'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
-    let api_listen = get_arg_or("api-listen", "0.0.0.0:21114".to_owned());
+    let api_listen = get_arg_or("api-listen", "[::]:21114".to_owned());
     if api_listen != "off" {
         let api_db = get_arg_or("api-db", "api_v1.sqlite3".to_owned());
         // The rendezvous needs the account database path for the

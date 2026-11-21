@@ -11,7 +11,7 @@
 //! - device binding via `/api/heartbeat` and `/api/sysinfo`
 //! - strategy push through heartbeat (e.g. hide-server-settings)
 //!
-//! Started from main.rs on `--api-listen` (default 0.0.0.0:21114).
+//! Started from main.rs on `--api-listen` (default [::]:21114).
 
 use crate::api_pages;
 use aes_gcm::{
@@ -36,7 +36,7 @@ use sqlx::{
 };
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
 };
@@ -5949,6 +5949,30 @@ fn load_tls_config(
     Ok(Arc::new(cfg))
 }
 
+/// Bind a TCP listener for the API/console planes, falling back to the
+/// IPv4 wildcard on the same port when an IPv6 listen address cannot be
+/// bound (host without IPv6, or a configured IPv6 address that is not
+/// assigned locally). Returns the bound listener and the address it
+/// actually listens on. An IPv4 bind failure, or a failed fallback bind,
+/// returns the original error.
+fn bind_listener_with_v6_fallback(
+    addr: SocketAddr,
+) -> std::io::Result<(std::net::TcpListener, SocketAddr)> {
+    match std::net::TcpListener::bind(addr) {
+        Ok(listener) => Ok((listener, addr)),
+        Err(e) => {
+            if addr.is_ipv6() {
+                let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
+                if let Ok(listener) = std::net::TcpListener::bind(v4) {
+                    log::warn!("failed to bind {addr} ({e}); falling back to {v4}");
+                    return Ok((listener, v4));
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 async fn serve_router(
     router: Router,
     addr: SocketAddr,
@@ -5957,12 +5981,15 @@ async fn serve_router(
     let make = router.into_make_service_with_connect_info::<SocketAddr>();
     match tls {
         None => {
-            axum::Server::bind(&addr).serve(make).await?;
+            let (listener, _) = bind_listener_with_v6_fallback(addr)
+                .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}"))?;
+            axum::Server::from_tcp(listener)?.serve(make).await?;
         }
         Some(cfg) => {
             let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
+            let (listener, _) = bind_listener_with_v6_fallback(addr)
+                .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}"))?;
+            let listener = tokio::net::TcpListener::from_std(listener)
                 .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}"))?;
             let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<TlsConn>>(64);
             tokio::spawn(async move {
@@ -8328,6 +8355,36 @@ mod tests {
             assert_eq!(v44_token_name(&st.pool, id).await, "admins");
             let _ = std::fs::remove_file(&path);
         });
+    }
+
+    #[test]
+    fn listen_fallback_uses_v4_when_v6_address_unavailable() {
+        // 2001:db8::/32 is documentation-only, never assigned locally.
+        let addr: SocketAddr = "[2001:db8::1]:0".parse().unwrap();
+        let (listener, effective) = bind_listener_with_v6_fallback(addr).unwrap();
+        assert!(effective.is_ipv4());
+        assert_eq!(effective.port(), 0);
+        let local = listener.local_addr().unwrap();
+        assert!(local.is_ipv4());
+        assert_ne!(local.port(), 0);
+    }
+
+    #[test]
+    fn listen_fallback_keeps_ipv4_failure() {
+        // 192.0.2.0/24 is TEST-NET-1, never assigned locally: an IPv4
+        // bind failure must surface as an error, not a fallback.
+        let addr: SocketAddr = "192.0.2.1:0".parse().unwrap();
+        assert!(bind_listener_with_v6_fallback(addr).is_err());
+    }
+
+    #[test]
+    fn listen_v6_wildcard_binds_or_falls_back() {
+        // On an IPv6 host the wildcard binds; on an IPv6-less host the
+        // fallback binds 0.0.0.0 instead. Either way the listener is up.
+        let addr: SocketAddr = "[::]:0".parse().unwrap();
+        let (listener, effective) = bind_listener_with_v6_fallback(addr).unwrap();
+        assert!(effective.is_ipv6() || effective.is_ipv4());
+        assert_ne!(listener.local_addr().unwrap().port(), 0);
     }
 
 }

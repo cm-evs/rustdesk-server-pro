@@ -161,7 +161,7 @@ func waitForKeyFile(dir string, stop <-chan struct{}) bool {
 }
 
 func (c serverConfig) hbbsArgs() []string {
-	args := []string{"-p", c.hbbsPort, "--api-listen", "0.0.0.0:" + c.apiPort}
+	args := []string{"-p", c.hbbsPort, "--api-listen", "[::]:" + c.apiPort}
 	if c.relayServers != "" {
 		args = append(args, "--relay-servers", c.relayServers)
 	}
