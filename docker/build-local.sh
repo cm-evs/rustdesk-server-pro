@@ -8,7 +8,7 @@
 #   PACKAGE_OR_DIR  Release zip (rustdesk-server-pro-linux-x86_64-glibc-v*.zip),
 #                   .tar.gz, or a directory containing hbbs and hbbr.
 #                   Default: newest rustdesk-server-pro-linux-x86_64-glibc-v*.zip
-#                   in ~/workspace/dist-pro (falls back to ./dist-pro).
+#                   in ./dist-pro.
 #   --classic       Build the classic image (docker-classic/) instead of the
 #                   s6 image (docker/).
 #   --tag TAG       Image tag. Default: ghcr.io/wirh/rustdesk-server-pro:local
@@ -16,7 +16,7 @@
 #
 # Examples:
 #   docker/build-local.sh
-#   docker/build-local.sh ~/workspace/dist-pro/rustdesk-server-pro-linux-x86_64-glibc-v44.zip
+#   docker/build-local.sh ./dist-pro/rustdesk-server-pro-linux-x86_64-glibc-v45.zip
 #   docker/build-local.sh --classic --tag myreg/pro-classic:local ./unpacked-dir
 #
 # The script copies hbbs/hbbr (and rustdesk-utils when available) into the
@@ -63,11 +63,11 @@ fi
 
 # Default source: newest linux glibc release package.
 if [ -z "$SRC" ]; then
-    for d in "$HOME/workspace/dist-pro" "$REPO_ROOT/dist-pro"; do
+    for d in "$REPO_ROOT/dist-pro"; do
         SRC=$(ls -t "$d"/rustdesk-server-pro-linux-x86_64-glibc-v*.zip 2>/dev/null | head -1 || true)
         [ -n "$SRC" ] && break
     done
-    [ -n "$SRC" ] || { echo "error: no rustdesk-server-pro-linux-x86_64-glibc-v*.zip found in ~/workspace/dist-pro or ./dist-pro; pass a package path or directory" >&2; exit 1; }
+    [ -n "$SRC" ] || { echo "error: no rustdesk-server-pro-linux-x86_64-glibc-v*.zip found in ./dist-pro; pass a package path or directory" >&2; exit 1; }
     echo "using default package: $SRC"
 fi
 [ -e "$SRC" ] || { echo "error: no such file or directory: $SRC" >&2; exit 1; }
