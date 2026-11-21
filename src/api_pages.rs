@@ -1021,7 +1021,8 @@ async function showRelay(id){
     '<h2>'+esc(n.name)+'<span class="badge">'+t('relay.badge')+'</span></h2>'+
     '<div class="table-wrapper" tabindex="0" role="region" aria-label="'+esc(n.name||t('relay.title'))+'"><table class="kv" style="min-width:360px"><colgroup><col style="width:30%"><col style="width:70%"></colgroup><tbody>'+
     '<tr><th>'+t('relay.status')+'</th><td>'+(n.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>')+'</td></tr>'+
-    '<tr><th>'+t('relay.address')+'</th><td>'+esc(n.address||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.address')+'</th><td>'+esc(n.address||n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.port')+'</th><td>'+(n.listen_port||'-')+'</td></tr>'+
     '<tr><th>'+t('relay.last_ip')+'</th><td>'+esc(n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
     '<tr><th>'+t('relay.agent_ver')+'</th><td>'+esc(n.agent_version||t('relay.unknown_time'))+'</td></tr>'+
     '<tr><th>'+t('relay.hbbr_ver')+'</th><td>'+esc(n.hbbr_version||t('relay.unknown_time'))+'</td></tr>'+
