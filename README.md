@@ -75,6 +75,8 @@ docker run -d --name rustdesk-pro \
 
 一体镜像同时跑 hbbs + hbbr；经典镜像（`ghcr.io/wirh/rustdesk-server-pro-classic`）一个容器跑一个服务，配合仓库根目录的 `docker-compose.yml` 使用。Docker Hub 同步发布：`tesx/rustdesk-server-pro` 与 `tesx/rustdesk-server-pro-classic`。详细部署方法见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
+数据在 `/data` 卷里（一体镜像）或挂载目录里（经典镜像）。v46 及更早的镜像把数据写进了容器内的 `/usr/bin`，升级到 v46.1 前先按 [docs/DEPLOY.md](docs/DEPLOY.md)「升级到 v46.1（数据迁移）」一节把旧数据拷出来，否则重建容器后数据丢失。
+
 ## 构建
 
 ```bash

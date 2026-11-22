@@ -48,6 +48,43 @@ cd rustdesk-server-pro-linux-*
 
 ## Docker 部署
 
+> [!WARNING]
+> **Docker 用户升级到 v46.1 前必须先迁移数据。** v46 及更早的镜像把运行时数据写进了容器内的 `/usr/bin`（`/data` 卷始终为空）；直接拉新镜像重建容器，旧数据全部丢失：密钥变了，已配好的客户端连不上；账号库丢了，账号与 API key 全没了。先把旧容器里的数据拷出来，再重建：
+>
+> 一体镜像（容器名 `rustdesk-pro`，卷名 `rustdesk-pro-data`）：
+>
+> ```bash
+> docker stop rustdesk-pro
+> mkdir -p /tmp/rustdesk-migrate
+> docker cp rustdesk-pro:/usr/bin/db_v2.sqlite3 /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/api_v1.sqlite3 /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/id_ed25519 /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/id_ed25519.pub /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/logs /tmp/rustdesk-migrate/
+> docker run --rm -v rustdesk-pro-data:/data -v /tmp/rustdesk-migrate:/migrate \
+>   busybox sh -c 'cp /migrate/db_v2.sqlite3 /migrate/api_v1.sqlite3 /migrate/id_ed25519 /migrate/id_ed25519.pub /data/ && cp -r /migrate/logs /data/'
+> docker pull ghcr.io/wirh/rustdesk-server-pro:v46.1
+> docker rm rustdesk-pro
+> # 按下文「一体镜像」命令重建容器，镜像标签用 :v46.1（预览版不移动 latest）
+> ```
+>
+> 经典镜像（compose，容器名 `hbbs` / `hbbr`，数据目录 `./data`）：
+>
+> ```bash
+> docker compose stop
+> docker cp hbbs:/usr/bin/db_v2.sqlite3 ./data/
+> docker cp hbbs:/usr/bin/api_v1.sqlite3 ./data/
+> docker cp hbbs:/usr/bin/id_ed25519 ./data/
+> docker cp hbbs:/usr/bin/id_ed25519.pub ./data/
+> docker cp hbbs:/usr/bin/logs ./data/
+> docker cp hbbr:/usr/bin/logs/hbbr.log ./data/logs/
+> # 预览版不移动 latest 标签：把 docker-compose.yml 里的两个镜像标签改成 :v46.1
+> docker compose pull
+> docker compose up -d
+> ```
+>
+> 旧容器已删则数据无法找回。完整说明见下文「升级到 v46.1（数据迁移）」。
+
 两个镜像，版本标签与 Release 一致（`v45`、`latest` 等），支持 amd64 / arm64 / armv7 / i386：
 
 | 镜像 | 说明 |
@@ -66,14 +103,14 @@ docker run -d --name rustdesk-pro \
   ghcr.io/wirh/rustdesk-server-pro:latest
 ```
 
-- 数据（密钥、账号库）存在 `/data`，删容器不丢数据，卷删了才丢
+- 数据存在 `/data` 卷里：密钥（`id_ed25519`、`id_ed25519.pub`）、账号库（`db_v2.sqlite3`、`api_v1.sqlite3`）与日志（`logs/`）。删容器不丢数据，卷删了才丢
 - `RELAY` 填服务器公网地址（域名或公网 IP），中继地址由此分发
 - `ENCRYPTED_ONLY=1`：只接受带密钥的加密连接（hbbs/hbbr 加 `-k _`）
 - 首次启动后打开 `http://<服务器IP>:21114/console/register` 注册账号，第一个注册的用户自动成为管理员，后续步骤同上文「快速开始」
 
 ### 经典镜像（compose）
 
-仓库根目录的 `docker-compose.yml` 即是现成配置：hbbs、hbbr 各一个容器，共用 `./data`（密钥与账号库都在里面）。把文件里的 `rustdesk.example.com` 改成服务器公网地址后：
+仓库根目录的 `docker-compose.yml` 即是现成配置：hbbs、hbbr 各一个容器，共用 `./data`。容器内工作目录是 `/root`，数据（密钥、账号库、日志）落在挂载的 `./data` 里。把文件里的 `rustdesk.example.com` 改成服务器公网地址后：
 
 ```bash
 docker compose up -d
@@ -89,6 +126,46 @@ docker compose up -d   # 或 docker run 重建
 ```
 
 Docker 部署不走控制台一键更新（一键更新只换宿主机上的 hbbs 二进制）。
+
+### 升级到 v46.1（数据迁移）
+
+v46 及更早的镜像有个缺陷：hbbs/hbbr 启动时把工作目录锚到二进制所在目录 `/usr/bin`，运行时数据（密钥、账号库、日志）写进了容器内的 `/usr/bin`，`/data` 卷（经典镜像是 `./data`）始终为空。升级到 v46.1 前，先把旧容器里的数据拷出来，否则重建容器后数据丢失：密钥变了，已配好的客户端连不上；账号库丢了，账号与 API key 全没了。旧容器已删则数据无法找回。
+
+一体镜像（容器名 `rustdesk-pro`，卷名 `rustdesk-pro-data`）：
+
+```bash
+docker stop rustdesk-pro
+mkdir -p /tmp/rustdesk-migrate
+docker cp rustdesk-pro:/usr/bin/db_v2.sqlite3 /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/api_v1.sqlite3 /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/id_ed25519 /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/id_ed25519.pub /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/logs /tmp/rustdesk-migrate/
+docker run --rm -v rustdesk-pro-data:/data -v /tmp/rustdesk-migrate:/migrate \
+  busybox sh -c 'cp /migrate/db_v2.sqlite3 /migrate/api_v1.sqlite3 /migrate/id_ed25519 /migrate/id_ed25519.pub /data/ && cp -r /migrate/logs /data/'
+docker pull ghcr.io/wirh/rustdesk-server-pro:v46.1
+docker rm rustdesk-pro
+# 按上文「一体镜像」命令重建容器，镜像标签改成 :v46.1（预览版不移动 latest）
+```
+
+用 `-v ./data:/data` 绑定挂载的，直接把文件拷进宿主的 `./data` 目录，无需临时容器。
+
+经典镜像（compose，容器名 `hbbs` / `hbbr`，数据目录 `./data`）：
+
+```bash
+docker compose stop
+docker cp hbbs:/usr/bin/db_v2.sqlite3 ./data/
+docker cp hbbs:/usr/bin/api_v1.sqlite3 ./data/
+docker cp hbbs:/usr/bin/id_ed25519 ./data/
+docker cp hbbs:/usr/bin/id_ed25519.pub ./data/
+docker cp hbbs:/usr/bin/logs ./data/
+docker cp hbbr:/usr/bin/logs/hbbr.log ./data/logs/
+# 预览版不移动 latest 标签：把 docker-compose.yml 里的两个镜像标签改成 :v46.1
+docker compose pull
+docker compose up -d
+```
+
+hbbr 容器里只有日志（默认不启用中继密钥校验，不生成密钥），数据库与密钥只从 hbbs 容器拷。拷完确认 `./data` 里有 `db_v2.sqlite3`、`api_v1.sqlite3`、`id_ed25519`、`id_ed25519.pub` 再重建容器。
 
 ### 本地构建镜像
 

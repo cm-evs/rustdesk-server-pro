@@ -50,6 +50,7 @@ in the inherited process environment.
 | `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
 | `MAX_PUNCH_REQUESTS` 🅴 | *(none)* | `100000` | Number of punch-request records kept in memory for the `punch-requests` [console](#runtime-console) command; the oldest is dropped when full. `0` disables recording. |
 | `MAX_MESSAGE_KB` 🅴 | *(none)* | `64` | Largest message, in KiB, that `hbbs` accepts on its TCP and WebSocket listeners; a connection that sends a bigger one is dropped. Capped at `65536`. The default fits an online-status query for about 5000 standard 9–10 digit IDs, fewer with long custom IDs; a client whose query is too big shows no online status. |
+| `RD_SKIP_ANCHOR` 🅴 | *(none)* | *(unset)* | `1` keeps the inherited working directory instead of anchoring it to the executable's directory. Both `hbbs` and `hbbr` read it. The Docker images set it so runtime data lands in the volume (`/data` for the s6 image, `/root` for the classic image) instead of `/usr/bin`. Leave it unset for host installs. |
 
 🅴 = set through the inherited process environment.
 
@@ -191,6 +192,10 @@ by `hbbs`/`hbbr` directly:
 
 Any variable from the tables above can also be passed straight through the
 container's environment (e.g. `-e ALWAYS_USE_RELAY=Y`, `-e RUST_LOG=debug`).
+
+Both images also set `RD_SKIP_ANCHOR=1` in the image itself (read by
+`hbbs`/`hbbr` directly, see the `hbbs` table above), so runtime data lands in
+the volume instead of `/usr/bin`.
 
 The classic scratch image (`rustdesk/rustdesk-server`) contains only the
 binaries and does **not** implement `RELAY`, `ENCRYPTED_ONLY`, `KEY_PUB`, or
