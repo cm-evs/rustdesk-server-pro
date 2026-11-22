@@ -69,6 +69,22 @@ struct Sink {
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
+// v46.2: the console's rotation toggle pushes a fresh RELAY_SERVERS
+// list to the running rendezvous loop through this sender, so a
+// change takes effect without restarting hbbs. Set once in
+// start_with_bind; unset while rendezvous is not running (then the
+// push misses and the caller falls back to "applies at restart").
+static RELAY_SERVERS_SENDER: std::sync::OnceLock<Sender> = std::sync::OnceLock::new();
+
+/// Push a new relay-servers list (comma-separated, as in
+/// RELAY_SERVERS) to the running rendezvous loop. Returns false when
+/// rendezvous is not running in this process.
+pub(crate) fn push_relay_servers(list: &str) -> bool {
+    match RELAY_SERVERS_SENDER.get() {
+        Some(tx) => tx.send(Data::RelayServers0(list.to_owned())).is_ok(),
+        None => false,
+    }
+}
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
@@ -198,6 +214,8 @@ impl RendezvousServer {
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
+        // v46.2: let the console push a fresh relay list live.
+        let _ = RELAY_SERVERS_SENDER.set(tx.clone());
         let software_url = get_arg("software-url");
         let version = hbb_common::get_version_from_url(&software_url);
         if !version.is_empty() {
@@ -2093,6 +2111,14 @@ mod tests {
             "/nonexistent-dir-xyz/no-such-db.sqlite3",
         )
         .await;
+    }
+
+    #[test]
+    fn push_relay_servers_false_without_rendezvous() {
+        // v46.2: the live push misses (returns false) when no
+        // rendezvous loop runs in this process — the sender is only
+        // set by start_with_bind, which no test starts.
+        assert!(!push_relay_servers("relay.example.com"));
     }
 
     #[hbb_common::tokio::test]
