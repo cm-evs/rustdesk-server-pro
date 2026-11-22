@@ -1,0 +1,7 @@
+# Pass the preview full version into the cross build container so
+# build.rs can bake it into hbbs (see build.rs: PRO_FULL_VERSION).
+# Cross drops arbitrary host variables at the container boundary by
+# default; only listed variables get through. Formal builds leave
+# PRO_FULL_VERSION unset, so this changes nothing for them.
+[build.env]
+passthrough = ["PRO_FULL_VERSION"]

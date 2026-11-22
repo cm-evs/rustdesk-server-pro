@@ -729,6 +729,43 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), contents);
         std::env::set_current_dir(directory.path().parent().unwrap()).unwrap();
     }
+
+    #[test]
+    fn anchor_skip_flag_reads_env() {
+        // One test covers every value so no two tests race on the
+        // process-wide variable; the previous value is restored after.
+        // Only anchor_skipped reads this variable, and no other test
+        // calls it.
+        let previous = std::env::var_os(SKIP_ANCHOR_ENV);
+        std::env::remove_var(SKIP_ANCHOR_ENV);
+        assert!(!anchor_skipped());
+        for value in ["0", "", "true", "yes", "2"] {
+            std::env::set_var(SKIP_ANCHOR_ENV, value);
+            assert!(!anchor_skipped(), "value {value:?} must not skip the anchor");
+        }
+        std::env::set_var(SKIP_ANCHOR_ENV, "1");
+        assert!(anchor_skipped());
+        match previous {
+            Some(value) => std::env::set_var(SKIP_ANCHOR_ENV, value),
+            None => std::env::remove_var(SKIP_ANCHOR_ENV),
+        }
+    }
+}
+
+/// Environment variable that opts out of the exe-directory anchor: when
+/// `RD_SKIP_ANCHOR` is set to `1`, the process keeps its inherited working
+/// directory. Intended for container images, where the data volume is the
+/// working directory (`/data` in the s6 image, `/root` in the classic
+/// image) and anchoring to the binary directory (`/usr/bin`) would put
+/// runtime data outside the volume. Any other value (including unset)
+/// keeps the default anchor behavior, so a bare release package run
+/// inside a container is unaffected unless the operator sets this
+/// explicitly.
+pub const SKIP_ANCHOR_ENV: &str = "RD_SKIP_ANCHOR";
+
+/// Whether the exe-directory anchor is skipped for this process.
+pub fn anchor_skipped() -> bool {
+    matches!(std::env::var(SKIP_ANCHOR_ENV).as_deref(), Ok("1"))
 }
 
 /// Anchor the process working directory to the directory containing
@@ -737,8 +774,12 @@ mod tests {
 /// server directory no matter where the process was launched from.
 /// Best effort: when the exe path cannot be determined, the inherited
 /// working directory is kept. Must run before any file is opened,
-/// including the logger.
+/// including the logger. Skipped entirely when `RD_SKIP_ANCHOR=1`
+/// (see [`SKIP_ANCHOR_ENV`]).
 pub fn anchor_to_exe_dir() {
+    if anchor_skipped() {
+        return;
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             if !dir.as_os_str().is_empty() {

@@ -14,6 +14,12 @@ COPY rootfs /
 
 ENV RELAY=relay.example.com
 ENV ENCRYPTED_ONLY=0
+# Keep the working directory (/data) instead of anchoring to the binary
+# directory (/usr/bin), so runtime data (databases, keys, logs) lands in
+# the volume and hbbs reads the key pair the key-secret service wrote
+# to /data. Without this, the s6 run scripts' `cd /data` is undone at
+# startup and every rebuild loses the data stored in /usr/bin.
+ENV RD_SKIP_ANCHOR=1
 
 EXPOSE 21114 21115 21116 21116/udp 21117 21118 21119
 

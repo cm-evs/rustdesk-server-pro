@@ -75,6 +75,8 @@ docker run -d --name rustdesk-pro \
 
 The all-in-one image runs hbbs + hbbr together; the classic image (`ghcr.io/wirh/rustdesk-server-pro-classic`) runs one service per container — use it with the `docker-compose.yml` at the repo root. Docker Hub publishes the same images: `tesx/rustdesk-server-pro` and `tesx/rustdesk-server-pro-classic`. See [docs/DEPLOY-en.md](docs/DEPLOY-en.md) for the full deployment guide.
 
+Runtime data lives in the `/data` volume (all-in-one image) or the mounted directory (classic image). Images v46 and earlier wrote the data into `/usr/bin` inside the container; before upgrading to v46.1, copy the old data out following the migration steps in [docs/DEPLOY-en.md](docs/DEPLOY-en.md), or it is lost when the container is recreated.
+
 ## Build
 
 ```bash

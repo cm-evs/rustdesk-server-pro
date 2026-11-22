@@ -40,6 +40,43 @@ Then, in the admin console:
 
 ## Docker Deployment
 
+> [!WARNING]
+> **Docker users must migrate their data before upgrading to v46.1.** Images v46 and earlier wrote runtime data into `/usr/bin` inside the container (the `/data` volume stayed empty); pulling the new image and recreating the container directly loses all old data: a new key means already-configured clients can no longer connect, and a lost account database means all accounts and API keys are gone. Copy the data out of the old container first, then recreate it:
+>
+> All-in-one image (container `rustdesk-pro`, volume `rustdesk-pro-data`):
+>
+> ```bash
+> docker stop rustdesk-pro
+> mkdir -p /tmp/rustdesk-migrate
+> docker cp rustdesk-pro:/usr/bin/db_v2.sqlite3 /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/api_v1.sqlite3 /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/id_ed25519 /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/id_ed25519.pub /tmp/rustdesk-migrate/
+> docker cp rustdesk-pro:/usr/bin/logs /tmp/rustdesk-migrate/
+> docker run --rm -v rustdesk-pro-data:/data -v /tmp/rustdesk-migrate:/migrate \
+>   busybox sh -c 'cp /migrate/db_v2.sqlite3 /migrate/api_v1.sqlite3 /migrate/id_ed25519 /migrate/id_ed25519.pub /data/ && cp -r /migrate/logs /data/'
+> docker pull ghcr.io/wirh/rustdesk-server-pro:v46.1
+> docker rm rustdesk-pro
+> # Recreate the container with the all-in-one command below, using the :v46.1 tag (previews never move latest)
+> ```
+>
+> Classic image (compose, containers `hbbs` / `hbbr`, data directory `./data`):
+>
+> ```bash
+> docker compose stop
+> docker cp hbbs:/usr/bin/db_v2.sqlite3 ./data/
+> docker cp hbbs:/usr/bin/api_v1.sqlite3 ./data/
+> docker cp hbbs:/usr/bin/id_ed25519 ./data/
+> docker cp hbbs:/usr/bin/id_ed25519.pub ./data/
+> docker cp hbbs:/usr/bin/logs ./data/
+> docker cp hbbr:/usr/bin/logs/hbbr.log ./data/logs/
+> # Previews never move the latest tag: change both image tags in docker-compose.yml to :v46.1
+> docker compose pull
+> docker compose up -d
+> ```
+>
+> If the old container is already deleted, the data is unrecoverable. See "Upgrading to v46.1 (data migration)" below for the full steps.
+
 Two images, tagged the same as the releases (`v45`, `latest`, etc.), built for amd64 / arm64 / armv7 / i386:
 
 | Image | Notes |
@@ -58,14 +95,14 @@ docker run -d --name rustdesk-pro \
   ghcr.io/wirh/rustdesk-server-pro:latest
 ```
 
-- Data (keys, account database) lives in `/data`: removing the container keeps it, deleting the volume loses it
+- Data lives in the `/data` volume: keys (`id_ed25519`, `id_ed25519.pub`), account databases (`db_v2.sqlite3`, `api_v1.sqlite3`), and logs (`logs/`). Removing the container keeps it; deleting the volume loses it
 - Set `RELAY` to the server's public address (domain or public IP); the relay address is distributed from it
 - `ENCRYPTED_ONLY=1`: only accept key-authenticated encrypted connections (adds `-k _` to hbbs/hbbr)
 - After the first start, open `http://<server-ip>:21114/console/register` and register an account; the first registered user automatically becomes admin. The remaining steps are the same as in "Quick Start" above.
 
 ### Classic image (compose)
 
-The `docker-compose.yml` at the repo root is a ready-made setup: one container each for hbbs and hbbr, sharing `./data` (keys and account database live there). Replace `rustdesk.example.com` in the file with the server's public address, then:
+The `docker-compose.yml` at the repo root is a ready-made setup: one container each for hbbs and hbbr, sharing `./data`. Inside the containers the working directory is `/root`, so the data (keys, account databases, logs) lands in the mounted `./data`. Replace `rustdesk.example.com` in the file with the server's public address, then:
 
 ```bash
 docker compose up -d
@@ -81,6 +118,46 @@ docker compose up -d   # or recreate with docker run
 ```
 
 Docker deployments do not use the console's one-click updater (it only swaps the hbbs binary on a host install).
+
+### Upgrading to v46.1 (data migration)
+
+Images v46 and earlier have a defect: on startup, hbbs/hbbr anchored the working directory to the binary directory `/usr/bin`, so runtime data (keys, account databases, logs) went into `/usr/bin` inside the container while the `/data` volume (`./data` for the classic image) stayed empty. Copy the data out of the old container before upgrading to v46.1, or it is lost when the container is recreated: a new key means already-configured clients can no longer connect, and a lost account database means all accounts and API keys are gone. If the old container is already deleted, the data is unrecoverable.
+
+All-in-one image (container `rustdesk-pro`, volume `rustdesk-pro-data`):
+
+```bash
+docker stop rustdesk-pro
+mkdir -p /tmp/rustdesk-migrate
+docker cp rustdesk-pro:/usr/bin/db_v2.sqlite3 /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/api_v1.sqlite3 /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/id_ed25519 /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/id_ed25519.pub /tmp/rustdesk-migrate/
+docker cp rustdesk-pro:/usr/bin/logs /tmp/rustdesk-migrate/
+docker run --rm -v rustdesk-pro-data:/data -v /tmp/rustdesk-migrate:/migrate \
+  busybox sh -c 'cp /migrate/db_v2.sqlite3 /migrate/api_v1.sqlite3 /migrate/id_ed25519 /migrate/id_ed25519.pub /data/ && cp -r /migrate/logs /data/'
+docker pull ghcr.io/wirh/rustdesk-server-pro:v46.1
+docker rm rustdesk-pro
+# Recreate the container with the all-in-one command above, using the :v46.1 tag (previews never move latest)
+```
+
+With a bind mount (`-v ./data:/data`), copy the files straight into the host's `./data` directory instead of using the temporary container.
+
+Classic image (compose, containers `hbbs` / `hbbr`, data directory `./data`):
+
+```bash
+docker compose stop
+docker cp hbbs:/usr/bin/db_v2.sqlite3 ./data/
+docker cp hbbs:/usr/bin/api_v1.sqlite3 ./data/
+docker cp hbbs:/usr/bin/id_ed25519 ./data/
+docker cp hbbs:/usr/bin/id_ed25519.pub ./data/
+docker cp hbbs:/usr/bin/logs ./data/
+docker cp hbbr:/usr/bin/logs/hbbr.log ./data/logs/
+# Previews never move the latest tag: change both image tags in docker-compose.yml to :v46.1
+docker compose pull
+docker compose up -d
+```
+
+The hbbr container holds only logs (relay key validation is off by default, so it generates no keys); copy the databases and keys from the hbbs container only. Check that `./data` contains `db_v2.sqlite3`, `api_v1.sqlite3`, `id_ed25519`, and `id_ed25519.pub` before recreating the containers.
 
 ### Building the image locally
 
