@@ -857,7 +857,10 @@ jobs:
           # public key file keeps the injected value, the startup log
           # shows it as the server's active key, and hbbs read the key
           # instead of generating a fresh pair.
-          if [ "$(cat /tmp/smoke-data/id_ed25519.pub)" != "$KEY_PUB" ]; then
+          # Read it from inside the container: key-secret chmods the key
+          # files 0600 root-owned, so the runner cannot cat them from the
+          # host side of the bind mount.
+          if [ "$(docker exec rustdesk-smoke cat /data/id_ed25519.pub)" != "$KEY_PUB" ]; then
             echo "id_ed25519.pub in /data does not match the injected KEY_PUB"
             exit 1
           fi
