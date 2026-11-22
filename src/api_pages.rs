@@ -722,7 +722,7 @@ const CONSOLE_BODY: &str = r#"
 <p class="muted"><button class="ghost" id="dev-refresh" data-i18n="dev.refresh">刷新</button> <span id="dev-updated"></span></p>
 <div id="dev-list" data-i18n="app.loading">加载中…</div></div>
 <div class="card adminonly" id="relay-card"><h2 data-i18n="relay.title">中继节点</h2>
-<p class="muted" data-i18n="relay.desc">中继节点由常驻代理（relay-agent）管理：代理注册后每 20 秒心跳上报状态，控制台下发的配置随心跳响应加密回传。注意：注册只建立管理关系，不会自动把节点加入中继轮询列表——轮询列表仍由服务器启动参数 RELAY_SERVERS 决定。</p>
+<p class="muted" data-i18n="relay.desc">中继节点由常驻代理（relay-agent）管理：代理注册后每 20 秒心跳上报状态，控制台下发的配置随心跳响应加密回传。注册只建立管理关系，不会自动把节点加入中继轮询列表；在节点详情页可手动加入或移除轮询。</p>
 <div class="err" id="relay-err"></div>
 <label data-i18n="relay.label">备注（可选）</label><input id="relay-label" placeholder="如：香港中继" data-i18n-ph="relay.label_ph">
 <label data-i18n="relay.expires">有效期（小时，1–168）</label><input id="relay-hours" type="number" value="24" min="1" max="168">
