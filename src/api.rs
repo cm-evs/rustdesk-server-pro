@@ -385,7 +385,7 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
         "create table if not exists ab_store(username text primary key, data text not null)",
         "create table if not exists captcha_codes(id text primary key, code_hash text not null, expires_at integer not null)",
         "create table if not exists relay_reg_tokens(token_id text primary key, link_key text not null, label text not null default '', created_by text not null, created_at integer not null, expires_at integer not null, used_at integer, used_by integer)",
-        "create table if not exists relay_nodes(id integer primary key autoincrement, name text not null, address text not null default '', last_ip text not null default '', public_ip text not null default '', link_key text not null, key_delivered integer not null default 0, registered_at integer not null, last_heartbeat integer not null default 0, agent_version text not null default '', hbbr_version text not null default '', hbbr_running integer not null default 0, hbbr_started_at integer not null default 0, listen_port integer not null default 0, sessions integer not null default 0, total_kbps integer not null default 0, config_json text not null default '{}', config_version integer not null default 1, applied_version integer not null default 0, pending_command text not null default '', created_by text not null default '')",
+        "create table if not exists relay_nodes(id integer primary key autoincrement, name text not null, address text not null default '', last_ip text not null default '', public_ip text not null default '', link_key text not null, key_delivered integer not null default 0, registered_at integer not null, last_heartbeat integer not null default 0, agent_version text not null default '', hbbr_version text not null default '', hbbr_running integer not null default 0, hbbr_started_at integer not null default 0, listen_port integer not null default 0, sessions integer not null default 0, total_kbps integer not null default 0, config_json text not null default '{}', config_version integer not null default 1, applied_version integer not null default 0, pending_command text not null default '', created_by text not null default '', rotation_entry text not null default '')",
         // v40: connection-audit records posted by the controlled side
         // (POST /api/audit/conn). nonce is UNIQUE: the client retries
         // a post for up to 120 s, and the insert is insert-or-ignore,
@@ -444,6 +444,18 @@ async fn init_db(path: &str) -> Result<SqlitePool, String> {
     // external lookup service and sends it in the heartbeat status.
     // Same duplicate-column tolerance as the migrations above.
     for s in ["alter table relay_nodes add column public_ip text not null default ''"] {
+        if let Err(e) = sqlx::query(s).execute(&pool).await {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(msg);
+            }
+        }
+    }
+    // v46.2: the exact RELAY_SERVERS entry written when the node was
+    // added to the rotation list, so removal deletes exactly that
+    // spelling. Same duplicate-column tolerance as the migrations
+    // above.
+    for s in ["alter table relay_nodes add column rotation_entry text not null default ''"] {
         if let Err(e) = sqlx::query(s).execute(&pool).await {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
@@ -5455,6 +5467,352 @@ async fn server_keypair(st: &ApiState) -> Result<(String, String), String> {
     Err("服务器密钥文件不存在，无法下发密钥（请确认服务端目录下有 id_ed25519 文件）".into())
 }
 
+/// server.env lives next to the server binary (see ApiState::exe_dir).
+fn server_env_path(exe_dir: &std::path::Path) -> PathBuf {
+    exe_dir.join("server.env")
+}
+
+/// The key of a `KEY=value` line, or None for blank lines, comments,
+/// and lines without `=`. Mirrors the winservice loader: surrounding
+/// whitespace is ignored, `#` starts a comment only at the start of
+/// the (trimmed) line.
+fn env_line_key(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (key, _) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
+/// Strip one pair of surrounding quotes, like the winservice loader.
+fn unquote_env_value(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let (first, last) = (&value[..1], &value[value.len() - 1..]);
+        if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+/// The RELAY_SERVERS entries in server.env text (last line wins, like
+/// the winservice loader). Missing key → empty list.
+fn relay_servers_from_env(text: &str) -> Vec<String> {
+    let mut value = "";
+    for line in text.lines() {
+        if env_line_key(line) == Some("RELAY_SERVERS") {
+            if let Some((_, v)) = line.split_once('=') {
+                value = v;
+            }
+        }
+    }
+    unquote_env_value(value)
+        .split(',')
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .collect()
+}
+
+/// Rewrite server.env text with a new RELAY_SERVERS value, keeping
+/// every other line (and comment) byte-identical. Appends the line
+/// when the key is absent; preserves the file's CRLF/LF style.
+/// Returns the new text and whether it differs from the old.
+fn update_relay_servers_in_env(text: &str, entries: &[String]) -> (String, bool) {
+    let new_line = format!("RELAY_SERVERS={}", entries.join(","));
+    if text.is_empty() {
+        return (format!("{new_line}\n"), true);
+    }
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let ends_with_nl = text.ends_with(nl);
+    let mut lines: Vec<String> = text.split(nl).map(|s| s.to_string()).collect();
+    if ends_with_nl {
+        lines.pop();
+    }
+    let mut found = false;
+    let mut changed = false;
+    for line in lines.iter_mut() {
+        if env_line_key(line) == Some("RELAY_SERVERS") {
+            found = true;
+            if *line != new_line {
+                *line = new_line.clone();
+                changed = true;
+            }
+        }
+    }
+    if !found {
+        lines.push(new_line);
+        changed = true;
+    }
+    let mut out = lines.join(nl);
+    if ends_with_nl {
+        out.push_str(nl);
+    }
+    (out, changed)
+}
+
+/// Read the RELAY_SERVERS list from server.env. A missing file means
+/// an empty list; any other read error is reported.
+fn read_relay_servers_env(path: &std::path::Path) -> Result<Vec<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(relay_servers_from_env(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("读取 server.env 失败：{e}")),
+    }
+}
+
+/// Atomically write a new RELAY_SERVERS list to server.env (temp file
+/// + rename in the same directory). Returns false when the file
+/// already holds exactly this list, so no write happens.
+fn write_relay_servers_env(path: &std::path::Path, entries: &[String]) -> Result<bool, String> {
+    let old = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取 server.env 失败：{e}")),
+    };
+    let (new_text, changed) = update_relay_servers_in_env(&old, entries);
+    if !changed {
+        return Ok(false);
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if let Err(e) = std::fs::write(&tmp, &new_text) {
+        return Err(format!("写入 server.env 失败：{e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入 server.env 失败：{e}"));
+    }
+    Ok(true)
+}
+
+/// Persist a new RELAY_SERVERS list to server.env and push it live to
+/// the rendezvous loop. Returns (file_updated, live_updated); a file
+/// error fails the whole call, a live-push miss only flips the flag
+/// (the file still takes effect at the next restart).
+fn apply_relay_servers(env_path: &std::path::Path, entries: &[String]) -> Result<(bool, bool), String> {
+    let file_updated = write_relay_servers_env(env_path, entries)?;
+    let live_updated = crate::rendezvous_server::push_relay_servers(&entries.join(","));
+    Ok((file_updated, live_updated))
+}
+
+/// The hbbr port for a relay node: the live listen_port when the
+/// agent reported one, else the port in the pushed config, else the
+/// hbbr default 21117.
+fn relay_node_port(listen_port: i64, config_json: &str) -> u16 {
+    if (1..=65535).contains(&listen_port) {
+        return listen_port as u16;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(config_json) {
+        if let Some(p) = v.get("port").and_then(|x| x.as_i64()) {
+            if (1..=65535).contains(&p) {
+                return p as u16;
+            }
+        }
+    }
+    DEFAULT_RELAY_PORT
+}
+
+/// The address a relay node is reached at: the first non-empty of
+/// address / public_ip / last_ip, the same order the detail page
+/// shows.
+fn resolve_rotation_host(address: &str, public_ip: &str, last_ip: &str) -> Option<String> {
+    [address, public_ip, last_ip]
+        .into_iter()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Build a RELAY_SERVERS entry from a host and its hbbr port. A port
+/// already present in the host is dropped first (the resolved port is
+/// the source of truth). The default port 21117 gets no suffix; IPv6
+/// literals are always bracketed with an explicit port, because
+/// get_servers resolves each entry with to_socket_addrs, which needs
+/// host:port.
+fn build_rotation_entry(host: &str, port: u16) -> String {
+    let host = host_part(host).trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let host = match norm_ip(host) {
+        Some(ip) => peer_ip_string(ip),
+        None => host.to_string(),
+    };
+    if host
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_ipv6())
+        .unwrap_or(false)
+    {
+        format!("[{host}]:{port}")
+    } else if port == DEFAULT_RELAY_PORT {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Is this a globally routable unicast address? `IpAddr::is_global`
+/// is still unstable, so the check is spelled out: the stable
+/// predicates plus octet checks for the ranges whose helpers are
+/// unstable (reserved 0/8 + 240/4, CGNAT 100.64/10, benchmarking
+/// 198.18/15) and the IPv6 documentation prefix 2001:db8::/32.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let reserved = o[0] == 0 || o[0] >= 240;
+            let shared = o[0] == 100 && (64..=127).contains(&o[1]);
+            let benchmarking = o[0] == 198 && (18..=19).contains(&o[1]);
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || reserved
+                || shared
+                || benchmarking)
+        }
+        IpAddr::V6(v6) => {
+            let doc = v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8;
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || doc)
+        }
+    }
+}
+
+/// A rotation entry's host must be a public address: last_ip is
+/// NAT-rewritten by the router, so a private/loopback/link-local/
+/// unspecified literal IP here means the node cannot serve as a
+/// relay. Domains pass through unchecked.
+fn validate_public_host(host: &str) -> Result<(), String> {
+    let host = host_part(host).trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match norm_ip(host) {
+        Some(ip) => {
+            if is_public_ip(ip) {
+                Ok(())
+            } else {
+                Err(format!("{host} 不是公网地址，无法加入轮询"))
+            }
+        }
+        None => {
+            if host.contains(':') {
+                return Err(format!("地址格式无效：{host}"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The RELAY_SERVERS entry for a relay node: its resolved address
+/// with a `:port` suffix when the hbbr port is not 21117. Fails when
+/// the node has no address, or its address is not public.
+fn relay_rotation_entry(
+    address: &str,
+    public_ip: &str,
+    last_ip: &str,
+    port: u16,
+) -> Result<String, String> {
+    let host = resolve_rotation_host(address, public_ip, last_ip)
+        .ok_or_else(|| "该节点没有可用地址，无法加入轮询".to_string())?;
+    validate_public_host(&host)?;
+    Ok(build_rotation_entry(&host, port))
+}
+
+/// Normalize a rotation entry for comparison: lowercase host (IP
+/// literals in canonical form, IPv4-mapped IPv6 folded to IPv4),
+/// default port 21117 when absent. Unparseable entries give None.
+fn normalize_rotation_entry(entry: &str) -> Option<(String, u16)> {
+    let host = host_part(entry).trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() {
+        return None;
+    }
+    let host = match norm_ip(host) {
+        Some(ip) => peer_ip_string(ip),
+        None => {
+            if host.contains(':') {
+                return None;
+            }
+            host.trim_end_matches('.').to_lowercase()
+        }
+    };
+    Some((host, port_suffix(entry).unwrap_or(DEFAULT_RELAY_PORT)))
+}
+
+/// Do two rotation entries name the same relay? Exact match first,
+/// then normalized (host + port, default 21117) match as a fallback
+/// for spelling differences.
+fn rotation_entries_match(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    if a == b {
+        return true;
+    }
+    match (normalize_rotation_entry(a), normalize_rotation_entry(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Remove a node's rotation entries from the list: the stored entry
+/// (exact or normalized match) and, as a fallback for nodes added
+/// before v46.2, the entry resolved from its current addresses.
+/// Nothing else is touched — in particular the main server's own
+/// relay address stays.
+fn remove_rotation_entries(
+    entries: &[String],
+    stored: &str,
+    candidate: Option<&str>,
+) -> (Vec<String>, bool) {
+    let stored = stored.trim();
+    let mut removed = false;
+    let kept: Vec<String> = entries
+        .iter()
+        .filter(|e| {
+            let drop = (!stored.is_empty() && rotation_entries_match(e, stored))
+                || candidate.map(|c| rotation_entries_match(e, c)).unwrap_or(false);
+            if drop {
+                removed = true;
+            }
+            !drop
+        })
+        .cloned()
+        .collect();
+    (kept, removed)
+}
+
+/// Is the node in the rotation list? Judged by server.env (the
+/// console's management view): the stored entry, or the entry
+/// resolved from its current addresses.
+fn node_in_rotation(stored: &str, candidate: Option<&str>, env_entries: &[String]) -> bool {
+    let stored = stored.trim();
+    env_entries.iter().any(|e| {
+        (!stored.is_empty() && rotation_entries_match(e, stored))
+            || candidate.map(|c| rotation_entries_match(e, c)).unwrap_or(false)
+    })
+}
+
 fn relay_node_summary(r: &sqlx::sqlite::SqliteRow, now_ts: i64) -> Value {
     let last_hb = r.try_get::<i64, _>("last_heartbeat").unwrap_or(0);
     json!({
@@ -6066,13 +6424,181 @@ async fn relays_detail(
         .unwrap_or_default();
     node["config"] = serde_json::from_str::<Value>(&cfg).unwrap_or(Value::Null);
     node["created_by"] = json!(row.try_get::<String, _>("created_by").unwrap_or_default());
+    // v46.2: rotation membership is judged by server.env (the
+    // console's management view), not by the live rendezvous list.
+    let stored = row
+        .try_get::<String, _>("rotation_entry")
+        .unwrap_or_default();
+    let port = relay_node_port(row.try_get::<i64, _>("listen_port").unwrap_or(0), &cfg);
+    let candidate = resolve_rotation_host(
+        &row.try_get::<String, _>("address").unwrap_or_default(),
+        &row.try_get::<String, _>("public_ip").unwrap_or_default(),
+        &row.try_get::<String, _>("last_ip").unwrap_or_default(),
+    )
+    .map(|h| build_rotation_entry(&h, port));
+    let env_entries = match read_relay_servers_env(&server_env_path(&st.exe_dir)) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("rotation status: {e}");
+            Vec::new()
+        }
+    };
+    node["in_rotation"] = json!(node_in_rotation(&stored, candidate.as_deref(), &env_entries));
+    node["rotation_entry"] = json!(stored);
     jresp(StatusCode::OK, json!({ "ok": true, "node": node }))
+}
+
+/// Add a relay node to (or remove it from) the rotation list (admin
+/// only). Writes server.env RELAY_SERVERS (survives restart) and
+/// pushes the new list live to rendezvous (no restart needed). When
+/// the live push misses (rendezvous not running in this process),
+/// the file still stands and the change applies at the next restart;
+/// the response reports that with live_updated=false.
+async fn relays_rotation(
+    Extension(st): Extension<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: String,
+) -> Response {
+    if let Err(r) = relay_admin(&st, &headers).await {
+        return r;
+    }
+    let v = parse_body(&body);
+    let want = match v.get("in_rotation").and_then(|x| x.as_bool()) {
+        Some(b) => b,
+        None => return err_resp(StatusCode::BAD_REQUEST, "参数 in_rotation 缺失或无效"),
+    };
+    let row = sqlx::query(
+        "select address, last_ip, public_ip, listen_port, config_json, rotation_entry from relay_nodes where id=?",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await;
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return err_resp(StatusCode::NOT_FOUND, "中继节点不存在"),
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let address = row.try_get::<String, _>("address").unwrap_or_default();
+    let last_ip = row.try_get::<String, _>("last_ip").unwrap_or_default();
+    let public_ip = row.try_get::<String, _>("public_ip").unwrap_or_default();
+    let cfg = row.try_get::<String, _>("config_json").unwrap_or_default();
+    let stored = row
+        .try_get::<String, _>("rotation_entry")
+        .unwrap_or_default();
+    let port = relay_node_port(row.try_get::<i64, _>("listen_port").unwrap_or(0), &cfg);
+    let env_path = server_env_path(&st.exe_dir);
+    let entries = match read_relay_servers_env(&env_path) {
+        Ok(e) => e,
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    // The candidate entry for matching never requires a public IP:
+    // the node may have been added while its address was public.
+    let candidate = resolve_rotation_host(&address, &public_ip, &last_ip)
+        .map(|h| build_rotation_entry(&h, port));
+    if want {
+        // Already in the list under the stored entry: no-op even when
+        // the node's current address would no longer validate.
+        if !stored.trim().is_empty() {
+            if let Some(in_file) = entries
+                .iter()
+                .find(|e| rotation_entries_match(e, &stored))
+            {
+                return jresp(
+                    StatusCode::OK,
+                    json!({
+                        "ok": true, "in_rotation": true, "file_updated": false,
+                        "live_updated": true, "rotation_entry": in_file,
+                    }),
+                );
+            }
+        }
+        let entry = match relay_rotation_entry(&address, &public_ip, &last_ip, port) {
+            Ok(e) => e,
+            Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e),
+        };
+        // Already in the list under the resolved entry (e.g. added by
+        // hand before v46.2): no-op, but remember the spelling
+        // actually in the file so removal later deletes exactly that.
+        if let Some(in_file) = entries.iter().find(|e| rotation_entries_match(e, &entry)) {
+            let in_file = in_file.clone();
+            if in_file != stored {
+                if let Err(e) = sqlx::query("update relay_nodes set rotation_entry=? where id=?")
+                    .bind(&in_file)
+                    .bind(id)
+                    .execute(&st.pool)
+                    .await
+                {
+                    log::warn!("rotation: failed to store entry for node {id}: {e}");
+                }
+            }
+            return jresp(
+                StatusCode::OK,
+                json!({
+                    "ok": true, "in_rotation": true, "file_updated": false,
+                    "live_updated": true, "rotation_entry": in_file,
+                }),
+            );
+        }
+        let mut next = entries.clone();
+        next.push(entry.clone());
+        let (file_updated, live_updated) = match apply_relay_servers(&env_path, &next) {
+            Ok(r) => r,
+            Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        };
+        if let Err(e) = sqlx::query("update relay_nodes set rotation_entry=? where id=?")
+            .bind(&entry)
+            .bind(id)
+            .execute(&st.pool)
+            .await
+        {
+            log::warn!("rotation: failed to store entry for node {id}: {e}");
+        }
+        jresp(
+            StatusCode::OK,
+            json!({
+                "ok": true, "in_rotation": true, "file_updated": file_updated,
+                "live_updated": live_updated, "rotation_entry": entry,
+            }),
+        )
+    } else {
+        let (next, removed) = remove_rotation_entries(&entries, &stored, candidate.as_deref());
+        if !removed {
+            return jresp(
+                StatusCode::OK,
+                json!({
+                    "ok": true, "in_rotation": false, "file_updated": false,
+                    "live_updated": true, "rotation_entry": stored,
+                }),
+            );
+        }
+        let (file_updated, live_updated) = match apply_relay_servers(&env_path, &next) {
+            Ok(r) => r,
+            Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        };
+        if let Err(e) = sqlx::query("update relay_nodes set rotation_entry='' where id=?")
+            .bind(id)
+            .execute(&st.pool)
+            .await
+        {
+            log::warn!("rotation: failed to clear entry for node {id}: {e}");
+        }
+        jresp(
+            StatusCode::OK,
+            json!({
+                "ok": true, "in_rotation": false, "file_updated": file_updated,
+                "live_updated": live_updated, "rotation_entry": "",
+            }),
+        )
+    }
 }
 
 /// Delete a relay node (admin only). The node credential dies with
 /// the row: the agent's next heartbeat fails lookup and it stops
 /// heartbeating (hbbr itself keeps running — the admin stops it on
-/// the relay host if the node is really gone).
+/// the relay host if the node is really gone). The node is also
+/// dropped from the rotation list (server.env + live); a failure
+/// there only warns — it never fails the delete itself.
 async fn relays_delete(
     Extension(st): Extension<Arc<ApiState>>,
     headers: HeaderMap,
@@ -6081,12 +6607,74 @@ async fn relays_delete(
     if let Err(r) = relay_admin(&st, &headers).await {
         return r;
     }
+    let row = sqlx::query(
+        "select address, last_ip, public_ip, listen_port, config_json, rotation_entry from relay_nodes where id=?",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await;
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return err_resp(StatusCode::NOT_FOUND, "中继节点不存在"),
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let stored = row
+        .try_get::<String, _>("rotation_entry")
+        .unwrap_or_default();
+    let port = relay_node_port(
+        row.try_get::<i64, _>("listen_port").unwrap_or(0),
+        &row.try_get::<String, _>("config_json").unwrap_or_default(),
+    );
+    let candidate = resolve_rotation_host(
+        &row.try_get::<String, _>("address").unwrap_or_default(),
+        &row.try_get::<String, _>("public_ip").unwrap_or_default(),
+        &row.try_get::<String, _>("last_ip").unwrap_or_default(),
+    )
+    .map(|h| build_rotation_entry(&h, port));
     match sqlx::query("delete from relay_nodes where id=?")
         .bind(id)
         .execute(&st.pool)
         .await
     {
-        Ok(res) if res.rows_affected() > 0 => jresp(StatusCode::OK, json!({ "ok": true })),
+        Ok(res) if res.rows_affected() > 0 => {
+            let mut warning: Option<String> = None;
+            if !stored.trim().is_empty() || candidate.is_some() {
+                let env_path = server_env_path(&st.exe_dir);
+                match read_relay_servers_env(&env_path) {
+                    Ok(entries) => {
+                        let (next, removed) =
+                            remove_rotation_entries(&entries, &stored, candidate.as_deref());
+                        if removed {
+                            match apply_relay_servers(&env_path, &next) {
+                                Ok((_, true)) => {}
+                                Ok((_, false)) => {
+                                    warning = Some(
+                                        "已从 server.env 移除，实时列表未更新（重启服务端后生效）"
+                                            .to_string(),
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!("rotation cleanup for deleted node {id}: {e}");
+                                    warning = Some(format!(
+                                        "轮询列表移除失败：{e}，请手动检查 server.env"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("rotation cleanup for deleted node {id}: {e}");
+                        warning =
+                            Some(format!("轮询列表移除失败：{e}，请手动检查 server.env"));
+                    }
+                }
+            }
+            let mut resp = json!({ "ok": true });
+            if let Some(w) = warning {
+                resp["rotation_warning"] = json!(w);
+            }
+            jresp(StatusCode::OK, resp)
+        }
         Ok(_) => err_resp(StatusCode::NOT_FOUND, "中继节点不存在"),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -6242,6 +6830,7 @@ fn build_router_part(state: Arc<ApiState>, part: RouterPart) -> Router {
             .route("/api/admin/relays", get(relays_list))
             .route("/api/admin/relays/:id", get(relays_detail).delete(relays_delete))
             .route("/api/admin/relays/:id/config", post(relays_config))
+            .route("/api/admin/relays/:id/rotation", post(relays_rotation))
             .route("/api/admin/relays/:id/restart", post(relays_restart));
     }
     r.layer(Extension(state))
@@ -7489,6 +8078,278 @@ mod tests {
         assert!(cfg["limit_speed"].is_null());
         assert!(cfg["total_bandwidth"].is_null());
         assert!(cfg["single_bandwidth"].is_null());
+    }
+
+    // ---- v46.2: console-managed relay rotation ----
+
+    #[test]
+    fn rotation_env_parse() {
+        let text = "# comment\nHBBS_PORT=21116\nRELAY_SERVERS=27.45.254.164,sramd2.668687.xyz\n# trailing\n";
+        assert_eq!(
+            relay_servers_from_env(text),
+            vec!["27.45.254.164", "sramd2.668687.xyz"]
+        );
+        // Quoted value, spaces, empty items.
+        assert_eq!(
+            relay_servers_from_env("RELAY_SERVERS=\"a.example.com, b.example.com,,\"\n"),
+            vec!["a.example.com", "b.example.com"]
+        );
+        // Last line wins, like the winservice loader.
+        assert_eq!(
+            relay_servers_from_env("RELAY_SERVERS=old.example.com\nRELAY_SERVERS=new.example.com\n"),
+            vec!["new.example.com"]
+        );
+        // Missing key, empty value, comment-only.
+        assert!(relay_servers_from_env("HBBS_PORT=21116\n").is_empty());
+        assert!(relay_servers_from_env("RELAY_SERVERS=\n").is_empty());
+        assert!(relay_servers_from_env("# RELAY_SERVERS=x.example.com\n").is_empty());
+        assert!(relay_servers_from_env("").is_empty());
+    }
+
+    #[test]
+    fn rotation_env_update_preserves_file() {
+        // Comments and other lines stay byte-identical; only the
+        // RELAY_SERVERS line changes.
+        let text = "# server config\nHBBS_PORT=21116\nRELAY_SERVERS=old.example.com\nAPI_PORT=21114\n";
+        let (out, changed) = update_relay_servers_in_env(
+            text,
+            &["old.example.com".to_string(), "new.example.com".to_string()],
+        );
+        assert!(changed);
+        assert_eq!(
+            out,
+            "# server config\nHBBS_PORT=21116\nRELAY_SERVERS=old.example.com,new.example.com\nAPI_PORT=21114\n"
+        );
+        // Same list: no change reported.
+        let (_, changed) =
+            update_relay_servers_in_env(text, &["old.example.com".to_string()]);
+        assert!(!changed);
+        // Missing key: appended at the end.
+        let (out, changed) =
+            update_relay_servers_in_env("# c\nHBBS_PORT=21116\n", &["a.example.com".to_string()]);
+        assert!(changed);
+        assert_eq!(out, "# c\nHBBS_PORT=21116\nRELAY_SERVERS=a.example.com\n");
+        // No trailing newline: none is added.
+        let (out, _) =
+            update_relay_servers_in_env("HBBS_PORT=21116", &["a.example.com".to_string()]);
+        assert_eq!(out, "HBBS_PORT=21116\nRELAY_SERVERS=a.example.com");
+        // Empty file: just the one line.
+        let (out, changed) = update_relay_servers_in_env("", &["a.example.com".to_string()]);
+        assert!(changed);
+        assert_eq!(out, "RELAY_SERVERS=a.example.com\n");
+        // CRLF file stays CRLF.
+        let (out, _) = update_relay_servers_in_env(
+            "HBBS_PORT=21116\r\nRELAY_SERVERS=old.example.com\r\n",
+            &["new.example.com".to_string()],
+        );
+        assert_eq!(out, "HBBS_PORT=21116\r\nRELAY_SERVERS=new.example.com\r\n");
+        // Removing the last entry leaves an empty (unquoted) value.
+        let (out, _) = update_relay_servers_in_env("RELAY_SERVERS=a.example.com\n", &[]);
+        assert_eq!(out, "RELAY_SERVERS=\n");
+    }
+
+    #[test]
+    fn rotation_env_write_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.env");
+        // Missing file is created with just the one line.
+        assert!(write_relay_servers_env(&path, &["a.example.com".to_string()]).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "RELAY_SERVERS=a.example.com\n"
+        );
+        // No temp file left behind.
+        assert!(!dir.path().join("server.env.tmp").exists());
+        // Same list again: no write.
+        assert!(!write_relay_servers_env(&path, &["a.example.com".to_string()]).unwrap());
+        // Existing file with comments: preserved, CRLF kept.
+        std::fs::write(&path, "# c\r\nHBBS_PORT=21116\r\nRELAY_SERVERS=a.example.com\r\n")
+            .unwrap();
+        assert!(write_relay_servers_env(
+            &path,
+            &["a.example.com".to_string(), "b.example.com:22000".to_string()]
+        )
+        .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# c\r\nHBBS_PORT=21116\r\nRELAY_SERVERS=a.example.com,b.example.com:22000\r\n"
+        );
+        assert!(!dir.path().join("server.env.tmp").exists());
+        // Missing file reads as an empty list.
+        let missing = dir.path().join("nope.env");
+        assert!(read_relay_servers_env(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rotation_entry_resolution() {
+        // Priority: address > public_ip > last_ip.
+        assert_eq!(
+            relay_rotation_entry("relay.example.com", "45.67.89.10", "10.0.0.1", 21117).unwrap(),
+            "relay.example.com"
+        );
+        assert_eq!(
+            relay_rotation_entry("", "45.67.89.10", "10.0.0.1", 21117).unwrap(),
+            "45.67.89.10"
+        );
+        assert_eq!(
+            relay_rotation_entry("", "", "45.67.89.10", 21117).unwrap(),
+            "45.67.89.10"
+        );
+        assert!(relay_rotation_entry("", "", "", 21117).is_err());
+        // Port suffix only when not the default.
+        assert_eq!(
+            relay_rotation_entry("relay.example.com", "", "", 22000).unwrap(),
+            "relay.example.com:22000"
+        );
+        assert_eq!(
+            relay_rotation_entry("45.67.89.10", "", "", 22000).unwrap(),
+            "45.67.89.10:22000"
+        );
+        // A port already in the address is dropped: the resolved port
+        // is the source of truth.
+        assert_eq!(
+            relay_rotation_entry("relay.example.com:22000", "", "", 21117).unwrap(),
+            "relay.example.com"
+        );
+        // IPv6 literals are always bracketed with an explicit port.
+        assert_eq!(
+            relay_rotation_entry("2606:4700:4700::1111", "", "", 21117).unwrap(),
+            "[2606:4700:4700::1111]:21117"
+        );
+        assert_eq!(
+            relay_rotation_entry("[2606:4700:4700::1111]:22000", "", "", 22000).unwrap(),
+            "[2606:4700:4700::1111]:22000"
+        );
+        // IPv4-mapped IPv6 folds to plain IPv4.
+        assert_eq!(
+            relay_rotation_entry("::ffff:45.67.89.10", "", "", 21117).unwrap(),
+            "45.67.89.10"
+        );
+    }
+
+    #[test]
+    fn rotation_node_port_rules() {
+        // listen_port wins, then the pushed config, then the default.
+        assert_eq!(relay_node_port(22000, r#"{"port": 23000}"#), 22000);
+        assert_eq!(relay_node_port(0, r#"{"port": 23000}"#), 23000);
+        assert_eq!(relay_node_port(0, "{}"), 21117);
+        assert_eq!(relay_node_port(0, "not json"), 21117);
+        // Out-of-range values fall through.
+        assert_eq!(relay_node_port(70000, r#"{"port": 23000}"#), 23000);
+        assert_eq!(relay_node_port(0, r#"{"port": 0}"#), 21117);
+        assert_eq!(relay_node_port(-1, r#"{"port": 70000}"#), 21117);
+    }
+
+    #[test]
+    fn rotation_entry_rejects_non_public() {
+        for bad in [
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.5",
+            "127.0.0.1",
+            "169.254.1.2",
+            "0.0.0.0",
+            "100.64.0.1", // CGNAT shared range
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:10.0.0.1", // mapped private IPv4
+            "192.0.2.1",       // documentation range, not routable
+            "2001:db8::1",
+        ] {
+            assert!(
+                relay_rotation_entry(bad, "", "", 21117).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        // Public IPs and domains pass.
+        assert!(relay_rotation_entry("8.8.8.8", "", "", 21117).is_ok());
+        assert!(relay_rotation_entry("2606:4700:4700::1111", "", "", 21117).is_ok());
+        assert!(relay_rotation_entry("relay.example.com", "", "", 21117).is_ok());
+        // The resolved address is validated as-is: a private address
+        // wins over a public fallback and is rejected, not skipped.
+        assert!(relay_rotation_entry("10.0.0.1", "45.67.89.10", "", 21117).is_err());
+        // Garbage with a colon is neither a domain nor an IP.
+        assert!(relay_rotation_entry("example.com:abc", "", "", 21117).is_err());
+    }
+
+    #[test]
+    fn rotation_normalize_match() {
+        assert_eq!(
+            normalize_rotation_entry("Relay.Example.COM"),
+            Some(("relay.example.com".to_string(), 21117))
+        );
+        assert_eq!(
+            normalize_rotation_entry("relay.example.com:21117"),
+            normalize_rotation_entry("relay.example.com")
+        );
+        assert_eq!(
+            normalize_rotation_entry("[2606:4700:4700::1111]:22000"),
+            Some(("2606:4700:4700::1111".to_string(), 22000))
+        );
+        assert_eq!(
+            normalize_rotation_entry("::ffff:45.67.89.10"),
+            normalize_rotation_entry("45.67.89.10")
+        );
+        assert!(normalize_rotation_entry("").is_none());
+        assert!(normalize_rotation_entry("example.com:abc").is_none());
+        assert!(rotation_entries_match("relay.example.com", "relay.example.com:21117"));
+        assert!(rotation_entries_match(
+            "RELAY.EXAMPLE.COM",
+            "relay.example.com"
+        ));
+        assert!(!rotation_entries_match("relay.example.com", "other.example.com"));
+        assert!(!rotation_entries_match(
+            "relay.example.com:22000",
+            "relay.example.com"
+        ));
+    }
+
+    #[test]
+    fn rotation_remove_keeps_others() {
+        let entries = vec![
+            "27.45.254.164".to_string(), // the main server's own relay
+            "relay.example.com".to_string(),
+            "other.example.com:22000".to_string(),
+        ];
+        // Stored entry, exact match.
+        let (kept, removed) =
+            remove_rotation_entries(&entries, "relay.example.com", None);
+        assert!(removed);
+        assert_eq!(kept, vec!["27.45.254.164", "other.example.com:22000"]);
+        // Stored entry, normalized match (default port spelled out).
+        let (kept, removed) =
+            remove_rotation_entries(&entries, "relay.example.com:21117", None);
+        assert!(removed);
+        assert_eq!(kept, vec!["27.45.254.164", "other.example.com:22000"]);
+        // No stored entry: the candidate from current addresses.
+        let (kept, removed) =
+            remove_rotation_entries(&entries, "", Some("other.example.com:22000"));
+        assert!(removed);
+        assert_eq!(kept, vec!["27.45.254.164", "relay.example.com"]);
+        // Not in the list: no-op, nothing removed.
+        let (kept, removed) =
+            remove_rotation_entries(&entries, "gone.example.com", Some("gone.example.com"));
+        assert!(!removed);
+        assert_eq!(kept, entries);
+        // Neither stored nor candidate: no-op.
+        let (kept, removed) = remove_rotation_entries(&entries, "", None);
+        assert!(!removed);
+        assert_eq!(kept, entries);
+    }
+
+    #[test]
+    fn rotation_in_rotation_judgement() {
+        let entries = vec!["relay.example.com".to_string(), "27.45.254.164".to_string()];
+        assert!(node_in_rotation("relay.example.com", None, &entries));
+        // Normalized match on the stored entry.
+        assert!(node_in_rotation("relay.example.com:21117", None, &entries));
+        // Candidate fallback (added before v46.2, no stored entry).
+        assert!(node_in_rotation("", Some("relay.example.com"), &entries));
+        assert!(!node_in_rotation("", Some("other.example.com"), &entries));
+        assert!(!node_in_rotation("", None, &entries));
+        assert!(!node_in_rotation("relay.example.com", None, &[]));
     }
 
     // ---- v39: admin create-user (issue #6) ----
