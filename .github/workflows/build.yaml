@@ -95,6 +95,23 @@ jobs:
           print('compile-time database ready')
           PYEOF
 
+      - name: Set PRO_FULL_VERSION for preview tags
+        # Preview tags (vN.M) bake the full version into hbbs so the
+        # updater can tell an installed preview from its formal base;
+        # formal tags (vN) and dispatch runs skip this step, and the
+        # shell regex below is the precise gate (three-part tags such
+        # as v1.2.3 are not previews). The variable reaches the cross
+        # build container via Cross.toml [build.env] passthrough.
+        if: github.event_name == 'push' && startsWith(github.ref_name, 'v') && contains(github.ref_name, '.')
+        run: |
+          T=${GITHUB_REF_NAME}
+          if [[ "$T" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+            echo "PRO_FULL_VERSION=${T#v}" >> "$GITHUB_ENV"
+            echo "preview tag $T: PRO_FULL_VERSION=${T#v}"
+          else
+            echo "tag $T is not a vN.M preview tag; PRO_FULL_VERSION stays unset"
+          fi
+
       - name: Build
         uses: actions-rs/cargo@v1
         with:
