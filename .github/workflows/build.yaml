@@ -544,6 +544,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Validation run: push only a throwaway test tag to GHCR, never latest.
             echo "tags=${{ env.GHCR_IMAGE_CLASSIC }}:ci-test-${{ matrix.job.name }}" >> $GITHUB_OUTPUT
+            echo "smoke_tag=ci-test-${{ matrix.job.name }}" >> $GITHUB_OUTPUT
             exit 0
           fi
           {
@@ -564,6 +565,7 @@ jobs:
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+          echo "smoke_tag=${T}-${{ matrix.job.name }}" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -571,9 +573,22 @@ jobs:
           context: "./docker-classic"
           platforms: ${{ matrix.job.docker_platform }}
           push: true
+          load: ${{ matrix.job.name == 'amd64' }}
           provenance: false
           tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Save amd64 image for smoke test
+        if: matrix.job.name == 'amd64'
+        run: docker save ${{ env.GHCR_IMAGE_CLASSIC }}:${{ steps.tags.outputs.smoke_tag }} -o /tmp/smoke-image-classic.tar
+
+      - name: Upload amd64 image for smoke test
+        if: matrix.job.name == 'amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-classic-amd64
+          path: /tmp/smoke-image-classic.tar
+          retention-days: 1
 
   # docker build and push of multiarch images
   docker-manifest-classic:
@@ -727,11 +742,17 @@ jobs:
             debian-build/rustdesk-server-utils_*_${{ matrix.job.debian_platform }}.deb
           if-no-files-found: error
 
-  # smoke test the freshly built amd64 image: the API must answer on 21114
+  # smoke test the freshly built amd64 images: the API must answer on
+  # 21114 and runtime data must land in the volume (/data for the s6
+  # image, /root for classic), never in /usr/bin next to the binaries.
+  # The s6 run also injects a known keypair (KEY_PUB/KEY_PRIV) and
+  # checks hbbs actually uses it.
   smoke:
 
-    name: Smoke test - amd64 image
-    needs: docker
+    name: Smoke test - amd64 images
+    needs:
+      - docker
+      - docker-classic
     runs-on: ubuntu-22.04
 
     steps:
@@ -742,25 +763,175 @@ jobs:
           name: docker-image-amd64
           path: /tmp/smoke
 
-      - name: Run container and probe the API on 21114
+      - name: Download classic amd64 image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-classic-amd64
+          path: /tmp/smoke-classic
+
+      - name: Download amd64 binaries (for rustdesk-utils)
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-linux-amd64
+          path: /tmp/smoke-bin
+
+      - name: Smoke test the s6 image (data in /data, injected key used)
         run: |
+          chmod +x /tmp/smoke-bin/rustdesk-utils
+          # Fresh keypair for this run: the key-secret service writes it
+          # to /data, and hbbs must read it instead of generating its own.
+          KEYPAIR=$(/tmp/smoke-bin/rustdesk-utils genkeypair)
+          KEY_PUB=$(echo "$KEYPAIR" | sed -n 's/^Public Key: *//p')
+          KEY_PRIV=$(echo "$KEYPAIR" | sed -n 's/^Secret Key: *//p')
+          if [ -z "$KEY_PUB" ] || [ -z "$KEY_PRIV" ]; then
+            echo "failed to generate a test keypair"
+            exit 1
+          fi
           IMG=$(docker load -i /tmp/smoke/smoke-image.tar | sed -n 's/^Loaded image: //p')
           if [ -z "$IMG" ]; then
             echo "failed to load smoke image"
             exit 1
           fi
           echo "loaded $IMG"
-          docker run -d --name rustdesk-smoke -p 21114:21114 "$IMG"
+          mkdir -p /tmp/smoke-data
+          docker run -d --name rustdesk-smoke -p 21114:21114 \
+            -v /tmp/smoke-data:/data \
+            -e KEY_PUB="$KEY_PUB" -e KEY_PRIV="$KEY_PRIV" \
+            "$IMG"
           for i in $(seq 1 30); do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:21114/" || true)
             if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then
               echo "API responded on 21114 (HTTP $CODE) after ${i} attempt(s)"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "API did not respond on 21114 within 60s"
               docker logs rustdesk-smoke || true
-              docker stop rustdesk-smoke >/dev/null
-              exit 0
+              exit 1
             fi
             sleep 2
           done
-          echo "API did not respond on 21114 within 60s"
-          docker logs rustdesk-smoke || true
-          exit 1
+          # Runtime data must land in the /data volume ...
+          for i in $(seq 1 15); do
+            if [ -f /tmp/smoke-data/db_v2.sqlite3 ] \
+              && [ -f /tmp/smoke-data/id_ed25519 ] \
+              && [ -f /tmp/smoke-data/id_ed25519.pub ] \
+              && [ -f /tmp/smoke-data/api_v1.sqlite3 ] \
+              && [ -f /tmp/smoke-data/logs/hbbs.log ]; then
+              break
+            fi
+            if [ "$i" = "15" ]; then
+              echo "runtime data did not appear in /data within 30s"
+              find /tmp/smoke-data | sort
+              docker logs rustdesk-smoke || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "runtime data present in /data:"
+          find /tmp/smoke-data -type f | sort
+          # ... and must NOT be next to the binaries in /usr/bin.
+          if docker exec rustdesk-smoke sh -c 'test -e /usr/bin/db_v2.sqlite3 -o -e /usr/bin/id_ed25519 -o -e /usr/bin/id_ed25519.pub -o -e /usr/bin/api_v1.sqlite3 -o -e /usr/bin/logs'; then
+            echo "runtime data leaked into /usr/bin"
+            docker exec rustdesk-smoke ls -la /usr/bin/ || true
+            exit 1
+          fi
+          # The injected keypair must be the one the server uses: the
+          # public key file keeps the injected value, the startup log
+          # shows it as the server's active key, and hbbs read the key
+          # instead of generating a fresh pair.
+          if [ "$(cat /tmp/smoke-data/id_ed25519.pub)" != "$KEY_PUB" ]; then
+            echo "id_ed25519.pub in /data does not match the injected KEY_PUB"
+            exit 1
+          fi
+          LOGS=$(docker logs rustdesk-smoke 2>&1)
+          if ! echo "$LOGS" | grep -Fq "Key: $KEY_PUB"; then
+            echo "hbbs startup log does not show the injected public key"
+            echo "$LOGS"
+            exit 1
+          fi
+          if ! echo "$LOGS" | grep -q "Private key comes from id_ed25519"; then
+            echo "hbbs did not read the injected key (expected 'Private key comes from id_ed25519' in the log)"
+            echo "$LOGS"
+            exit 1
+          fi
+          if echo "$LOGS" | grep -q "Private/public key written"; then
+            echo "hbbs generated a fresh keypair instead of using the injected one"
+            exit 1
+          fi
+          echo "s6 smoke test passed"
+          docker stop rustdesk-smoke >/dev/null
+
+      - name: Smoke test the classic image (data in /root)
+        run: |
+          IMG=$(docker load -i /tmp/smoke-classic/smoke-image-classic.tar | sed -n 's/^Loaded image: //p')
+          if [ -z "$IMG" ]; then
+            echo "failed to load classic smoke image"
+            exit 1
+          fi
+          echo "loaded $IMG"
+          mkdir -p /tmp/smoke-classic-data /tmp/smoke-classic-hbbr
+          docker run -d --name rustdesk-smoke-classic -p 21124:21114 \
+            -v /tmp/smoke-classic-data:/root \
+            "$IMG" hbbs -r 127.0.0.1:21117
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:21124/" || true)
+            if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then
+              echo "classic API responded on 21124 (HTTP $CODE) after ${i} attempt(s)"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "classic API did not respond on 21124 within 60s"
+              docker logs rustdesk-smoke-classic || true
+              exit 1
+            fi
+            sleep 2
+          done
+          for i in $(seq 1 15); do
+            if [ -f /tmp/smoke-classic-data/db_v2.sqlite3 ] \
+              && [ -f /tmp/smoke-classic-data/id_ed25519 ] \
+              && [ -f /tmp/smoke-classic-data/id_ed25519.pub ] \
+              && [ -f /tmp/smoke-classic-data/api_v1.sqlite3 ] \
+              && [ -f /tmp/smoke-classic-data/logs/hbbs.log ]; then
+              break
+            fi
+            if [ "$i" = "15" ]; then
+              echo "runtime data did not appear in the classic volume within 30s"
+              find /tmp/smoke-classic-data | sort
+              docker logs rustdesk-smoke-classic || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "runtime data present in the classic volume:"
+          find /tmp/smoke-classic-data -type f | sort
+          # The scratch image has no shell: copy /usr/bin out and check
+          # from the host side that no runtime data leaked there.
+          docker cp rustdesk-smoke-classic:/usr/bin /tmp/classic-usrbin
+          for f in db_v2.sqlite3 id_ed25519 id_ed25519.pub api_v1.sqlite3 logs; do
+            if [ -e "/tmp/classic-usrbin/$f" ]; then
+              echo "runtime data leaked into classic /usr/bin: $f"
+              ls -la /tmp/classic-usrbin/ || true
+              exit 1
+            fi
+          done
+          echo "classic hbbs smoke test passed"
+          docker stop rustdesk-smoke-classic >/dev/null
+          # hbbr shares the anchor code: its log must land in the volume too.
+          docker run -d --name rustdesk-smoke-classic-hbbr \
+            -v /tmp/smoke-classic-hbbr:/root \
+            "$IMG" hbbr
+          for i in $(seq 1 15); do
+            if [ -f /tmp/smoke-classic-hbbr/logs/hbbr.log ]; then
+              break
+            fi
+            if [ "$i" = "15" ]; then
+              echo "hbbr log did not appear in the classic volume within 30s"
+              find /tmp/smoke-classic-hbbr | sort
+              docker logs rustdesk-smoke-classic-hbbr || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "classic hbbr smoke test passed"
+          docker stop rustdesk-smoke-classic-hbbr >/dev/null
