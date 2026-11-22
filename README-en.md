@@ -63,6 +63,47 @@ A self-hosted remote desktop server based on the official open-source [rustdesk-
 
 See [docs/DEPLOY-en.md](docs/DEPLOY-en.md) for deployment, upgrades, and per-version change notes.
 
+## Relay nodes and distributed deployment
+
+### Relay nodes
+
+A relay node is a machine running hbbr, plus a resident agent (relay-agent). hbbr never connects to hbbs, so the agent handles registration, heartbeats, config updates, and supervising the local hbbr process.
+
+- **Registration**: the console's Devices page generates a one-time registration link (valid 24 hours by default, shown only once); on the relay host, run `relay-agent register --link <link>`. Registration uses an HMAC challenge-response, and the server returns the node id, the server keypair, and the initial config encrypted with AES-256-GCM. Treat the link as a credential — delete it once used.
+- **Key validation**: the agent starts hbbr as `hbbr -p <port> -k -`, forcing client key validation (without `-k`, hbbr validates no keys at all); if the key file is missing, it refuses to start hbbr — a keyless relay is never served.
+- **Heartbeat and config**: the agent reports status every 20 seconds (encrypted, then signed); the console can push the listen port and three speed limits (a port change restarts hbbr; a speed-limit-only change applies live), and can restart hbbr remotely. Deleting a node revokes it: the agent stops heartbeating, hbbr keeps serving.
+- **Console view**: admins see a relay sub-table on the Devices page: online/offline (judged by the last heartbeat within 90 seconds), address, versions, sessions, and throughput. Address display priority: registered address > agent-reported public IP > heartbeat source IP.
+- **Registration is not rotation**: registration only establishes management — it does not add the node to the relay rotation list, which comes solely from the main server's `RELAY_SERVERS` startup parameter (below).
+- **No online updates**: relay nodes cannot update online — the agent only pushes config and restarts, never binaries; upgrading means manually replacing hbbr and relay-agent on the relay host (see "Relay deployment and updates").
+
+### Distributed deployment
+
+One main server (hbbs + API + console) plus relay nodes spread across sites or VPS hosts:
+
+1. Deploy the main server as usual.
+2. On each relay host, install and register relay-agent per the "Relay deployment and updates" section below. The relay port must be reachable from both peers (default 21117 TCP, WebSocket at port +2; forward the port if behind NAT); the agent reaches the main server's API (default 21114) over an outbound connection, so registration and heartbeats work from behind NAT.
+3. Add the relay addresses, comma-separated, to `RELAY_SERVERS` in the main server's `server.env` (public IPs or publicly resolvable domains; a port may be included, default 21117), then restart the server (rdsvc reads server.env only at service start — restart the service, not just hbbs).
+4. Clients fill in the relay field with the public address (no `https://`, port defaults to 21117 and may be omitted); only the relay field needs changing. Generated clients already carry the relay address.
+5. Optional: for globally distributed relays, drop a MaxMind city database (`geoip-city.mmdb`) into the main server's directory (or point `RELAY_GEOIP_DB` at it) to enable nearest-relay selection (below); the startup log line `relay geo selection: enabled` confirms it.
+
+Full steps and the registration/heartbeat protocol: the v36 section of [docs/DEPLOY-en.md](docs/DEPLOY-en.md) and [relayagent/README.md](relayagent/README.md).
+
+### Relay deployment and updates
+
+- **Deploy**: each platform has its own relay package (`rustdesk-server-pro-relay-*`) with hbbr, relay-agent, and install scripts. Linux: unzip, run `install-relay.sh` (installs the `rustdesk-relay-agent` systemd service), then `relay-agent register --link <link>`, then `systemctl start rustdesk-relay-agent`. Windows: unzip, run `install-service.bat` (registers the `RustDeskRelayAgent` service), then `relay-agent.exe register --link <link>`, then `service.bat start`. ARM soft-routers use the linux-aarch64-musl relay package (hbbr and agent are both statically linked). Only the agent starts hbbr — never start hbbr directly with systemd or rdsvc, or two processes will fight over the port.
+- **Update**: stop the agent service; download the relay package for the new version from the GitHub release; unzip it to a temp directory; copy the new hbbr and relay-agent over the package directory (`agent.json`, `relay.env`, `id_ed25519`, and logs stay untouched — no re-registration needed); start the service. Relayed sessions on that node drop for a few seconds. Check the release notes: some versions need no relay update at all, and when only the agent changed, swapping relay-agent alone is enough.
+
+### Relay allocation logic
+
+hbbs only hands out relay addresses — it counts no sessions and does no pairing; pairing happens in hbbr.
+
+- **Candidate list**: the list comes only from the `--relay-servers` startup parameter (`RELAY_SERVERS`), comma-separated, read at hbbs startup; registered relay nodes do not join it automatically, and changing the list needs an hbbs restart.
+- **Health checks**: with 2 or more relays, hbbs TCP-probes each one every 3 seconds (3-second timeout); only reachable relays enter the allocation list, and if all probes fail the previous list is kept, not cleared. With a single relay there is no probing — it is always used.
+- **When it is assigned**: when a controller asks hbbs to punch a hole to a peer, hbbs picks one relay by both peers' public IPs and writes it into the punch-hole message forwarded to the controlled peer; if direct connection fails, both peers go to that relay to pair.
+- **Selection policy** (several relays): with a GeoIP database loaded, hbbs picks the relay minimizing the summed great-circle distance to both peers; relays within 1.3× + 250 km of the best form a near set that is rotated through. Without a database, when a peer cannot be located (private addresses, etc.), or when no relay can be located, it falls back to plain round-robin.
+- **Client-side precedence** (verified against the official client 1.5.0 source): a client's own relay setting wins; if empty, the client uses the address hbbs assigned; if that is empty too, it uses the ID server's address with port +1 (21117 by default — the main server's own relay). Generated clients and clients with a relay filled in use their own relay; when neither side has one set, hbbs's single assigned address makes both peers pair at the same relay.
+- **LAN cases**: when the controlled peer is on the LAN, hbbs hands out the server's LAN address; when one side is on the LAN and the other is not, relay is forced.
+
 ## Docker deployment
 
 ```bash

@@ -74,19 +74,24 @@
 - **心跳与配置**：代理每 20 秒上报状态（加密后签名）；控制台可下发端口与三项限速（端口变化重启 hbbr，只改限速即时生效），可远程重启 hbbr。节点删除即吊销：代理停心跳，hbbr 继续服务。
 - **控制台查看**：管理员在「设备」页看到中继子表：在线/离线（按最后心跳 90 秒判）、地址、版本、会话数与吞吐。地址显示优先级：注册地址 > 代理上报的公网 IP > 心跳来源 IP。
 - **注册不等于加入轮询**：注册只建立管理关系，不会把节点自动加入中继轮询列表——轮询列表只由主服务器启动参数 `RELAY_SERVERS` 决定（见下）。
-- **中继节点不能在线更新**：代理只推配置与重启，从不推二进制；换版本要手动替换中继机器上的 hbbr 与 relay-agent。
+- **中继节点不能在线更新**：代理只推配置与重启，从不推二进制；换版本要手动替换中继机器上的 hbbr 与 relay-agent（步骤见「中继部署与更新」）。
 
 ### 分布式部署
 
 一台主服务器（hbbs + API + 控制台）加多台中继节点（分布在不同机房或 VPS）：
 
 1. 主服务器照常部署。
-2. 每台中继机器解压对应平台的中继包（`rustdesk-server-pro-relay-*`，含 hbbr、relay-agent 与安装脚本）：Linux 跑 `install-relay.sh`（systemd 服务 `rustdesk-relay-agent`），Windows 跑 `install-service.bat`（服务 `RustDeskRelayAgent`）；然后 `relay-agent register --link <链接>` 完成注册并启动服务。中继端口必须能从两端客户端连到（默认 21117 TCP，WebSocket 在端口 +2；NAT 后面要做端口转发）；代理连主服务器 API（默认 21114）走出站连接，注册与心跳不受中继机器自身 NAT 影响。
+2. 每台中继机器按「中继部署与更新」一节安装并注册 relay-agent。中继端口必须能从两端客户端连到（默认 21117 TCP，WebSocket 在端口 +2；NAT 后面要做端口转发）；代理连主服务器 API（默认 21114）走出站连接，注册与心跳不受中继机器自身 NAT 影响。
 3. 主服务器 `server.env` 里把各中继地址逗号分隔写进 `RELAY_SERVERS`（公网 IP 或可公网解析的域名，可带端口，默认 21117），改完重启服务端（rdsvc 只在服务启动时读一次 server.env，要重启服务，不只是重启 hbbs）。
 4. 客户端中继字段填公网地址（不带 `https://`，端口默认 21117 可省略），只改中继字段即可；生成客户端已预绑定中继地址。
 5. 可选：多中继全球部署时，把 MaxMind 城市库 `geoip-city.mmdb` 放进主服务器目录（或 `RELAY_GEOIP_DB` 指定路径），开启就近选路（见下）；启动日志 `relay geo selection: enabled` 可确认。
 
 详细步骤与注册/心跳协议见 [docs/DEPLOY.md](docs/DEPLOY.md) v36 一节与 [relayagent/README.md](relayagent/README.md)。
+
+### 中继部署与更新
+
+- **部署**：每个平台一个中继包（`rustdesk-server-pro-relay-*`，含 hbbr、relay-agent 与安装脚本）。Linux：解压后运行 `install-relay.sh`（装 systemd 服务 `rustdesk-relay-agent`），再 `relay-agent register --link <链接>`，最后 `systemctl start rustdesk-relay-agent`。Windows：解压后运行 `install-service.bat`（注册 `RustDeskRelayAgent` 服务），再 `relay-agent.exe register --link <链接>`，最后 `service.bat start`。ARM 软路由用 linux-aarch64-musl 中继包（hbbr 与代理都是静态链接）。被管中继上只由代理启动 hbbr，不要再用 systemd / rdsvc 直接拉 hbbr，否则两个进程抢端口。
+- **更新**：停 agent 服务 → 从 GitHub Release 下载新版本的中继包 → 解压到临时目录 → 把新的 hbbr 与 relay-agent 拷进包目录覆盖（agent.json、relay.env、id_ed25519、日志不动，无需重新注册）→ 启动服务。该节点上的中继会话会中断几秒。看发布说明确认该版本是否需要更新中继：有的版本中继二进制没变，无需更新；只改了代理时只换 relay-agent 即可。
 
 ### 中继分配逻辑
 
