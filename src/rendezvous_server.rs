@@ -2113,6 +2113,14 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn push_relay_servers_false_without_rendezvous() {
+        // v46.2: the live push misses (returns false) when no
+        // rendezvous loop runs in this process — the sender is only
+        // set by start_with_bind, which no test starts.
+        assert!(!push_relay_servers("relay.example.com"));
+    }
+
     #[hbb_common::tokio::test]
     async fn punch_reqs_bounded() {
         let max = *PUNCH_REQ_MAX;
