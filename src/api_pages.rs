@@ -259,7 +259,7 @@ const I18N={zh:{
 'relay.regpage.warn':'此链接含注册密钥，相当于凭证：注册完成后即失效，请勿转发或公开。',
 'relay.regpage.win_hint':'Windows 上同样在 relay-agent.exe 所在目录运行此命令（PowerShell 或 cmd）。',
 'relay.title':'中继节点','relay.badge':'中继',
-'relay.desc':'中继节点由常驻代理（relay-agent）管理：代理注册后每 20 秒心跳上报状态，控制台下发的配置随心跳响应加密回传。注意：注册只建立管理关系，不会自动把节点加入中继轮询列表——轮询列表仍由服务器启动参数 RELAY_SERVERS 决定。',
+'relay.desc':'中继节点由常驻代理（relay-agent）管理：代理注册后每 20 秒心跳上报状态，控制台下发的配置随心跳响应加密回传。注册只建立管理关系，不会自动把节点加入中继轮询列表；在节点详情页可手动加入或移除轮询。',
 'relay.label':'备注（可选）','relay.label_ph':'如：香港中继','relay.expires':'有效期（小时，1–168）',
 'relay.gen':'生成注册链接','relay.gen_fail':'生成失败',
 'relay.link_once':'注册链接只显示一次，请立即复制并妥善保管：',
@@ -283,6 +283,9 @@ const I18N={zh:{
 'relay.load_fail':'加载中继节点失败','relay.online':'● 在线','relay.offline':'● 离线',
 'relay.unknown_time':'未知','relay.never':'从未',
 'relay.port_change_note':'改端口会重启 hbbr（会话中断）；只改限速时即时生效，不重启。',
+'relay.rotation':'轮询状态','relay.rotation_in':'在轮询中','relay.rotation_out':'未加入轮询',
+'relay.rotation_add':'加入轮询列表','relay.rotation_remove':'从轮询移除',
+'relay.rotation_restart_hint':'已写入 server.env，重启服务端后生效',
 'aud.title':'审计日志','aud.desc':'被控端上报的连接记录：谁在什么时间从哪里连到哪台设备、是否走中继、连了多久。用户名来自设备绑定，未绑定设备只显示 ID。',
 'aud.search_ph':'搜索控制端/被控端 ID、用户名、主机名','aud.search':'搜索','aud.refresh':'刷新',
 'aud.range_today':'今天','aud.range_7d':'7 天','aud.range_30d':'30 天','aud.range_all':'全部',
@@ -421,7 +424,7 @@ const I18N={zh:{
 'relay.regpage.warn':'This link contains a registration secret — treat it as a credential. It expires once registration completes; do not forward or publish it.',
 'relay.regpage.win_hint':'On Windows, run the same command in the directory containing relay-agent.exe (PowerShell or cmd).',
 'relay.title':'Relay Nodes','relay.badge':'Relay',
-'relay.desc':'Relay nodes are managed by a resident agent (relay-agent): after registration the agent heartbeats every 20 s, and configuration pushed from the console is returned encrypted in the heartbeat response. Note: registration only establishes management; it does not add the node to the relay rotation list — rotation is still decided by the server startup parameter RELAY_SERVERS.',
+'relay.desc':'Relay nodes are managed by a resident agent (relay-agent): after registration the agent heartbeats every 20 s, and configuration pushed from the console is returned encrypted in the heartbeat response. Registration only establishes management; it does not add the node to the relay rotation list — add or remove nodes from rotation on the node detail page.',
 'relay.label':'Label (optional)','relay.label_ph':'e.g. Hong Kong relay','relay.expires':'Validity (hours, 1–168)',
 'relay.gen':'Generate registration link','relay.gen_fail':'Failed to generate',
 'relay.link_once':'The registration link is shown only once — copy it now and keep it safe:',
@@ -445,6 +448,9 @@ const I18N={zh:{
 'relay.load_fail':'Failed to load relay nodes','relay.online':'● Online','relay.offline':'● Offline',
 'relay.unknown_time':'Unknown','relay.never':'Never',
 'relay.port_change_note':'Changing the port restarts hbbr (sessions drop); changing only the limits applies live without a restart.',
+'relay.rotation':'Rotation status','relay.rotation_in':'In rotation','relay.rotation_out':'Not in rotation',
+'relay.rotation_add':'Add to rotation','relay.rotation_remove':'Remove from rotation',
+'relay.rotation_restart_hint':'Saved to server.env; restart the server to apply',
 'aud.title':'Audit Log','aud.desc':'Connection records reported by controlled devices: who connected to which device, when, from where, relayed or direct, and for how long. Usernames come from device binding; unbound devices show only their ID.',
 'aud.search_ph':'Search controller/controlled ID, username, hostname','aud.search':'Search','aud.refresh':'Refresh',
 'aud.range_today':'Today','aud.range_7d':'7 days','aud.range_30d':'30 days','aud.range_all':'All',
@@ -1129,6 +1135,7 @@ async function showRelay(id){
     '<div class="table-wrapper" tabindex="0" role="region" aria-label="'+esc(n.name||t('relay.title'))+'"><table class="kv" style="min-width:360px"><colgroup><col style="width:30%"><col style="width:70%"></colgroup><tbody>'+
     '<tr><th>'+t('relay.status')+'</th><td>'+(n.online?'<span class="ok">'+t('relay.online')+'</span>':'<span class="muted">'+t('relay.offline')+'</span>')+'</td></tr>'+
     '<tr><th>'+t('relay.address')+'</th><td>'+esc(n.address||n.public_ip||n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
+    '<tr><th>'+t('relay.rotation')+'</th><td>'+(n.in_rotation?'<span class="ok">'+t('relay.rotation_in')+'</span>':'<span class="muted">'+t('relay.rotation_out')+'</span>')+'</td></tr>'+
     '<tr><th>'+t('relay.port')+'</th><td>'+(n.listen_port||'-')+'</td></tr>'+
     '<tr><th>'+t('relay.last_ip')+'</th><td>'+esc(n.last_ip||t('relay.unknown_time'))+'</td></tr>'+
     '<tr><th>'+t('relay.agent_ver')+'</th><td>'+esc(n.agent_version||t('relay.unknown_time'))+'</td></tr>'+
@@ -1148,6 +1155,7 @@ async function showRelay(id){
     '<label>'+t('relay.limit_total')+'</label><input id="rcfg-tb" type="number" step="any" min="0" value="'+lim(cfg.total_bandwidth)+'" placeholder="'+t('relay.default_hint')+'">'+
     '<label>'+t('relay.limit_single')+'</label><input id="rcfg-sb" type="number" step="any" min="0" value="'+lim(cfg.single_bandwidth)+'" placeholder="'+t('relay.default_hint')+'">'+
     '<p><button id="rcfg-push" onclick="relayPushCfg('+n.id+')">'+t('relay.push')+'</button> '+
+    '<button class="ghost" aria-pressed="'+(n.in_rotation?'true':'false')+'" onclick="relayToggleRotation('+n.id+','+(n.in_rotation?'true':'false')+')">'+t(n.in_rotation?'relay.rotation_remove':'relay.rotation_add')+'</button> '+
     '<button class="ghost" onclick="relayRestart('+n.id+')">'+t('relay.restart')+'</button> '+
     '<button class="danger" onclick="relayDelete('+n.id+')">'+t('relay.delete')+'</button></p>';
   $('relay-detail-card').style.display='';
@@ -1169,10 +1177,14 @@ async function relayRestart(id){
   const j=await api('/api/admin/relays/'+id+'/restart',{method:'POST'});
   if(j.ok){alert(t('relay.restart_ok'));showRelay(id);}else alert(j.error||t('app.op_failed'));
 }
+async function relayToggleRotation(id,inRotation){
+  const j=await api('/api/admin/relays/'+id+'/rotation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({in_rotation:!inRotation})});
+  if(j.ok){if(!j.live_updated)alert(t('relay.rotation_restart_hint'));showRelay(id);}else alert(j.error||t('app.op_failed'));
+}
 async function relayDelete(id){
   if(!confirm(t('relay.delete_confirm').replace('{n}',RELAY_DETAIL_NAME)))return;
   const j=await api('/api/admin/relays/'+id,{method:'DELETE'});
-  if(j.ok){backRelay();loadDevices();}else alert(j.error||t('app.op_failed'));
+  if(j.ok){if(j.rotation_warning)alert(j.rotation_warning);backRelay();loadDevices();}else alert(j.error||t('app.op_failed'));
 }
 let USERS=[];
 async function loadUsers(){
